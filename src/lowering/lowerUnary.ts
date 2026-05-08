@@ -40,15 +40,10 @@ export function lowerUnary(
       e.span
     );
   }
-  // Complex `Not` lowers in Stage B (logicals); complex `Plus`/`Minus`
-  // are valid scalar arithmetic and pass through naturally — `+z` is
-  // an identity, `-z` flips both real and imag.
-  if (operand.ty.isComplex && e.op === "Not") {
-    throw new UnsupportedConstruct(
-      `unary ${e.op} on a complex operand is not yet supported`,
-      e.span
-    );
-  }
+  // Complex `Plus`/`Minus` are valid scalar arithmetic (`+z` identity,
+  // `-z` flips both parts). Complex `Not` is the toBool path: `~z` is
+  // 1 iff `re == 0 && im == 0`. The codegen branch handles both;
+  // lowering just sets the type appropriately.
   if (operand.kind === "NumLit") {
     if (e.op === "Plus") {
       return { ...operand, span: e.span };

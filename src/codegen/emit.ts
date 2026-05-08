@@ -217,6 +217,15 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
     }
 
     case "Binary": {
+      // Comparison / logical ops with any complex operand take a
+      // dedicated branch — C's bare `<`/`==`/`&&` operators don't
+      // match numbl's complex semantics (real-part-only for ordering;
+      // both parts for equality; toBool for `&& ||`).
+      const lc = isNumeric(e.left.ty) && e.left.ty.isComplex;
+      const rc = isNumeric(e.right.ty) && e.right.ty.isComplex;
+      if ((lc || rc) && CMP_OR_LOGICAL.has(e.op)) {
+        return emitComplexCmpOrLogical(state, e, parentPrec);
+      }
       const cOp = BIN_OP_C[e.op];
       if (cOp) {
         const p = precedence(e.op);
@@ -232,6 +241,11 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
     }
 
     case "Unary": {
+      // Complex `~z` (Not) is the toBool negation: 1 iff re==0 && im==0.
+      if (e.op === "Not" && isNumeric(e.operand.ty) && e.operand.ty.isComplex) {
+        const s = emitExpr(state, e.operand, 0);
+        return `(!(creal(${s}) != 0.0 || cimag(${s}) != 0.0))`;
+      }
       const cOp = UN_OP_C[e.op];
       if (!cOp) throw new Error(`codegen: unsupported unary op ${e.op}`);
       const p = precedence(e.op);
@@ -245,6 +259,85 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       return p < parentPrec ? `(${inner})` : inner;
     }
   }
+}
+
+/** Binary ops that take the complex-aware branch in `emitExpr.Binary`
+ *  whenever any operand is complex. (Arithmetic ops use C99's native
+ *  complex operators, so they don't need this re-routing.) */
+const CMP_OR_LOGICAL: ReadonlySet<BinaryOperation> = new Set<BinaryOperation>([
+  BinaryOperation.Less,
+  BinaryOperation.LessEqual,
+  BinaryOperation.Greater,
+  BinaryOperation.GreaterEqual,
+  BinaryOperation.Equal,
+  BinaryOperation.NotEqual,
+  BinaryOperation.AndAnd,
+  BinaryOperation.OrOr,
+]);
+
+/** Emit a comparison or logical op when at least one operand is
+ *  complex. Mirrors numbl's semantics:
+ *    <  <=  >  >=     real-part only
+ *    ==  !=           both real and imag parts
+ *    &&  ||           toBool: re != 0 || im != 0
+ *  Real operands are unwrapped (no creal/cimag) since C's implicit
+ *  promotion rules don't help us here — we want plain `double`s on
+ *  the C side wherever the IR side is real. */
+function emitComplexCmpOrLogical(
+  state: EmitState,
+  e: Extract<IRExpr, { kind: "Binary" }>,
+  parentPrec: number
+): string {
+  const lc = isNumeric(e.left.ty) && e.left.ty.isComplex;
+  const rc = isNumeric(e.right.ty) && e.right.ty.isComplex;
+  const left = emitExpr(state, e.left, 0);
+  const right = emitExpr(state, e.right, 0);
+  const reOf = (s: string, isComplex: boolean): string =>
+    isComplex ? `creal(${s})` : s;
+  const imOf = (s: string, isComplex: boolean): string =>
+    isComplex ? `cimag(${s})` : "0.0";
+  const truthy = (s: string, isComplex: boolean): string =>
+    isComplex ? `(creal(${s}) != 0.0 || cimag(${s}) != 0.0)` : `(${s} != 0.0)`;
+
+  let inner: string;
+  switch (e.op) {
+    case "Less":
+    case "LessEqual":
+    case "Greater":
+    case "GreaterEqual": {
+      const cOp = BIN_OP_C[e.op]!;
+      inner = `${reOf(left, lc)} ${cOp} ${reOf(right, rc)}`;
+      break;
+    }
+    case "Equal": {
+      inner =
+        `${reOf(left, lc)} == ${reOf(right, rc)} && ` +
+        `${imOf(left, lc)} == ${imOf(right, rc)}`;
+      break;
+    }
+    case "NotEqual": {
+      inner =
+        `${reOf(left, lc)} != ${reOf(right, rc)} || ` +
+        `${imOf(left, lc)} != ${imOf(right, rc)}`;
+      break;
+    }
+    case "AndAnd": {
+      inner = `${truthy(left, lc)} && ${truthy(right, rc)}`;
+      break;
+    }
+    case "OrOr": {
+      inner = `${truthy(left, lc)} || ${truthy(right, rc)}`;
+      break;
+    }
+    default:
+      throw new Error(
+        `codegen internal: emitComplexCmpOrLogical called with op ${e.op}`
+      );
+  }
+  // Always parenthesize at parent>=1 since the inner is a logical-style
+  // expression; at top level we let it pass through.
+  const p = precedence(e.op);
+  return p < parentPrec ? `(${inner})` : inner;
 }
 
 function useRuntime(

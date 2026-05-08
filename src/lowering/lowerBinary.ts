@@ -17,6 +17,7 @@ import {
   arithResult,
   isMultiElement,
   isScalar,
+  isScalarComplex,
   isScalarReal,
   isNumeric,
   scalarComplex,
@@ -125,15 +126,23 @@ export function lowerBinary(
   return lowerArith(e, left, right);
 }
 
-/** Comparisons / logical ops: scalar-real operands only today.
- *  Element-wise comparison on tensors needs its own codegen path;
- *  comparison/logical ops on complex scalars land in Stage B. */
+/** Comparisons / logical ops: scalar operands (real or complex).
+ *  Element-wise comparison on tensors needs its own codegen path.
+ *
+ *  Numbl semantics on complex (mirrored by emit's complex branch):
+ *    <  <=  >  >=     compare on the real part only
+ *    ==  !=           compare both real and imag
+ *    && ||            apply `toBool`: re != 0 || im != 0
+ *  The IR result type stays a real-scalar logical (0/1, "nonnegative");
+ *  codegen dispatches on operand `isComplex` to emit the correct C. */
 function lowerComparison(
   e: Extract<Expr, { type: "Binary" }>,
   left: IRExpr,
   right: IRExpr
 ): IRExpr {
-  if (!isScalarReal(left.ty) || !isScalarReal(right.ty)) {
+  const ok = (t: IRExpr["ty"]): boolean =>
+    isScalarReal(t) || isScalarComplex(t);
+  if (!ok(left.ty) || !ok(right.ty)) {
     throw new UnsupportedConstruct(
       `comparison/logical ${e.op} on ${typeToString(left.ty)} and ` +
         `${typeToString(right.ty)} is not yet supported`,
