@@ -281,8 +281,7 @@ function analyzeExpr(state: EmitState, e: IRExpr): void {
     case "Var":
       return;
     case "TensorLit":
-      for (const row of e.elements)
-        for (const c of row) analyzeExpr(state, c);
+      for (const row of e.elements) for (const c of row) analyzeExpr(state, c);
       return;
     case "Call": {
       // Every builtin we currently emit lives in <math.h> (libm + the
@@ -331,8 +330,7 @@ function analyzeStmt(state: EmitState, s: IRStmt): void {
         analyzeExpr(state, eif.cond);
         for (const t of eif.body) analyzeStmt(state, t);
       }
-      if (s.elseBody)
-        for (const t of s.elseBody) analyzeStmt(state, t);
+      if (s.elseBody) for (const t of s.elseBody) analyzeStmt(state, t);
       return;
     case "For":
       // The emitted iteration-count formula calls floor(), so any For
@@ -401,10 +399,19 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         useRuntime(state, "mtoc_disp_double", MTOC_DISP_DOUBLE);
         // Non-variadic call — `int` operands auto-promote to `double`,
         // so no manual cast is needed (unlike `printf("%g", ...)`).
-        pushStmt(state, level, `mtoc_disp_double(${emitExpr(state, s.arg, 0)});`);
+        pushStmt(
+          state,
+          level,
+          `mtoc_disp_double(${emitExpr(state, s.arg, 0)});`
+        );
         break;
       }
-      if (isNumeric(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
+      if (
+        isNumeric(ty) &&
+        isMultiElement(ty) &&
+        !ty.isComplex &&
+        ty.elem === "double"
+      ) {
         // The lowering pass requires tensor `disp` args to be a Var;
         // anything else would have thrown at lowering with a span.
         if (s.arg.kind !== "Var") {
@@ -486,11 +493,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         level + 1,
         `for (long _mtoc_i = 0; _mtoc_i < _mtoc_n; _mtoc_i++) {`
       );
-      pushStmt(
-        state,
-        level + 2,
-        `${v} = _mtoc_start + ${stepStr} * _mtoc_i;`
-      );
+      pushStmt(state, level + 2, `${v} = _mtoc_start + ${stepStr} * _mtoc_i;`);
       for (const t of s.body) emitStmt(state, level + 2, t);
       pushStmt(state, level + 1, `}`);
       pushStmt(state, level, `}`);
@@ -597,7 +600,12 @@ function emitDeclarations(
       pushStmt(state, level, `double ${cName} = 0.0;`);
       continue;
     }
-    if (isNumeric(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
+    if (
+      isNumeric(ty) &&
+      isMultiElement(ty) &&
+      !ty.isComplex &&
+      ty.elem === "double"
+    ) {
       const numel = staticNumElements(ty);
       if (numel === null) {
         throw new Error(
@@ -663,7 +671,9 @@ function functionHeaderComment(fn: IRFunction): string[] {
       ? `${loc.startLine}`
       : `${loc.startLine}-${loc.endLine}`;
   const lines: string[] = [];
-  lines.push(`/* User function specialization: ${fn.matlabName}(${argSummary})`);
+  lines.push(
+    `/* User function specialization: ${fn.matlabName}(${argSummary})`
+  );
   lines.push(` *   defined : ${loc.file}:${lineRange}`);
   lines.push(` *   mangled : ${fn.mangledName}`);
   for (const p of fn.params) {
@@ -680,18 +690,10 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
       `codegen: function '${fn.matlabName}' has unsupported return type ${fn.returnTy.kind}`
     );
   }
-  const paramList = fn.params
-    .map(p => `double ${p.cName}`)
-    .join(", ");
+  const paramList = fn.params.map(p => `double ${p.cName}`).join(", ");
   const sig = `static double ${fn.mangledName}(${paramList || "void"}) {`;
   const { lines, cReturn } = emitFunctionBody(state, fn);
-  return [
-    ...functionHeaderComment(fn),
-    sig,
-    ...lines,
-    `  ${cReturn}`,
-    "}",
-  ];
+  return [...functionHeaderComment(fn), sig, ...lines, `  ${cReturn}`, "}"];
 }
 
 export function emitC(prog: IRProgram): string {

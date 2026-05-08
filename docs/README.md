@@ -2,7 +2,7 @@
 
 Orientation material for people (and agents) extending mtoc. The codebase is in
 flux — these docs deliberately avoid line numbers and try to talk in terms of
-*concepts and roles* so they stay accurate as files move around.
+_concepts and roles_ so they stay accurate as files move around.
 
 ## Where to start
 
@@ -32,7 +32,7 @@ flux — these docs deliberately avoid line numbers and try to talk in terms of
 - Every IR node carries a source `Span`. Errors should always include it, so
   user-facing messages can point to a line.
 - Every refactor must keep the cross-runner at full pass before merging. `tsc
-  --noEmit` clean too.
+--noEmit` clean too.
 - Generated C output is treated as observable. Changing it (whitespace,
   ordering, helper names) means updating snapshots/tests; cross-runner output
   must remain byte-identical to numbl for every script in `test_scripts/`.

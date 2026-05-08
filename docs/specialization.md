@@ -23,7 +23,7 @@ monomorphized.
 Two consequences worth keeping in mind:
 
 - **Sign is part of the key.** Calling `f(positive_value)` and `f(negative_value)`
-  produces *different* specializations, with different mangled names. That's by
+  produces _different_ specializations, with different mangled names. That's by
   design: a sign-sensitive operation in the body (`sqrt(x)`, `log(x)`) is
   validated against the actual call-site sign rather than rejected categorically.
 - **Different specializations may emit identical C.** If two distinct argument

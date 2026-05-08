@@ -14,7 +14,7 @@ Example: `acosh(x)`.
    When the constraint is expressible, add it.
 2. Add an entry to the builtin registry using the `libm` factory:
    ```ts
-   libm("acosh", 1, "acosh", "nonnegative", [null])
+   libm("acosh", 1, "acosh", "nonnegative", [null]);
    ```
 3. Add a focused `.m` test under `test_scripts/builtins/acosh.m`.
 4. Run the cross-runner. Done.
@@ -33,7 +33,7 @@ Example: a hypothetical `mtoc_relu(x)` that returns `max(x, 0)`.
 2. Register it in the runtime helper registry. No deps.
 3. Add a builtin entry using the `runtime` factory:
    ```ts
-   runtime("relu", 1, "mtoc_relu", "nonnegative", [null])
+   runtime("relu", 1, "mtoc_relu", "nonnegative", [null]);
    ```
 4. Test script + cross-runner.
 
@@ -98,9 +98,9 @@ span)`. To improve a message:
 1. Find the throw site (often in a per-construct lowering helper).
 2. Update the message — include the actual offending types via
    `typeToString`, and any actionable hint (`use abs(x)`, `assign to a name
-   first`).
+first`).
 3. Update any vitest assertions that match the previous wording. Match on
-   *intent* via regex, not the exact string.
+   _intent_ via regex, not the exact string.
 
 ## Remove a restriction (turn an UnsupportedConstruct into a feature)
 

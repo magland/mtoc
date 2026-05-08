@@ -20,7 +20,7 @@ available to read as a reference. When a question comes up about how the
 dialect should behave, the answer is "what numbl does" — go read the relevant
 file in `../numbl/src/numbl-core/`.
 
-mtoc is a *static* translator and intentionally accepts a strict subset of
+mtoc is a _static_ translator and intentionally accepts a strict subset of
 what numbl can run — anything outside that subset raises `UnsupportedConstruct`
 with a source span.
 
@@ -40,7 +40,7 @@ Every change should keep `README.md` and `docs/` accurate. If you:
 
 When in doubt, skim `docs/README.md` for the right home and add a one-liner
 rather than letting the docs drift. Avoid hard-coding line numbers — refer to
-subsystems and file *roles* so the docs survive routine refactors.
+subsystems and file _roles_ so the docs survive routine refactors.
 
 ## Test discipline
 
@@ -49,6 +49,7 @@ A change is "done" when:
 - `npx tsc --noEmit` is clean.
 - `npx tsx scripts/run_test_scripts.ts` is at full pass.
 - `npx vitest run` is at full pass.
+- `npm run lint` and `npm run format:check` are both clean.
 
 Two layers, strict separation:
 

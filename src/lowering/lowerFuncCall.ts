@@ -9,7 +9,11 @@ import { createHash } from "node:crypto";
 
 import type { Expr, Span } from "../parser/index.js";
 import { offsetToLine } from "../parser/sourceLoc.js";
-import { getBuiltin, type BuiltinSig, type ParamConstraint } from "../workspace/builtins.js";
+import {
+  getBuiltin,
+  type BuiltinSig,
+  type ParamConstraint,
+} from "../workspace/builtins.js";
 import type { FunctionStmt } from "../workspace/workspace.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr, IRFunction } from "./ir.js";
@@ -282,11 +286,7 @@ function specialize(
       cName: cNameFor(p),
       ty: argTypes[i],
     }));
-    const inner = new Lowerer(
-      this.shared,
-      paramBindings,
-      fnAst.outputs[0]
-    );
+    const inner = new Lowerer(this.shared, paramBindings, fnAst.outputs[0]);
     const body = inner.lowerStmts(fnAst.body);
     const outputName = fnAst.outputs[0];
     const returnTy = inner.envLookup(outputName);

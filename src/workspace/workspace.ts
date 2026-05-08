@@ -41,9 +41,7 @@ export class Workspace {
 
   registerLocalFunction(fn: FunctionStmt): void {
     if (this.localFunctions.has(fn.name)) {
-      throw new Error(
-        `duplicate local function definition: '${fn.name}'`
-      );
+      throw new Error(`duplicate local function definition: '${fn.name}'`);
     }
     this.localFunctions.set(fn.name, fn);
   }

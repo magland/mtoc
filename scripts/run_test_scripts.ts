@@ -149,9 +149,8 @@ async function runPool<T, R>(
       onResult(items[i], r, i);
     }
   };
-  const workers = Array.from(
-    { length: Math.min(limit, items.length) },
-    () => runWorker()
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () =>
+    runWorker()
   );
   await Promise.all(workers);
   return results;

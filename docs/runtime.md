@@ -89,6 +89,7 @@ scalars are `double _Complex` (C99).
 ## Adding a helper
 
 1. Create `src/codegen/runtime/foo.h` with the standard shape:
+
    ```c
    /* mtoc runtime helper: short description of what foo does. */
 
@@ -96,6 +97,7 @@ scalars are `double _Complex` (C99).
 
    static double mtoc_foo(double x) { ... }
    ```
+
 2. Register it in `src/codegen/runtime.ts` with any deps it needs. The key is
    the C identifier the codegen will emit (`"mtoc_foo"`).
 3. If a builtin needs to emit a call to this helper, point the builtin's

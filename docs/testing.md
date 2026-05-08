@@ -69,13 +69,37 @@ already covers that and is much faster. Vitest is for unit-level checks.
    cross-runner can't observe.
 5. `npx tsc --noEmit` clean.
 
+## Lint + format
+
+Prettier and ESLint are also part of the dev loop:
+
+```bash
+npm run format        # prettier --write .
+npm run format:check  # prettier --check .  (CI gate)
+npm run lint          # eslint .            (CI gate)
+```
+
+The vendored `src/lexer/` and `src/parser/` are excluded from both prettier
+and eslint via `.prettierignore` and `eslint.config.js`'s `globalIgnores` — do
+not remove those entries, or vendoring will drift away from numbl byte-for-byte
+(see `scripts/sync_from_numbl.ts`).
+
+Husky wires this into git: `pre-commit` runs `lint-staged` (prettier + eslint
+on staged files), `pre-push` runs `npm run typecheck && npm run lint`.
+
 ## CI / regression discipline
 
 A change is "done" when:
+
 - `npx tsc --noEmit` is clean.
 - The cross-runner is at full pass.
 - Vitest is at full pass.
+- `npm run lint` and `npm run format:check` are both clean.
 
 Don't merge a refactor that drops cross-runner pass count, even by one. A
 divergent script either represents a real bug to fix or a script that should
 move out of the cross-runner.
+
+Note: the GitHub Actions workflow runs lint + format:check + typecheck +
+vitest. The cross-runner is not in CI because it depends on `../numbl` being
+available as a sibling directory; run it locally before pushing.

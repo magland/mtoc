@@ -82,7 +82,8 @@ The sign lattice has its own helpers (`signNegate`, `signAdd`, `signSub`,
 but not paranoid — `pos + pos = pos`, `pos * neg = neg`, `nonneg * unknown =
 unknown`, etc.
 
-A handful of *structural* refinements live alongside the lattice:
+A handful of _structural_ refinements live alongside the lattice:
+
 - `x * x` (same variable) is detected as `nonneg` regardless of `x`'s sign.
 - `for k = 1:n` ⇒ `k` is `positive` inside the body, `nonneg` after the loop
   (the latter accounts for the "loop never ran" path).

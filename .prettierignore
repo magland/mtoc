@@ -1,0 +1,10 @@
+dist
+node_modules
+coverage
+tmp
+test_scripts
+package-lock.json
+
+# Vendored verbatim from numbl — must remain byte-identical (see scripts/sync_from_numbl.ts)
+src/lexer
+src/parser

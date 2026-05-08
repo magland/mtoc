@@ -6,7 +6,7 @@ workaround or a roadmap note.
 ## Type system
 
 - **Sign-only refinement is path-insensitive.** Inside a body that's `if x > 0
-  ... end`, mtoc does *not* refine `x.sign` to `positive` within the
+... end`, mtoc does _not_ refine `x.sign` to `positive` within the
   then-branch. To take advantage of a guard, hoist the value into a fresh
   variable: `if x > 0; xpos = x; ... use xpos ...; end`.
 - **Loop type analysis is single-pass.** Bodies whose sign-flow oscillates
@@ -20,7 +20,7 @@ workaround or a roadmap note.
 ## Tensors
 
 - **Dimensions must be statically exact.** `v = [1 2 3]` works; `v = zeros(N,
-  M)` with runtime `N`/`M` doesn't yet (the lowering surfaces a clear error).
+M)` with runtime `N`/`M` doesn't yet (the lowering surfaces a clear error).
   Dynamic sizing is the next major tensor milestone — its plan is a
   per-function arena allocator that keeps the `mtoc_tensor_t` shape unchanged.
 - **Tensor sub-expressions only at `Assign` RHS.** `disp(a + b)` and
@@ -72,7 +72,7 @@ workaround or a roadmap note.
 
 ## When to add a new entry to this list
 
-When the lowerer raises a *categorical* `UnsupportedConstruct` for a feature
+When the lowerer raises a _categorical_ `UnsupportedConstruct` for a feature
 that a real numbl program would reasonably use, add a one-liner here so the
 next person doesn't waste time rediscovering it. Specific bugs (mismatched
 output for one script) belong in commit messages or issue trackers, not in

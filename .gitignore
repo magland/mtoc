@@ -6,3 +6,4 @@ tmp/
 *.tsbuildinfo
 coverage/
 /e1.c
+.husky/_/

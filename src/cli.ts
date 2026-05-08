@@ -84,7 +84,9 @@ function cmdRun(args: string[]): void {
   try {
     execFileSync(cc, [cFile, "-o", exeFile, "-lm"], { stdio: "inherit" });
   } catch {
-    process.stderr.write(`mtoc: ${cc} failed (see output above). Source at ${cFile}\n`);
+    process.stderr.write(
+      `mtoc: ${cc} failed (see output above). Source at ${cFile}\n`
+    );
     process.exit(1);
   }
 
@@ -107,7 +109,7 @@ function main(): void {
       return cmdRun(rest);
     case "-h":
     case "--help":
-      usage();
+      return usage();
     default:
       process.stderr.write(`mtoc: unknown command '${cmd}'\n`);
       usage();

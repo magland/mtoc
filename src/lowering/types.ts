@@ -49,10 +49,7 @@ export interface NumericType {
   sign: Sign;
 }
 
-export type MType =
-  | NumericType
-  | { kind: "Unknown" }
-  | { kind: "Void" };
+export type MType = NumericType | { kind: "Unknown" } | { kind: "Void" };
 
 export const SCALAR_DOUBLE: NumericType = {
   kind: "Numeric",
@@ -68,7 +65,10 @@ export function scalarDouble(sign: Sign = "unknown"): NumericType {
 }
 
 /** Construct a row-vector type with cols known exactly. */
-export function rowVecDouble(cols: number, sign: Sign = "unknown"): NumericType {
+export function rowVecDouble(
+  cols: number,
+  sign: Sign = "unknown"
+): NumericType {
   return {
     kind: "Numeric",
     elem: "double",
@@ -80,7 +80,10 @@ export function rowVecDouble(cols: number, sign: Sign = "unknown"): NumericType 
 }
 
 /** Construct a column-vector type with rows known exactly. */
-export function colVecDouble(rows: number, sign: Sign = "unknown"): NumericType {
+export function colVecDouble(
+  rows: number,
+  sign: Sign = "unknown"
+): NumericType {
   return {
     kind: "Numeric",
     elem: "double",
@@ -130,16 +133,12 @@ export function isScalar(t: MType): boolean {
 
 /** True when rows is exactly 1 but cols is not (i.e., not a scalar). */
 export function isRowVec(t: MType): boolean {
-  return (
-    isNumeric(t) && dimIsExactly(t.rows, 1) && !dimIsExactly(t.cols, 1)
-  );
+  return isNumeric(t) && dimIsExactly(t.rows, 1) && !dimIsExactly(t.cols, 1);
 }
 
 /** True when cols is exactly 1 but rows is not. */
 export function isColVec(t: MType): boolean {
-  return (
-    isNumeric(t) && dimIsExactly(t.cols, 1) && !dimIsExactly(t.rows, 1)
-  );
+  return isNumeric(t) && dimIsExactly(t.cols, 1) && !dimIsExactly(t.rows, 1);
 }
 
 /** A vector is a row vector or a column vector (and not a scalar). */
@@ -442,11 +441,7 @@ function dimsEqualExact(a: DimInfo, b: DimInfo): boolean {
  * abstract op kind here, since lower.ts maps both `Mul` and `ElemMul`
  * to `Mul`; tensor⊙tensor with that abstract op is rejected).
  */
-export function arithResult(
-  op: ArithKind,
-  a: MType,
-  b: MType
-): MType {
+export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   if (!isNumeric(a) || !isNumeric(b)) return { kind: "Unknown" };
   if (a.elem !== b.elem) return { kind: "Unknown" };
   if (a.isComplex || b.isComplex) return { kind: "Unknown" };
@@ -528,8 +523,6 @@ export function typeToString(t: MType): string {
   // rows+cols read, which doesn't fit the per-field iteration model.
   // The corresponding NUMERIC_FIELDS entries return the empty fragment.
   const dims = `${dimToString(t.rows)}x${dimToString(t.cols)}`;
-  const fragments = NUMERIC_FIELDS
-    .map(f => f.format(t))
-    .filter(s => s !== "");
+  const fragments = NUMERIC_FIELDS.map(f => f.format(t)).filter(s => s !== "");
   return `Numeric<${cat}(${dims}), ${fragments.join(", ")}>`;
 }

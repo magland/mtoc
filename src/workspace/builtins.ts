@@ -14,7 +14,12 @@
  * `reduceTensor`) keep the registry terse for the common cases.
  */
 
-import { isNumeric, scalarDouble, type MType, type Sign } from "../lowering/types.js";
+import {
+  isNumeric,
+  scalarDouble,
+  type MType,
+  type Sign,
+} from "../lowering/types.js";
 
 /** Sign-domain constraint on an argument. `null` means no constraint. */
 export type Domain = "nonnegative" | "positive" | null;

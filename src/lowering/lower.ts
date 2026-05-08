@@ -20,12 +20,7 @@
  *     on the (shape, elem) of the call-site argument types
  */
 
-import type {
-  AbstractSyntaxTree,
-  Expr,
-  Span,
-  Stmt,
-} from "../parser/index.js";
+import type { AbstractSyntaxTree, Expr, Span, Stmt } from "../parser/index.js";
 import { Workspace } from "../workspace/workspace.js";
 import { getConstant } from "../workspace/constants.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
@@ -271,7 +266,9 @@ export class Lowerer {
           ...new Set(
             envs
               .map(e => e.get(k))
-              .filter((t): t is MType => t !== undefined && t.kind !== "Unknown")
+              .filter(
+                (t): t is MType => t !== undefined && t.kind !== "Unknown"
+              )
               .map(typeToString)
           ),
         ];
@@ -449,10 +446,7 @@ export class Lowerer {
             span: e.span,
           };
         }
-        throw new TypeError(
-          `use of undefined variable '${e.name}'`,
-          e.span
-        );
+        throw new TypeError(`use of undefined variable '${e.name}'`, e.span);
       }
 
       case "Binary":

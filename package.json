@@ -13,12 +13,32 @@
     "run": "tsx src/cli.ts run",
     "test": "vitest run",
     "test:scripts": "tsx scripts/run_test_scripts.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint .",
+    "prepare": "husky"
+  },
+  "lint-staged": {
+    "*.{ts,tsx}": [
+      "prettier --write",
+      "eslint"
+    ],
+    "*.{js,jsx}": "prettier --write",
+    "*.{json,css,md,yml}": "prettier --write"
   },
   "devDependencies": {
+    "@eslint/js": "^9.39.4",
     "@types/node": "^24.10.1",
+    "eslint": "^9.39.4",
+    "eslint-config-prettier": "^10.1.8",
+    "globals": "^16.5.0",
+    "husky": "^9.1.7",
+    "lint-staged": "^16.4.0",
+    "prettier": "^3.8.3",
     "tsx": "^4.21.0",
     "typescript": "~5.9.3",
+    "typescript-eslint": "^8.59.2",
     "vitest": "^4.0.18"
   }
 }

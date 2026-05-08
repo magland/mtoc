@@ -15,7 +15,14 @@
  *                NUMBL_VERSION to numbl's HEAD SHA.
  *   (default)    Report drift only (exit 0 even if drifted).
  */
-import { readFileSync, writeFileSync, existsSync, readdirSync, statSync, unlinkSync } from "fs";
+import {
+  readFileSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
+} from "fs";
 import { execFileSync } from "child_process";
 import { dirname, join, relative, resolve } from "path";
 import { fileURLToPath } from "url";
@@ -27,13 +34,11 @@ const NUMBL_CORE = resolve(NUMBL_ROOT, "src", "numbl-core");
 const VERSION_FILE = resolve(REPO_ROOT, "NUMBL_VERSION");
 
 /** Files mtoc owns and the sync script will not touch. */
-const MTOC_OWNED: ReadonlySet<string> = new Set([
-  "src/parser/sourceLoc.ts",
-]);
+const MTOC_OWNED: ReadonlySet<string> = new Set(["src/parser/sourceLoc.ts"]);
 
 /** Subtrees that must match upstream byte-for-byte (post-patch). */
 const SYNCED_SUBTREES: ReadonlyArray<{ numbl: string; mtoc: string }> = [
-  { numbl: "lexer",  mtoc: "src/lexer"  },
+  { numbl: "lexer", mtoc: "src/lexer" },
   { numbl: "parser", mtoc: "src/parser" },
 ];
 
@@ -46,11 +51,9 @@ const SYNCED_SUBTREES: ReadonlyArray<{ numbl: string; mtoc: string }> = [
 const PATCHES: ReadonlyArray<(relPath: string, src: string) => string> = [
   // Re-route offsetToLine import from numbl's runtime to the inlined stub.
   (rel, src) => {
-    if (rel !== "src/parser/index.ts" && rel !== "src/parser/ParserBase.ts") return src;
-    return src.replace(
-      'from "../runtime/index.js"',
-      'from "./sourceLoc.js"',
-    );
+    if (rel !== "src/parser/index.ts" && rel !== "src/parser/ParserBase.ts")
+      return src;
+    return src.replace('from "../runtime/index.js"', 'from "./sourceLoc.js"');
   },
 ];
 
@@ -87,8 +90,8 @@ function diffSubtree(numblSub: string, mtocSub: string): FileDiff[] {
   const numblDir = join(NUMBL_CORE, numblSub);
   const mtocDir = join(REPO_ROOT, mtocSub);
 
-  const numblFiles = listFilesRec(numblDir).map((p) => relative(numblDir, p));
-  const mtocFiles = listFilesRec(mtocDir).map((p) => relative(mtocDir, p));
+  const numblFiles = listFilesRec(numblDir).map(p => relative(numblDir, p));
+  const mtocFiles = listFilesRec(mtocDir).map(p => relative(mtocDir, p));
 
   const seen = new Set<string>();
   const diffs: FileDiff[] = [];
@@ -123,7 +126,9 @@ function diffSubtree(numblSub: string, mtocSub: string): FileDiff[] {
 }
 
 function getNumblHeadSha(): string {
-  return execFileSync("git", ["-C", NUMBL_ROOT, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+  return execFileSync("git", ["-C", NUMBL_ROOT, "rev-parse", "HEAD"], {
+    encoding: "utf8",
+  }).trim();
 }
 
 function getPinnedSha(): string | null {
@@ -157,9 +162,11 @@ function main() {
     allDiffs.push(...diffSubtree(sub.numbl, sub.mtoc));
   }
 
-  const drift = allDiffs.filter((d) => d.status !== "ok");
+  const drift = allDiffs.filter(d => d.status !== "ok");
   if (drift.length === 0) {
-    console.log("In sync: lexer + parser match numbl byte-for-byte (post-patch).");
+    console.log(
+      "In sync: lexer + parser match numbl byte-for-byte (post-patch)."
+    );
     if (check && pinned !== numblHead) {
       console.error("\nerror: --check failed: NUMBL_VERSION pin is stale.");
       process.exit(1);
@@ -167,7 +174,9 @@ function main() {
     return;
   }
 
-  console.log(`Drift detected (${drift.length} file${drift.length === 1 ? "" : "s"}):`);
+  console.log(
+    `Drift detected (${drift.length} file${drift.length === 1 ? "" : "s"}):`
+  );
   for (const d of drift) {
     console.log(`  ${d.status.padEnd(18)} ${d.relPath}`);
   }
@@ -188,10 +197,14 @@ function main() {
     console.log(`  pinned  ${numblHead}`);
     console.log("\nDone. Run typecheck + tests before committing.");
   } else if (check) {
-    console.error("\nerror: --check failed (run `tsx scripts/sync_from_numbl.ts --apply` to update).");
+    console.error(
+      "\nerror: --check failed (run `tsx scripts/sync_from_numbl.ts --apply` to update)."
+    );
     process.exit(1);
   } else {
-    console.log("\n(re-run with --apply to update mtoc, or --check to fail in CI.)");
+    console.log(
+      "\n(re-run with --apply to update mtoc, or --check to fail in CI.)"
+    );
   }
 }
 
