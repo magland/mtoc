@@ -9,6 +9,9 @@ import { parseMFile } from "../src/parser/index.js";
 import { Workspace } from "../src/workspace/workspace.js";
 import { lower } from "../src/lowering/lower.js";
 import { emitC } from "../src/codegen/emit.js";
+// Note: parseMFile / Workspace / lower are also used directly by the
+// IRStmt.Disp assertion below (it inspects the lowered IR rather than
+// the emitted C, to exercise the lowering boundary explicitly).
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(here, "..");
@@ -82,6 +85,30 @@ describe("translate scalar example", () => {
     expect(() => translate("x = -5;\ndisp(sqrt(x));\n")).toThrow(
       /sqrt requires .* to be statically nonnegative/
     );
+  });
+
+  it("sqrt(x) rejection flows through params[0].domain (reports arg sign)", () => {
+    // The `validateDomain` path off `BuiltinSig.params[0].domain`
+    // includes the inferred sign in its message — proves the error
+    // came from the registry-driven domain check rather than an
+    // ad-hoc string compare.
+    expect(() => translate("x = -5;\ndisp(sqrt(x));\n")).toThrow(
+      /got sign='negative'/
+    );
+  });
+
+  it("disp(x) lowers via IRStmt.Disp (statement-only path)", () => {
+    // The registry entry for `disp` has `category: "stmt"`; the
+    // ExprStmt(disp(...)) shortcut in lower.ts must produce an
+    // `IRStmt.Disp` node so codegen picks the dedicated runtime
+    // helper rather than emitting a value-bearing call.
+    const source = "x = 1;\ndisp(x);\n";
+    const ast = parseMFile(source, "test.m");
+    const ws = new Workspace("test.m");
+    ws.addFile({ name: "test.m", source, ast });
+    const ir = lower(ast, ws);
+    const dispStmts = ir.stmts.filter(s => s.kind === "Disp");
+    expect(dispStmts.length).toBe(1);
   });
 
   it("rejects log(x) when x is not provably positive", () => {
