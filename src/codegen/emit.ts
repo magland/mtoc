@@ -16,6 +16,7 @@ import type {
 } from "../lowering/ir.js";
 import {
   isMultiElement,
+  isScalarComplex,
   isScalarReal,
   isNumeric,
   staticNumElements,
@@ -24,6 +25,7 @@ import {
 } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import {
+  MTOC_DISP_COMPLEX,
   MTOC_DISP_DOUBLE,
   MTOC_TENSOR_STRUCT,
   RUNTIME_HELPERS,
@@ -113,6 +115,10 @@ interface EmitState {
   /** Boxed so the `BuiltinSig.emit` closure (which receives a small
    *  facade view, not the whole EmitState) can flip it. */
   needMath: { value: boolean };
+  /** True when any complex value (literal, declaration, or operation)
+   *  has been emitted — drives `<complex.h>` inclusion. Boxed for the
+   *  same reason as `needMath`. */
+  needComplex: { value: boolean };
   /** Runtime helpers used by the program, in stable order. */
   runtime: RuntimeSnippet[];
   /** Names of helpers already added to `runtime` (dedup). */
@@ -163,6 +169,16 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
   switch (e.kind) {
     case "NumLit":
       return formatNumLit(e.value);
+
+    case "ImagLit": {
+      // Render as `<value> * I`. C99's `_Complex_I` macro expands to
+      // a `const float _Complex` (or `const double _Complex`) value
+      // representing 0+1i; multiplying a `double` by it produces a
+      // `double _Complex`. Wrap in parens so adjacent operators (e.g.
+      // a unary `-`, or an Add) bind correctly. The `<complex.h>`
+      // header was already activated by analyzeExpr.
+      return `(${formatNumLit(e.value)} * I)`;
+    }
 
     case "Var":
       // Inside a per-element loop, a multi-element `Var` reads the
@@ -273,9 +289,21 @@ function pushStmt(state: EmitState, level: number, s: string): void {
  * helpers do.
  */
 function analyzeExpr(state: EmitState, e: IRExpr): void {
+  // Any expression whose static type is complex forces <complex.h>:
+  // its rendering touches `I`, `creal`, `cimag`, or a `double _Complex`
+  // declaration somewhere downstream. Setting it on the way down keeps
+  // the header activation centralized.
+  if (isNumeric(e.ty) && e.ty.isComplex) {
+    state.needComplex.value = true;
+  }
   switch (e.kind) {
     case "NumLit":
       // INFINITY / NAN macros come from <math.h>.
+      if (!Number.isFinite(e.value)) state.needMath.value = true;
+      return;
+    case "ImagLit":
+      // The `I` macro and `double _Complex` type both come from
+      // <complex.h>; the type-driven flag above handles activation.
       if (!Number.isFinite(e.value)) state.needMath.value = true;
       return;
     case "Var":
@@ -369,7 +397,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         emitTensorLitAssign(state, level, s.cName, s.rhs);
         break;
       }
-      if (isScalarReal(s.ty)) {
+      if (isScalarReal(s.ty) || isScalarComplex(s.ty)) {
         pushStmt(state, level, `${s.cName} = ${emitExpr(state, s.rhs, 0)};`);
         break;
       }
@@ -403,6 +431,15 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           state,
           level,
           `mtoc_disp_double(${emitExpr(state, s.arg, 0)});`
+        );
+        break;
+      }
+      if (isScalarComplex(ty)) {
+        useRuntime(state, "mtoc_disp_complex", MTOC_DISP_COMPLEX);
+        pushStmt(
+          state,
+          level,
+          `mtoc_disp_complex(${emitExpr(state, s.arg, 0)});`
         );
         break;
       }
@@ -600,6 +637,10 @@ function emitDeclarations(
       pushStmt(state, level, `double ${cName} = 0.0;`);
       continue;
     }
+    if (isScalarComplex(ty)) {
+      pushStmt(state, level, `double _Complex ${cName} = 0.0;`);
+      continue;
+    }
     if (
       isNumeric(ty) &&
       isMultiElement(ty) &&
@@ -699,6 +740,7 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
 export function emitC(prog: IRProgram): string {
   const state: EmitState = {
     needMath: { value: false },
+    needComplex: { value: false },
     runtime: [],
     runtimeNames: new Set(),
     lines: [],
@@ -730,6 +772,7 @@ export function emitC(prog: IRProgram): string {
   // Headers: union of explicit needs + every runtime snippet's headers.
   const headerSet = new Set<string>(["<stdio.h>"]);
   if (state.needMath.value) headerSet.add("<math.h>");
+  if (state.needComplex.value) headerSet.add("<complex.h>");
   for (const snippet of state.runtime) {
     for (const h of snippet.headers) headerSet.add(h);
   }

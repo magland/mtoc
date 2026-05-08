@@ -35,6 +35,9 @@ The subset is growing iteratively. Roughly:
   unique call-site argument-type tuple
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
+- Scalar complex numbers: literals (`1i`, `2.5i`, `3+4i`), unary `+`/`-`,
+  arithmetic (`+ - * /`), and `disp` formatting matching numbl byte-for-byte.
+  Complex comparisons / logicals / builtins / tensors are still in progress.
 
 Anything outside the supported subset raises `UnsupportedConstruct` with a
 source span pointing to the offending line.

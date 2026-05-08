@@ -13,6 +13,19 @@ import type { MType } from "./types.js";
 export type IRExpr =
   | { kind: "NumLit"; value: number; ty: MType; span: Span }
   | {
+      /** Imaginary literal — the complex number `0 + value*i`. Produced
+       *  by lowering when the AST exposes either a bare `ImagUnit` (i.e.
+       *  the implicit `1i`) or a `Binary(Mul, NumLit, ImagUnit)` (i.e.
+       *  `<NumLit>i` such as `2.5i`). The real-coefficient case folds
+       *  here so codegen never has to recognize the binary form, and
+       *  `arithResult(Add, real, complex)` cleanly produces the
+       *  complex sum for `3 + 4i`. `ty` is always a complex scalar. */
+      kind: "ImagLit";
+      value: number;
+      ty: MType;
+      span: Span;
+    }
+  | {
       kind: "Var";
       /** MATLAB name (for diagnostics and assignedVars lookups). */
       name: string;

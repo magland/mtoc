@@ -15,9 +15,11 @@ import { UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
   arithResult,
+  isMultiElement,
   isScalar,
   isScalarReal,
   isNumeric,
+  scalarComplex,
   scalarDouble,
   type MType,
   typeToString,
@@ -86,6 +88,25 @@ export function lowerBinary(
   }
   const left = this.lowerExpr(e.left);
   const right = this.lowerExpr(e.right);
+  // Fold the parser's `Number * ImagUnit` shape into a single
+  // ImagLit. The numbl parser's `parsePostfix` only emits the
+  // standalone `ImagUnit` variant on the right side of a synthetic
+  // Mul whose left side is a numeric literal — so this fold doesn't
+  // touch any user-written multiplication. After this, codegen sees
+  // `2.5i` as one ImagLit instead of `Mul(NumLit 2.5, ImagLit 1)`.
+  if (
+    e.op === "Mul" &&
+    left.kind === "NumLit" &&
+    right.kind === "ImagLit" &&
+    right.value === 1
+  ) {
+    return {
+      kind: "ImagLit",
+      value: left.value,
+      ty: scalarComplex(),
+      span: e.span,
+    };
+  }
   if (!isNumeric(left.ty) || !isNumeric(right.ty)) {
     throw new UnsupportedConstruct(
       `binary ${e.op} on ${typeToString(left.ty)} and ${typeToString(
@@ -105,7 +126,8 @@ export function lowerBinary(
 }
 
 /** Comparisons / logical ops: scalar-real operands only today.
- *  Element-wise comparison on tensors needs its own codegen path. */
+ *  Element-wise comparison on tensors needs its own codegen path;
+ *  comparison/logical ops on complex scalars land in Stage B. */
 function lowerComparison(
   e: Extract<Expr, { type: "Binary" }>,
   left: IRExpr,
@@ -113,7 +135,8 @@ function lowerComparison(
 ): IRExpr {
   if (!isScalarReal(left.ty) || !isScalarReal(right.ty)) {
     throw new UnsupportedConstruct(
-      `comparison/logical ${e.op} on tensors is not yet supported`,
+      `comparison/logical ${e.op} on ${typeToString(left.ty)} and ` +
+        `${typeToString(right.ty)} is not yet supported`,
       e.span
     );
   }
@@ -127,7 +150,8 @@ function lowerComparison(
   };
 }
 
-/** Power ops: scalar-real end-to-end (codegen emits `pow()` inline). */
+/** Power ops: scalar-real end-to-end (codegen emits `pow()` inline).
+ *  Complex `^` is not yet supported. */
 function lowerPow(
   e: Extract<Expr, { type: "Binary" }>,
   left: IRExpr,
@@ -136,6 +160,15 @@ function lowerPow(
   if (!isScalar(left.ty) || !isScalar(right.ty)) {
     throw new UnsupportedConstruct(
       `binary ${e.op} on tensors is not yet supported`,
+      e.span
+    );
+  }
+  if (
+    (isNumeric(left.ty) && left.ty.isComplex) ||
+    (isNumeric(right.ty) && right.ty.isComplex)
+  ) {
+    throw new UnsupportedConstruct(
+      `binary ${e.op} on complex operands is not yet supported`,
       e.span
     );
   }
@@ -186,6 +219,16 @@ function lowerArith(
     isNumeric(ty)
   ) {
     ty = { ...ty, sign: "nonnegative" };
+  }
+  // Complex tensors land in a later stage. For now, broadcasting a
+  // complex scalar against a real tensor (or any other shape that
+  // would produce a complex multi-element result) is rejected with a
+  // clean message at the offending expression.
+  if (isNumeric(ty) && ty.isComplex && isMultiElement(ty)) {
+    throw new UnsupportedConstruct(
+      `binary ${e.op} producing a complex tensor is not yet supported`,
+      e.span
+    );
   }
   if (ty.kind === "Unknown") {
     throw new UnsupportedConstruct(

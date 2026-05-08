@@ -57,6 +57,13 @@ export const MTOC_DISP_DOUBLE = loadSnippet("disp_double.h", [
   "mtoc_format_double",
 ]);
 
+const MTOC_FORMAT_COMPLEX = loadSnippet("format_complex.h", [
+  "mtoc_format_double",
+]);
+export const MTOC_DISP_COMPLEX = loadSnippet("disp_complex.h", [
+  "mtoc_format_complex",
+]);
+
 /**
  * Tensor struct typedef. No function body, but lives in the same
  * snippet machinery so its definition appears above any helper that
@@ -77,6 +84,8 @@ const MTOC_DISP_TENSOR = loadSnippet("disp_tensor.h", [
 export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_format_double", MTOC_FORMAT_DOUBLE],
   ["mtoc_disp_double", MTOC_DISP_DOUBLE],
+  ["mtoc_format_complex", MTOC_FORMAT_COMPLEX],
+  ["mtoc_disp_complex", MTOC_DISP_COMPLEX],
   ["mtoc_tensor_t", MTOC_TENSOR_STRUCT],
   ["mtoc_disp_tensor", MTOC_DISP_TENSOR],
   ["mtoc_mod", loadSnippet("mod.h")],

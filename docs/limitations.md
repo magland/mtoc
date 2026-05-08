@@ -53,8 +53,11 @@ M)` with runtime `N`/`M` doesn't yet (the lowering surfaces a clear error).
 
 ## Source language
 
-- **No complex numbers.** The type system has an `isComplex` field (always
-  `false` today); the codegen path doesn't exist.
+- **Complex numbers are partial.** Scalar complex literals, unary `+`/`-`,
+  scalar `+ - * /`, and `disp` are byte-for-byte against numbl. Comparisons,
+  logicals (`&& || ~`), the complex math builtins (`real`, `imag`, `conj`,
+  `angle`, `cabs`, `csqrt`, `cexp`, `clog`, …), `^`, and complex tensors
+  (literals, broadcast, reductions) are not yet supported.
 - **No char / string.** `'hello'` and `"hello"` raise
   `UnsupportedConstruct: Char` / `String`.
 - **No cell arrays, structs, classes.**

@@ -34,9 +34,18 @@ export function lowerUnary(
     );
   }
   const operand = this.lowerExpr(e.operand);
-  if (!isNumeric(operand.ty) || operand.ty.isComplex) {
+  if (!isNumeric(operand.ty)) {
     throw new UnsupportedConstruct(
       `unary ${e.op} on ${typeToString(operand.ty)} is not yet supported`,
+      e.span
+    );
+  }
+  // Complex `Not` lowers in Stage B (logicals); complex `Plus`/`Minus`
+  // are valid scalar arithmetic and pass through naturally — `+z` is
+  // an identity, `-z` flips both real and imag.
+  if (operand.ty.isComplex && e.op === "Not") {
+    throw new UnsupportedConstruct(
+      `unary ${e.op} on a complex operand is not yet supported`,
       e.span
     );
   }
@@ -62,10 +71,24 @@ export function lowerUnary(
       };
     }
   }
+  // Fold a unary on an ImagLit at lowering, mirroring the NumLit case
+  // (so `-2i` becomes one ImagLit rather than `Unary(Minus, ImagLit 2)`).
+  if (operand.kind === "ImagLit") {
+    if (e.op === "Plus") {
+      return { ...operand, span: e.span };
+    }
+    if (e.op === "Minus") {
+      return { ...operand, value: -operand.value, span: e.span };
+    }
+  }
   let ty: MType = operand.ty;
   if (isNumeric(operand.ty)) {
     if (e.op === "Minus") {
-      ty = { ...operand.ty, sign: signNegate(operand.ty.sign) };
+      // Sign negation only applies on the real branch — complex `sign`
+      // stays "unknown" by the type-system invariant.
+      if (!operand.ty.isComplex) {
+        ty = { ...operand.ty, sign: signNegate(operand.ty.sign) };
+      }
     } else if (e.op === "Not") {
       ty = scalarDouble("nonnegative");
     }

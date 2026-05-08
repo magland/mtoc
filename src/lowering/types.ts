@@ -94,6 +94,20 @@ export function scalarDouble(sign: Sign = "unknown"): NumericType {
   return { ...SCALAR_DOUBLE, sign };
 }
 
+/** Construct a complex scalar (1×1 complex double). Sign is forced to
+ *  "unknown" to honor the invariant that sign is meaningless on
+ *  complex types. */
+export function scalarComplex(): NumericType {
+  return {
+    kind: "Numeric",
+    elem: "double",
+    isComplex: true,
+    rows: { kind: "exact", n: 1 },
+    cols: { kind: "exact", n: 1 },
+    sign: "unknown",
+  };
+}
+
 /** Construct a row-vector type with cols known exactly. */
 export function rowVecDouble(
   cols: number,
@@ -207,6 +221,10 @@ export function isScalarReal(t: MType): boolean {
   return isNumeric(t) && isScalar(t) && !t.isComplex;
 }
 
+export function isScalarComplex(t: MType): boolean {
+  return isNumeric(t) && isScalar(t) && t.isComplex;
+}
+
 /** Element count when both dims are statically exact, else null. */
 export function staticNumElements(t: MType): number | null {
   if (!isNumeric(t)) return null;
@@ -215,14 +233,15 @@ export function staticNumElements(t: MType): number | null {
 }
 
 /** The C type used to represent values of this MType in the generated
- *  source. Scalars become bare `double`; multi-element tensors become
- *  `mtoc_tensor_t` (the struct from runtime/tensor.h). Returns null for
- *  types codegen does not yet handle (complex, Unknown, Void). */
+ *  source. Scalars become bare `double` (real) or `double _Complex`
+ *  (complex); multi-element tensors become `mtoc_tensor_t` (the struct
+ *  from runtime/tensor.h) — the struct's `imag` buffer answers the
+ *  complex question on the C side. Returns null for types codegen does
+ *  not yet handle (Unknown, Void, non-double elem). */
 export function cTypeFor(t: MType): string | null {
   if (t.kind !== "Numeric") return null;
-  if (t.isComplex) return null;
   if (t.elem !== "double") return null;
-  if (isScalar(t)) return "double";
+  if (isScalar(t)) return t.isComplex ? "double _Complex" : "double";
   return "mtoc_tensor_t";
 }
 
@@ -507,14 +526,25 @@ function dimsEqualExact(a: DimInfo, b: DimInfo): boolean {
 export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   if (!isNumeric(a) || !isNumeric(b)) return { kind: "Unknown" };
   if (a.elem !== b.elem) return { kind: "Unknown" };
-  if (a.isComplex || b.isComplex) return { kind: "Unknown" };
-  const sign = arithSign(op, a.sign, b.sign);
+  // Complex propagates: real⊙complex and complex⊙complex both produce
+  // complex. Sign is meaningless on a complex result (the invariant is
+  // enforced at output sites — canonicalizeType / unify normalize) so
+  // we just compute it on the real branch.
+  const isComplex = a.isComplex || b.isComplex;
+  const sign = isComplex ? "unknown" : arithSign(op, a.sign, b.sign);
 
   const aSc = isScalar(a);
   const bSc = isScalar(b);
 
   if (aSc && bSc) {
-    return scalarDouble(sign);
+    return {
+      kind: "Numeric",
+      elem: a.elem,
+      isComplex,
+      rows: { kind: "exact", n: 1 },
+      cols: { kind: "exact", n: 1 },
+      sign,
+    };
   }
   if (aSc || bSc) {
     // Scalar broadcasts to the other operand's shape.
@@ -522,7 +552,7 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
     return {
       kind: "Numeric",
       elem: tensor.elem,
-      isComplex: false,
+      isComplex,
       rows: tensor.rows,
       cols: tensor.cols,
       sign,
@@ -540,7 +570,7 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   return {
     kind: "Numeric",
     elem: a.elem,
-    isComplex: false,
+    isComplex,
     rows: a.rows,
     cols: a.cols,
     sign,

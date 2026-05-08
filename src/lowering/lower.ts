@@ -36,6 +36,7 @@ import {
   isScalarReal,
   isNumeric,
   MType,
+  scalarComplex,
   scalarDouble,
   signFromValue,
   staticNumElements,
@@ -426,6 +427,21 @@ export class Lowerer {
         };
       }
 
+      case "ImagUnit": {
+        // Bare `ImagUnit` represents the implicit `1i`. The numbl parser
+        // only emits a standalone `ImagUnit` as the right operand of
+        // `Binary(Mul, NumLit, ImagUnit)`; the binary lowerer folds that
+        // pair into a single `ImagLit { value: numLit.value }`. Lowering
+        // the bare form here as `ImagLit { value: 1 }` keeps the IR
+        // uniform if a future parser path delivers a standalone unit.
+        return {
+          kind: "ImagLit",
+          value: 1,
+          ty: scalarComplex(),
+          span: e.span,
+        };
+      }
+
       case "Ident": {
         const ty = this.env.get(e.name);
         if (ty) {
@@ -484,6 +500,7 @@ function rejectNestedTensorLit(e: IRExpr): void {
         e.span
       );
     case "NumLit":
+    case "ImagLit":
     case "Var":
       return;
     case "Binary":
@@ -514,6 +531,7 @@ function rejectCallInTensorContext(e: IRExpr): void {
         e.span
       );
     case "NumLit":
+    case "ImagLit":
     case "Var":
     case "TensorLit":
       // TensorLit has already been rejected by `rejectNestedTensorLit`
