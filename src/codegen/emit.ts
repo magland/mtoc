@@ -17,10 +17,10 @@ import type {
 import {
   isMultiElement,
   isScalarReal,
-  isTensor,
+  isNumeric,
   staticNumElements,
   typeToString,
-  type TensorType,
+  type NumericType,
 } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import {
@@ -386,7 +386,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         pushStmt(state, level, `mtoc_disp_double(${emitExpr(state, s.arg, 0)});`);
         break;
       }
-      if (isTensor(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
+      if (isNumeric(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
         // The lowering pass requires tensor `disp` args to be a Var;
         // anything else would have thrown at lowering with a span.
         if (s.arg.kind !== "Var") {
@@ -519,10 +519,10 @@ function emitTensorLitAssign(
   target: string,
   lit: Extract<IRExpr, { kind: "TensorLit" }>
 ): void {
-  if (!isTensor(lit.ty)) {
+  if (!isNumeric(lit.ty)) {
     throw new Error("codegen: tensor literal must produce a tensor type");
   }
-  const ty = lit.ty as TensorType;
+  const ty = lit.ty as NumericType;
   if (ty.rows.kind !== "exact" || ty.cols.kind !== "exact") {
     throw new Error(
       `codegen: tensor literal with non-exact dims (got ${typeToString(ty)})`
@@ -564,7 +564,7 @@ function emitDeclarations(
       pushStmt(state, level, `double ${cName} = 0.0;`);
       continue;
     }
-    if (isTensor(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
+    if (isNumeric(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
       const numel = staticNumElements(ty);
       if (numel === null) {
         throw new Error(

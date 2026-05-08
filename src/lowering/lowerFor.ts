@@ -9,7 +9,7 @@ import type { Stmt } from "../parser/index.js";
 import { UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IRStmt } from "./ir.js";
 import {
-  isTensor,
+  isNumeric,
   scalarDouble,
   signIsNonneg,
   signIsPositive,
@@ -60,7 +60,7 @@ export function lowerFor(
   // direction. `for k = 1:n` ⇒ k positive; `for k = 0:n` ⇒ k nonneg;
   // symmetric for negative-stride loops. Anything that could cross
   // zero falls back to unknown.
-  const startSign = isTensor(start.ty) ? start.ty.sign : "unknown";
+  const startSign = isNumeric(start.ty) ? start.ty.sign : "unknown";
   let loopVarSign:
     | "positive"
     | "nonnegative"

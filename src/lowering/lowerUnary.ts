@@ -8,7 +8,7 @@ import type { Expr, UnaryOperation as UnOp } from "../parser/index.js";
 import { UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
-  isTensor,
+  isNumeric,
   scalarDouble,
   signFromValue,
   signNegate,
@@ -34,7 +34,7 @@ export function lowerUnary(
     );
   }
   const operand = this.lowerExpr(e.operand);
-  if (!isTensor(operand.ty) || operand.ty.isComplex) {
+  if (!isNumeric(operand.ty) || operand.ty.isComplex) {
     throw new UnsupportedConstruct(
       `unary ${e.op} on ${typeToString(operand.ty)} is not yet supported`,
       e.span
@@ -63,7 +63,7 @@ export function lowerUnary(
     }
   }
   let ty: MType = operand.ty;
-  if (isTensor(operand.ty)) {
+  if (isNumeric(operand.ty)) {
     if (e.op === "Minus") {
       ty = { ...operand.ty, sign: signNegate(operand.ty.sign) };
     } else if (e.op === "Not") {

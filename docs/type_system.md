@@ -1,7 +1,8 @@
 # Type system
 
 Lives in `src/lowering/types.ts`. Designed to grow — the discriminated union
-won't need reshaping for complex numbers, integer kinds, or N-D tensors.
+has room for non-numeric variants (Logical, Char, Cell, Struct, Handle) without
+reshaping. Today only `Numeric` and the sentinels are populated.
 
 ## MType
 
@@ -9,38 +10,45 @@ The top-level type carrier:
 
 ```
 MType =
-  | TensorType
+  | NumericType
   | { kind: "Unknown" }
   | { kind: "Void" }
 ```
 
-Almost every value mtoc reasons about is a `TensorType`. `Unknown` shows up at
-type-check failures; `Void` is reserved for statement-only constructs (e.g.
-`disp` returns nothing).
+Every value mtoc currently reasons about is a `NumericType` — scalar or
+tensor, real or complex. `Unknown` shows up at type-check failures; `Void`
+is reserved for statement-only constructs (e.g. `disp` returns nothing).
 
-## TensorType
+When non-numeric kinds (Logical/Char/Cell/Struct/Handle) get added, they
+land as new top-level variants — the discriminator is already there. Numeric
+code paths keep narrowing to `NumericType` without touching them.
+
+## NumericType
 
 ```
-TensorType {
-  kind: "Tensor"
-  elem: ElemKind        // today: "double" only; reserved for single/int/...
-  isComplex: boolean    // today: always false; reserved for complex codegen
+NumericType {
+  kind: "Numeric"
+  elem: ElemKind        // today: "double" only (numbl tensors are double-only)
+  isComplex: boolean    // tracks the complex axis; codegen picks
+                        //   `double` / `double _Complex` / `mtoc_tensor_t`
+                        //   accordingly. Complex tensors mirror numbl's
+                        //   split storage (separate real/imag buffers).
   rows: DimInfo
   cols: DimInfo
   sign: Sign
 }
 ```
 
-Scalars are 1×1 tensors — there is no separate "Scalar" type. Operations
+Scalars are 1×1 numerics — there is no separate "Scalar" type. Operations
 dispatch on shape via the `isScalar` / `isRowVec` / `isColVec` / `isVector` /
 `isMatrix` / `isMultiElement` predicates. Codegen picks the C representation
 via `cTypeFor` (bare `double` for scalars, `mtoc_tensor_t` struct for
 multi-element).
 
-The predicates intentionally return plain `boolean`, not `t is TensorType`: a
-type predicate would have TS narrow `TensorType` to `never` in the false
-branch, which is wrong. Callers needing `TensorType` narrowing should
-`isTensor(t)` first.
+The predicates intentionally return plain `boolean`, not `t is NumericType`: a
+type predicate would have TS narrow `NumericType` to `never` in the false
+branch, which is wrong. Callers needing `NumericType` narrowing should
+`isNumeric(t)` first.
 
 A small set of constructor helpers (`scalarDouble`, `rowVecDouble`,
 `colVecDouble`, `matrixDouble`) keeps lowering call sites short.
@@ -64,7 +72,7 @@ type-merge would widen to non-exact).
 Sign = positive | nonnegative | negative | nonpositive | zero | nonzero | unknown
 ```
 
-Tracked on every `TensorType`. Used by builtins to refuse translation when an
+Tracked on every `NumericType`. Used by builtins to refuse translation when an
 input could land outside the function's domain — `sqrt(x)` requires `x` to be
 statically `nonnegative`; `log(x)` requires `positive`. The canonical pattern
 when a user has only `unknown` info is `sqrt(abs(x))`.
@@ -100,7 +108,7 @@ A handful of *structural* refinements live alongside the lattice:
 `canonicalizeType` produces a deterministic field-ordered representation used
 to hash a function's argument-type tuple into a stable specialization name (8
 hex chars of SHA-256). Together with `typeToString`, it's driven by a
-`TENSOR_FIELDS` table — adding a new `TensorType` field means appending one
+`NUMERIC_FIELDS` table — adding a new `NumericType` field means appending one
 table entry.
 
 ## Error attribution

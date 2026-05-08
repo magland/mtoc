@@ -1,11 +1,14 @@
 /**
  * mtoc type system (seed).
  *
- * The basic type is `Tensor`. Scalars are 1×1 tensors. Today only
- * real `double` scalars are exercised end-to-end; the lattice is
- * shaped to grow into shape-aware reasoning (rowVec, colVec, matrix)
- * and other element kinds (single, int*, logical, char) without
- * reshaping the discriminated union.
+ * The numeric tower is `NumericType` — every value mtoc currently
+ * tracks is in it: scalar or tensor, real or complex, with shape
+ * carried alongside element kind. Scalars are 1×1 numerics (no
+ * separate "Scalar" variant). The `kind` discriminator is reserved
+ * to grow sibling variants for non-numeric values (Logical, Char,
+ * Cell, Struct, Handle) — those land when there's a concrete need;
+ * keeping the discriminator means adding them won't ripple through
+ * numeric-only code paths.
  */
 
 export type ElemKind = "double";
@@ -30,14 +33,15 @@ export type Sign =
   | "unknown";
 
 /**
- * Every numeric value is a Tensor — including scalars, which are 1×1
- * tensors. There is no separate "Scalar" type. Operations dispatch on
- * the shape predicates below (isScalar / isRowVec / etc.); codegen
- * uses cTypeFor() to pick the C representation (double vs the
- * mtoc_tensor_t struct).
+ * Every numeric value — scalar or tensor, real or complex — is a
+ * NumericType. There is no separate "Scalar" variant; scalars are
+ * 1×1 numerics. Operations dispatch on the shape predicates below
+ * (isScalar / isRowVec / etc.); codegen uses cTypeFor() to pick the
+ * C representation (`double` vs `double _Complex` vs the
+ * `mtoc_tensor_t` struct).
  */
-export interface TensorType {
-  kind: "Tensor";
+export interface NumericType {
+  kind: "Numeric";
   elem: ElemKind;
   isComplex: boolean;
   rows: DimInfo;
@@ -46,12 +50,12 @@ export interface TensorType {
 }
 
 export type MType =
-  | TensorType
+  | NumericType
   | { kind: "Unknown" }
   | { kind: "Void" };
 
-export const SCALAR_DOUBLE: TensorType = {
-  kind: "Tensor",
+export const SCALAR_DOUBLE: NumericType = {
+  kind: "Numeric",
   elem: "double",
   isComplex: false,
   rows: { kind: "exact", n: 1 },
@@ -59,14 +63,14 @@ export const SCALAR_DOUBLE: TensorType = {
   sign: "unknown",
 };
 
-export function scalarDouble(sign: Sign = "unknown"): TensorType {
+export function scalarDouble(sign: Sign = "unknown"): NumericType {
   return { ...SCALAR_DOUBLE, sign };
 }
 
 /** Construct a row-vector type with cols known exactly. */
-export function rowVecDouble(cols: number, sign: Sign = "unknown"): TensorType {
+export function rowVecDouble(cols: number, sign: Sign = "unknown"): NumericType {
   return {
-    kind: "Tensor",
+    kind: "Numeric",
     elem: "double",
     isComplex: false,
     rows: { kind: "exact", n: 1 },
@@ -76,9 +80,9 @@ export function rowVecDouble(cols: number, sign: Sign = "unknown"): TensorType {
 }
 
 /** Construct a column-vector type with rows known exactly. */
-export function colVecDouble(rows: number, sign: Sign = "unknown"): TensorType {
+export function colVecDouble(rows: number, sign: Sign = "unknown"): NumericType {
   return {
-    kind: "Tensor",
+    kind: "Numeric",
     elem: "double",
     isComplex: false,
     rows: { kind: "exact", n: rows },
@@ -92,9 +96,9 @@ export function matrixDouble(
   rows: number,
   cols: number,
   sign: Sign = "unknown"
-): TensorType {
+): NumericType {
   return {
-    kind: "Tensor",
+    kind: "Numeric",
     elem: "double",
     isComplex: false,
     rows: { kind: "exact", n: rows },
@@ -105,8 +109,8 @@ export function matrixDouble(
 
 // ── Predicates ───────────────────────────────────────────────────────────
 
-export function isTensor(t: MType): t is TensorType {
-  return t.kind === "Tensor";
+export function isNumeric(t: MType): t is NumericType {
+  return t.kind === "Numeric";
 }
 
 function dimIsExactly(d: DimInfo, n: number): boolean {
@@ -114,27 +118,27 @@ function dimIsExactly(d: DimInfo, n: number): boolean {
 }
 
 // Note on shape predicates: these return plain `boolean`, not type
-// predicates. `isTensor(t)` already narrows to `TensorType`; layering
+// predicates. `isNumeric(t)` already narrows to `NumericType`; layering
 // "is-scalar" on top of that as a predicate would have TS exclude
-// TensorType from itself in the false branch, narrowing to `never`.
-// Callers that need TensorType narrowing should `isTensor(t)` first.
+// NumericType from itself in the false branch, narrowing to `never`.
+// Callers that need NumericType narrowing should `isNumeric(t)` first.
 
 /** True when both dimensions are statically known to be exactly 1. */
 export function isScalar(t: MType): boolean {
-  return isTensor(t) && dimIsExactly(t.rows, 1) && dimIsExactly(t.cols, 1);
+  return isNumeric(t) && dimIsExactly(t.rows, 1) && dimIsExactly(t.cols, 1);
 }
 
 /** True when rows is exactly 1 but cols is not (i.e., not a scalar). */
 export function isRowVec(t: MType): boolean {
   return (
-    isTensor(t) && dimIsExactly(t.rows, 1) && !dimIsExactly(t.cols, 1)
+    isNumeric(t) && dimIsExactly(t.rows, 1) && !dimIsExactly(t.cols, 1)
   );
 }
 
 /** True when cols is exactly 1 but rows is not. */
 export function isColVec(t: MType): boolean {
   return (
-    isTensor(t) && dimIsExactly(t.cols, 1) && !dimIsExactly(t.rows, 1)
+    isNumeric(t) && dimIsExactly(t.cols, 1) && !dimIsExactly(t.rows, 1)
   );
 }
 
@@ -145,22 +149,22 @@ export function isVector(t: MType): boolean {
 
 /** A matrix is anything tensor-shaped that isn't a scalar or vector. */
 export function isMatrix(t: MType): boolean {
-  return isTensor(t) && !isScalar(t) && !isVector(t);
+  return isNumeric(t) && !isScalar(t) && !isVector(t);
 }
 
 /** Multi-element tensor (vector or matrix). Codegen uses this to pick
  *  between the bare `double` representation and `mtoc_tensor_t`. */
 export function isMultiElement(t: MType): boolean {
-  return isTensor(t) && !isScalar(t);
+  return isNumeric(t) && !isScalar(t);
 }
 
 export function isScalarReal(t: MType): boolean {
-  return isTensor(t) && isScalar(t) && !t.isComplex;
+  return isNumeric(t) && isScalar(t) && !t.isComplex;
 }
 
 /** Element count when both dims are statically exact, else null. */
 export function staticNumElements(t: MType): number | null {
-  if (!isTensor(t)) return null;
+  if (!isNumeric(t)) return null;
   if (t.rows.kind !== "exact" || t.cols.kind !== "exact") return null;
   return t.rows.n * t.cols.n;
 }
@@ -170,7 +174,7 @@ export function staticNumElements(t: MType): number | null {
  *  `mtoc_tensor_t` (the struct from runtime/tensor.h). Returns null for
  *  types codegen does not yet handle (complex, Unknown, Void). */
 export function cTypeFor(t: MType): string | null {
-  if (t.kind !== "Tensor") return null;
+  if (t.kind !== "Numeric") return null;
   if (t.isComplex) return null;
   if (t.elem !== "double") return null;
   if (isScalar(t)) return "double";
@@ -180,7 +184,7 @@ export function cTypeFor(t: MType): string | null {
 /** Get the "shape category" as a short string, derived from rows/cols.
  *  Used in human-readable output (typeToString, function header
  *  comments). NOT stored on the type. */
-export function shapeCategory(t: TensorType): string {
+export function shapeCategory(t: NumericType): string {
   if (isScalar(t)) return "scalar";
   if (isRowVec(t)) return "rowVec";
   if (isColVec(t)) return "colVec";
@@ -296,9 +300,9 @@ function joinDim(a: DimInfo, b: DimInfo): DimInfo {
   return { kind: "unknown" };
 }
 
-// ── TensorType field template ───────────────────────────────────────────
+// ── NumericType field template ───────────────────────────────────────────
 //
-// Single source of truth describing every storable field on `TensorType`.
+// Single source of truth describing every storable field on `NumericType`.
 // `canonicalizeType`, `typeToString`, and `unify` all iterate this list
 // instead of hand-rolling a copy of every field. Adding a new field
 // (say, `complexKind`) means appending one entry here — the three
@@ -311,32 +315,32 @@ function joinDim(a: DimInfo, b: DimInfo): DimInfo {
 // New fields MUST be appended to the end.
 
 interface TensorFieldEntry {
-  /** Field key on `TensorType`. */
-  readonly name: keyof TensorType;
+  /** Field key on `NumericType`. */
+  readonly name: keyof NumericType;
   /** Canonical-hash value contributed by this field (deterministic JSON
    *  for `canonicalizeType`). Default: pass-through of `t[name]`. */
-  readonly canonicalize: (t: TensorType) => unknown;
+  readonly canonicalize: (t: NumericType) => unknown;
   /** typeToString fragment contributed by this field. Empty string is
    *  fine — the framing handles separators. Receives the whole type so
    *  paired-field renderings (rows+cols → "RxC") can be coalesced into
    *  a single field's contribution. */
-  readonly format: (t: TensorType) => string;
+  readonly format: (t: NumericType) => string;
   /** Joins this field across `a` and `b`, writing the result into
    *  `out`. Returns `false` when the two values can't share a single
    *  C representation — `unify` then short-circuits to Unknown. */
   readonly joinInto: (
-    a: TensorType,
-    b: TensorType,
+    a: NumericType,
+    b: NumericType,
     out: Record<string, unknown>
   ) => boolean;
 }
 
 /** Build a field entry with per-field types preserved. The resulting
  *  closures cast inside the union so callers see a uniform interface. */
-function makeField<K extends keyof TensorType>(
+function makeField<K extends keyof NumericType>(
   name: K,
-  format: (t: TensorType) => string,
-  join: (a: TensorType[K], b: TensorType[K]) => TensorType[K] | null
+  format: (t: NumericType) => string,
+  join: (a: NumericType[K], b: NumericType[K]) => NumericType[K] | null
 ): TensorFieldEntry {
   return {
     name,
@@ -351,7 +355,7 @@ function makeField<K extends keyof TensorType>(
   };
 }
 
-const TENSOR_FIELDS: ReadonlyArray<TensorFieldEntry> = [
+const NUMERIC_FIELDS: ReadonlyArray<TensorFieldEntry> = [
   makeField(
     "elem",
     t => t.elem,
@@ -388,16 +392,16 @@ const TENSOR_FIELDS: ReadonlyArray<TensorFieldEntry> = [
 export function unify(a: MType, b: MType): MType {
   if (a.kind === "Unknown" || b.kind === "Unknown") return { kind: "Unknown" };
   if (a.kind === "Void" || b.kind === "Void") return { kind: "Unknown" };
-  // Walk the field template, building a fresh TensorType in the
-  // canonical field order (kind, then TENSOR_FIELDS in array order).
+  // Walk the field template, building a fresh NumericType in the
+  // canonical field order (kind, then NUMERIC_FIELDS in array order).
   // Insertion order matters because canonicalizeType normalizes by
   // re-iterating the same template, but keeping it consistent here
   // keeps debug-prints stable too.
-  const out: Record<string, unknown> = { kind: "Tensor" };
-  for (const f of TENSOR_FIELDS) {
+  const out: Record<string, unknown> = { kind: "Numeric" };
+  for (const f of NUMERIC_FIELDS) {
     if (!f.joinInto(a, b, out)) return { kind: "Unknown" };
   }
-  return out as unknown as TensorType;
+  return out as unknown as NumericType;
 }
 
 export type ArithKind = "Add" | "Sub" | "Mul" | "Div";
@@ -443,7 +447,7 @@ export function arithResult(
   a: MType,
   b: MType
 ): MType {
-  if (!isTensor(a) || !isTensor(b)) return { kind: "Unknown" };
+  if (!isNumeric(a) || !isNumeric(b)) return { kind: "Unknown" };
   if (a.elem !== b.elem) return { kind: "Unknown" };
   if (a.isComplex || b.isComplex) return { kind: "Unknown" };
   const sign = arithSign(op, a.sign, b.sign);
@@ -458,7 +462,7 @@ export function arithResult(
     // Scalar broadcasts to the other operand's shape.
     const tensor = aSc ? b : a;
     return {
-      kind: "Tensor",
+      kind: "Numeric",
       elem: tensor.elem,
       isComplex: false,
       rows: tensor.rows,
@@ -476,7 +480,7 @@ export function arithResult(
     return { kind: "Unknown" };
   }
   return {
-    kind: "Tensor",
+    kind: "Numeric",
     elem: a.elem,
     isComplex: false,
     rows: a.rows,
@@ -495,7 +499,7 @@ export const arithResultScalar = arithResult;
  * Canonical (deterministic) representation of an MType. Used by the
  * lowerer to hash a function's argument type tuple into a stable suffix:
  * two calls with identical type tuples produce the same hash, and so
- * land on the same specialization. Iterates `TENSOR_FIELDS` so the
+ * land on the same specialization. Iterates `NUMERIC_FIELDS` so the
  * serialization doesn't depend on the order TS happened to insert keys
  * (and so a new field shows up in the hash automatically by being
  * appended to the template above).
@@ -503,8 +507,8 @@ export const arithResultScalar = arithResult;
 export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Unknown") return { kind: "Unknown" };
   if (t.kind === "Void") return { kind: "Void" };
-  const out: Record<string, unknown> = { kind: "Tensor" };
-  for (const f of TENSOR_FIELDS) {
+  const out: Record<string, unknown> = { kind: "Numeric" };
+  for (const f of NUMERIC_FIELDS) {
     out[f.name] = f.canonicalize(t);
   }
   return out;
@@ -522,10 +526,10 @@ export function typeToString(t: MType): string {
   const cat = shapeCategory(t);
   // Dims are rendered into the framing prefix — they're a paired
   // rows+cols read, which doesn't fit the per-field iteration model.
-  // The corresponding TENSOR_FIELDS entries return the empty fragment.
+  // The corresponding NUMERIC_FIELDS entries return the empty fragment.
   const dims = `${dimToString(t.rows)}x${dimToString(t.cols)}`;
-  const fragments = TENSOR_FIELDS
+  const fragments = NUMERIC_FIELDS
     .map(f => f.format(t))
     .filter(s => s !== "");
-  return `Tensor<${cat}(${dims}), ${fragments.join(", ")}>`;
+  return `Numeric<${cat}(${dims}), ${fragments.join(", ")}>`;
 }

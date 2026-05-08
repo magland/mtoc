@@ -17,7 +17,7 @@ import {
   arithResult,
   isScalar,
   isScalarReal,
-  isTensor,
+  isNumeric,
   scalarDouble,
   type MType,
   typeToString,
@@ -86,7 +86,7 @@ export function lowerBinary(
   }
   const left = this.lowerExpr(e.left);
   const right = this.lowerExpr(e.right);
-  if (!isTensor(left.ty) || !isTensor(right.ty)) {
+  if (!isNumeric(left.ty) || !isNumeric(right.ty)) {
     throw new UnsupportedConstruct(
       `binary ${e.op} on ${typeToString(left.ty)} and ${typeToString(
         right.ty
@@ -183,7 +183,7 @@ function lowerArith(
     left.kind === "Var" &&
     right.kind === "Var" &&
     left.name === right.name &&
-    isTensor(ty)
+    isNumeric(ty)
   ) {
     ty = { ...ty, sign: "nonnegative" };
   }

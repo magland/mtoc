@@ -11,7 +11,7 @@ import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
   isScalarReal,
-  isTensor,
+  isNumeric,
   joinSign,
   matrixDouble,
   type Sign,
@@ -60,7 +60,7 @@ export function lowerTensorLiteral(
         );
       }
       loweredRow.push(ir);
-      if (isTensor(ir.ty)) elementSigns.push(ir.ty.sign);
+      if (isNumeric(ir.ty)) elementSigns.push(ir.ty.sign);
     }
     elements.push(loweredRow);
   }

@@ -17,7 +17,7 @@ import {
   canonicalizeType,
   isMultiElement,
   isScalarReal,
-  isTensor,
+  isNumeric,
   isVector,
   signIsNonneg,
   signIsPositive,
@@ -167,7 +167,7 @@ function validateDomain(
   const dom = constraint.domain;
   if (!dom) return;
   const argTy = arg.ty;
-  const argSign = isTensor(argTy) ? argTy.sign : "unknown";
+  const argSign = isNumeric(argTy) ? argTy.sign : "unknown";
   const ok =
     dom === "nonnegative" ? signIsNonneg(argSign) : signIsPositive(argSign);
   if (!ok) {

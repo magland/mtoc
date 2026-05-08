@@ -39,7 +39,7 @@ import type {
 import {
   isMultiElement,
   isScalarReal,
-  isTensor,
+  isNumeric,
   MType,
   scalarDouble,
   signFromValue,
@@ -213,7 +213,7 @@ export class Lowerer {
       // different shapes (e.g. `v=[1 2 3]` then `v=[1 2 3 4]`).
       if (
         prev &&
-        isTensor(merged) &&
+        isNumeric(merged) &&
         isMultiElement(merged) &&
         (merged.rows.kind !== "exact" || merged.cols.kind !== "exact")
       ) {

@@ -8,7 +8,7 @@ flux — these docs deliberately avoid line numbers and try to talk in terms of
 
 - [architecture.md](architecture.md) — the pipeline (parse → lower → emit),
   what each stage owns, what the IR looks like.
-- [type_system.md](type_system.md) — `MType`, `TensorType`, sign tracking, how
+- [type_system.md](type_system.md) — `MType`, `NumericType`, sign tracking, how
   type inference flows through control flow and function specialization.
 - [builtins.md](builtins.md) — the typed signature DSL for builtins, factory
   helpers, how a builtin participates in lowering and codegen.

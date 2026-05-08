@@ -14,7 +14,7 @@
  * `reduceTensor`) keep the registry terse for the common cases.
  */
 
-import { isTensor, scalarDouble, type MType, type Sign } from "../lowering/types.js";
+import { isNumeric, scalarDouble, type MType, type Sign } from "../lowering/types.js";
 
 /** Sign-domain constraint on an argument. `null` means no constraint. */
 export type Domain = "nonnegative" | "positive" | null;
@@ -168,7 +168,7 @@ function reduceVector(
     params: [{ shape: "vector", domain: null, elem: "double" }],
     result: argTys => {
       const argTy = argTys[0];
-      const argSign: Sign = isTensor(argTy) ? argTy.sign : "unknown";
+      const argSign: Sign = isNumeric(argTy) ? argTy.sign : "unknown";
       return scalarDouble(signFromArg(argSign));
     },
     emit: (args, state) => {

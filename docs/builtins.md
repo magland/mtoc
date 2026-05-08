@@ -24,7 +24,7 @@ with a span pointing at that argument.
 
 `result` and `emit` are first-class closures — there is no magic-string
 indirection. A reduction like `sum` whose result sign tracks its argument's
-sign is just `result: ([t]) => scalarDouble(isTensor(t) ? t.sign : "unknown")`.
+sign is just `result: ([t]) => scalarDouble(isNumeric(t) ? t.sign : "unknown")`.
 Codegen for any builtin is whatever `emit` returns.
 
 ## Factories
@@ -91,5 +91,5 @@ The lowerer and codegen consume it generically.
   not in the `emit` closure).
 - A future "tensor-returning" builtin (matrix `sum`, `min(tensor)` returning
   scalar of arg's elem, etc.) doesn't need a DSL change — its `result` returns
-  a multi-element `TensorType` and its `emit` is responsible for materializing
+  a multi-element `NumericType` and its `emit` is responsible for materializing
   the result. Today no such builtin exists; the path is open when one does.
