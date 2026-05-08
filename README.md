@@ -35,16 +35,18 @@ The subset is growing iteratively. Roughly:
   unique call-site argument-type tuple
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
-- Scalar complex numbers: literals (`1i`, `2.5i`, `3+4i`), unary `+`/`-`,
-  arithmetic (`+ - * /`), comparisons + logicals (numbl semantics:
-  ordering on real part, equality on both parts, toBool for `&& ||`),
-  and complex-aware scalar builtins — `sqrt`, `exp`, `log`, `log2`,
-  `log10`, `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`,
-  `atan`, `sinh`, `cosh`, `tanh`, `abs`, `sign`, `min`, `max`,
-  `real`, `imag`, `conj`, `angle`. `floor`/`ceil`/`round`/`fix` and
-  `mod`/`rem` stay real-only by design (numbl semantics). `disp`
-  formatting matches numbl byte-for-byte. Complex tensors are still
-  in progress.
+- Complex numbers (scalar and tensor): literals (`1i`, `2.5i`,
+  `3+4i`, `[1+2i, 3+4i]`), unary `+`/`-`, arithmetic (`+ - * /`),
+  comparisons + logicals (numbl semantics: ordering on real part,
+  equality on both parts, toBool for `&& ||`), elementwise tensor
+  arithmetic with broadcast, `disp` formatting matching numbl
+  byte-for-byte (scalar + tensor), and complex-aware builtins —
+  `sqrt`, `exp`, `log`, `log2`, `log10`, `expm1`, `log1p`, `sin`,
+  `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`,
+  `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`, `angle`,
+  `sum` (vector reduction). `length`/`numel` accept any tensor.
+  `floor`/`ceil`/`round`/`fix`, `mod`/`rem`, and `^` stay real-only
+  for now (numbl-semantics or pending implementation work).
 
 Anything outside the supported subset raises `UnsupportedConstruct` with a
 source span pointing to the offending line.

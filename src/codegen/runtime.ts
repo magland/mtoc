@@ -97,6 +97,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_mod", loadSnippet("mod.h")],
   ["mtoc_sign", loadSnippet("sign.h")],
   ["mtoc_sum", loadSnippet("sum.h", ["mtoc_tensor_t"])],
+  ["mtoc_sum_complex", loadSnippet("sum_complex.h", ["mtoc_tensor_t"])],
   ["mtoc_length", loadSnippet("length.h", ["mtoc_tensor_t"])],
   ["mtoc_numel", loadSnippet("numel.h", ["mtoc_tensor_t"])],
   // Complex-scalar runtime helpers — siblings of libm-real / mtoc-real

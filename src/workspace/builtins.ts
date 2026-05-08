@@ -277,13 +277,27 @@ function runtime(
   };
 }
 
+interface ReduceVectorComplexOpts {
+  /** When set, complex-vector inputs are admitted and dispatched to
+   *  this runtime helper, which returns `double _Complex`. The result
+   *  type tracks the input — real → real, complex → complex. */
+  complexHelperName?: string;
+}
+
 /** 1-arg vector reduction (e.g. `sum(v)`). The result sign is derived
- *  from the argument's sign — summing nonneg elements is nonneg, etc. */
+ *  from the argument's sign — summing nonneg elements is nonneg, etc.
+ *  Optionally accepts a complex sibling helper for complex-vector
+ *  inputs (`sum` over a complex vector returns a complex scalar). */
 function reduceVector(
   name: string,
   helperName: string,
-  signFromArg: (s: Sign) => Sign
+  signFromArg: (s: Sign) => Sign,
+  complexOpts: ReduceVectorComplexOpts = {}
 ): BuiltinSig {
+  const { complexHelperName } = complexOpts;
+  const complexDomain: ComplexDomain = complexHelperName
+    ? "real-or-complex"
+    : "real-only";
   return {
     name,
     category: "expr",
@@ -292,23 +306,30 @@ function reduceVector(
         shape: "vector",
         domain: null,
         elem: "double",
-        complexDomain: "real-only",
+        complexDomain,
       },
     ],
     result: argTys => {
       const argTy = argTys[0];
+      if (complexHelperName && isNumeric(argTy) && argTy.isComplex) {
+        return scalarComplex();
+      }
       const argSign: Sign = isNumeric(argTy) ? argTy.sign : "unknown";
       return scalarDouble(signFromArg(argSign));
     },
-    emit: (args, _argTys, state) => {
-      state.useRuntime(helperName);
-      return `${helperName}(${args.join(", ")})`;
+    emit: (args, argTys, state) => {
+      const useComplex = complexHelperName !== undefined && anyComplex(argTys);
+      const target = useComplex ? complexHelperName! : helperName;
+      state.useRuntime(target);
+      return `${target}(${args.join(", ")})`;
     },
   };
 }
 
 /** 1-arg multi-element tensor reduction returning a scalar of fixed
- *  sign (e.g. `length`, `numel`). */
+ *  sign (e.g. `length`, `numel`). These are pure introspection — the
+ *  result is rows/cols-derived and doesn't touch element values — so
+ *  complex tensors are admissible. */
 function reduceTensor(
   name: string,
   helperName: string,
@@ -322,7 +343,7 @@ function reduceTensor(
         shape: "tensor",
         domain: null,
         elem: "double",
-        complexDomain: "real-only",
+        complexDomain: "real-or-complex",
       },
     ],
     result: () => scalarDouble(resultSign),
@@ -512,7 +533,9 @@ const BUILTINS: BuiltinSig[] = [
   // row vector of column sums) need a tensor-returning builtin path
   // we'll add later. The result sign tracks the input's sign — sum of
   // nonneg elements is nonneg, sum of positive is positive, etc.
-  reduceVector("sum", "mtoc_sum", s => s),
+  reduceVector("sum", "mtoc_sum", s => s, {
+    complexHelperName: "mtoc_sum_complex",
+  }),
 
   // `length` and `numel` accept any non-scalar tensor and return a
   // nonneg scalar (the count includes 0 for an empty tensor).

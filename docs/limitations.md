@@ -54,15 +54,17 @@ M)` with runtime `N`/`M` doesn't yet (the lowering surfaces a clear error).
 ## Source language
 
 - **Complex numbers are partial.** Scalar complex literals, unary `+`/`-`,
-  scalar `+ - * /`, comparisons + logicals, `disp`, and the complex-aware
-  scalar builtins (`sqrt`, `exp`, `log`, `log2`, `log10`, `expm1`, `log1p`,
-  `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`,
-  `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`, `angle`) are
-  byte-for-byte against numbl. `^` (complex pow), the rounding family
+  scalar `+ - * /`, comparisons + logicals, scalar + tensor `disp`, the
+  complex-aware scalar builtins (`sqrt`, `exp`, `log`, `log2`, `log10`,
+  `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`,
+  `cosh`, `tanh`, `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`,
+  `angle`), complex tensor literals, complex tensor element-wise
+  arithmetic with broadcast, and complex vector `sum` are byte-for-byte
+  against numbl. `^` (complex pow), the rounding family
   (`floor`/`ceil`/`round`/`fix`) on complex, `mod`/`rem` on complex, and
-  complex tensors (literals, broadcast, reductions) are not yet supported.
-  `floor`/`ceil`/`round`/`fix` would need a componentwise runtime helper;
-  `mod`/`rem` are real-only by numbl semantics.
+  complex `min`/`max` over tensors (only scalars today) are not yet
+  supported. `floor`/`ceil`/`round`/`fix` would need a componentwise
+  runtime helper; `mod`/`rem` are real-only by numbl semantics.
 - **No char / string.** `'hello'` and `"hello"` raise
   `UnsupportedConstruct: Char` / `String`.
 - **No cell arrays, structs, classes.**
