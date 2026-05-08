@@ -36,8 +36,15 @@ The subset is growing iteratively. Roughly:
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
 - Scalar complex numbers: literals (`1i`, `2.5i`, `3+4i`), unary `+`/`-`,
-  arithmetic (`+ - * /`), and `disp` formatting matching numbl byte-for-byte.
-  Complex comparisons / logicals / builtins / tensors are still in progress.
+  arithmetic (`+ - * /`), comparisons + logicals (numbl semantics:
+  ordering on real part, equality on both parts, toBool for `&& ||`),
+  and complex-aware scalar builtins — `sqrt`, `exp`, `log`, `log2`,
+  `log10`, `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`,
+  `atan`, `sinh`, `cosh`, `tanh`, `abs`, `sign`, `min`, `max`,
+  `real`, `imag`, `conj`, `angle`. `floor`/`ceil`/`round`/`fix` and
+  `mod`/`rem` stay real-only by design (numbl semantics). `disp`
+  formatting matches numbl byte-for-byte. Complex tensors are still
+  in progress.
 
 Anything outside the supported subset raises `UnsupportedConstruct` with a
 source span pointing to the offending line.

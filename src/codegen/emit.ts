@@ -209,11 +209,14 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       // a plain `cName(args)`; runtime-helper builtins also call
       // `state.useRuntime(name)`). The closure can also flip
       // `needMath` for builtins that conditionally pull in <math.h>.
+      // The closure receives the arg MTypes so it can dispatch on
+      // `isComplex` (e.g. `sqrt(x)` vs `sqrt(z)` → `csqrt(z)`).
       const argStrs = e.args.map(a => emitExpr(state, a, 0));
       if (e.callee.kind === "userFunc") {
         return `${e.callee.mangled}(${argStrs.join(", ")})`;
       }
-      return e.callee.sig.emit(argStrs, builtinEmitFacade(state));
+      const argTys = e.args.map(a => a.ty);
+      return e.callee.sig.emit(argStrs, argTys, builtinEmitFacade(state));
     }
 
     case "Binary": {

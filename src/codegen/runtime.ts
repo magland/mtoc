@@ -93,4 +93,15 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_sum", loadSnippet("sum.h", ["mtoc_tensor_t"])],
   ["mtoc_length", loadSnippet("length.h", ["mtoc_tensor_t"])],
   ["mtoc_numel", loadSnippet("numel.h", ["mtoc_tensor_t"])],
+  // Complex-scalar runtime helpers — siblings of libm-real / mtoc-real
+  // entries. Activated by `BuiltinSig.emit` when the call's argTys
+  // include a complex value.
+  ["mtoc_clog2", loadSnippet("clog2.h")],
+  ["mtoc_clog10", loadSnippet("clog10.h")],
+  ["mtoc_clog1p", loadSnippet("clog1p.h")],
+  ["mtoc_cexpm1", loadSnippet("cexpm1.h")],
+  ["mtoc_sign_complex", loadSnippet("sign_complex.h")],
+  ["mtoc_min_complex", loadSnippet("min_complex.h")],
+  ["mtoc_max_complex", loadSnippet("max_complex.h")],
+  ["mtoc_angle_real", loadSnippet("angle_real.h")],
 ]);

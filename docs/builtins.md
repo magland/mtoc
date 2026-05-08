@@ -17,26 +17,43 @@ BuiltinSig {
 ```
 
 A `ParamConstraint` carries `shape` (`scalar` / `vector` / `tensor` / `any`),
-`domain` (`nonnegative` / `positive` / `null`), and `elem` (currently
-`"double"` or `null`). The lowerer reads `params[i].shape`/`.domain` to validate
-each argument; on violation it raises a `TypeError` or `UnsupportedConstruct`
-with a span pointing at that argument.
+`domain` (`nonnegative` / `positive` / `null`), `elem` (currently `"double"` or
+`null`), and `complexDomain` (`real-only` / `real-or-complex` / `complex-only`,
+defaulting to `real-only`). The lowerer reads `params[i].shape`/`.domain`/
+`.complexDomain` to validate each argument; on violation it raises a
+`TypeError` or `UnsupportedConstruct` with a span pointing at that argument.
+The sign-domain check is skipped for complex args (sign is meaningless on
+complex per the type-system invariant; the complex sibling implementation is
+total).
 
 `result` and `emit` are first-class closures — there is no magic-string
 indirection. A reduction like `sum` whose result sign tracks its argument's
 sign is just `result: ([t]) => scalarDouble(isNumeric(t) ? t.sign : "unknown")`.
 Codegen for any builtin is whatever `emit` returns.
 
+The `emit` closure also receives the inferred `argTys: MType[]` so it can
+dispatch on `isComplex` for builtins with both real and complex
+implementations (e.g. `sqrt(real)` → `sqrt`, `sqrt(complex)` → `csqrt`;
+`abs(real)` → `fabs`, `abs(complex)` → `cabs`).
+
 ## Factories
 
 A few factory helpers in `builtins.ts` keep entries terse for the common
 patterns:
 
-- **`libm(name, arity, cName, resultSign, domains)`** — scalar libm function
-  call (`sqrt`, `cos`, `pow`, …). Activates `<math.h>`.
-- **`runtime(name, arity, helperName, resultSign, domains)`** — call to a
-  runtime helper (`mtoc_mod`, `mtoc_sign`, …). Activates the helper snippet
-  via the runtime registry.
+- **`libm(name, arity, cName, resultSign, domains, complexOpts?)`** — scalar
+  libm function call (`sqrt`, `cos`, `pow`, …). Activates `<math.h>`. Pass
+  `complexOpts.complexCName` to admit complex inputs and dispatch to a
+  complex libm sibling (`csqrt`, `cabs` …); set `complexResult: "real"` for
+  abs-style builtins whose complex form returns a real magnitude.
+- **`runtime(name, arity, helperName, resultSign, domains, complexOpts?)`** —
+  call to a runtime helper (`mtoc_mod`, `mtoc_sign`, …). Activates the
+  helper snippet via the runtime registry. Pass
+  `complexOpts.complexHelperName` to admit complex inputs with a registered
+  complex sibling helper (e.g. `mtoc_clog2`, `mtoc_min_complex`); set
+  `complexOpts.realIsLibm: true` when the real-side `helperName` is
+  actually a libm function (e.g. `log10`, `fmin`) so the factory skips
+  `useRuntime` on the real branch.
 - **`reduceVector(name, helperName, signFromArg)`** — vector → scalar reduction
   (`sum`). Sign computed from the arg.
 - **`reduceTensor(name, helperName, resultSign, domains)`** — tensor → scalar

@@ -20,6 +20,7 @@ import type { IRExpr, IRFunction } from "./ir.js";
 import {
   canonicalizeType,
   isMultiElement,
+  isScalar,
   isScalarReal,
   isNumeric,
   isVector,
@@ -87,12 +88,16 @@ export function lowerBuiltinCall(
     );
   }
   const args = argExprs.map(a => this.lowerExpr(a));
-  // Per-arg shape + sign-domain validation, both driven by ParamConstraint.
+  // Per-arg shape + complex-domain + sign-domain validation, all driven
+  // by ParamConstraint. Order matters: the complex-domain check runs
+  // before the sign-domain check so a complex arg fails with "cannot
+  // accept a complex argument" rather than a confusing sign error.
   const argLabel = (i: number): string =>
     builtin.params.length === 1 ? "x" : `arg ${i + 1}`;
   for (let i = 0; i < args.length; i++) {
     const constraint = builtin.params[i];
     validateShape(name, builtin, constraint, args[i], argLabel(i));
+    validateComplexDomain(name, constraint, args[i], argLabel(i), span);
     validateDomain(name, constraint, args[i], argLabel(i), span);
   }
   // The builtin computes its own result MType from the lowered arg
@@ -131,11 +136,22 @@ function validateShape(
     case "any":
       return;
     case "scalar":
-      if (!isScalarReal(argTy)) {
-        throw new UnsupportedConstruct(
-          `${name} ${argLabel} must be a real scalar (got ${typeToString(argTy)})`,
-          arg.span
-        );
+      // Real-only "scalar" rejects complex; "real-or-complex"/"complex-only"
+      // admit complex scalars too. The complex-domain check
+      // (`validateComplexDomain`) runs separately and catches the
+      // mismatched-complex case with a more specific message; here we
+      // only test the shape (scalar-ness) when complex is allowed.
+      {
+        const allowsComplex = constraint.complexDomain !== "real-only";
+        const ok = allowsComplex ? isScalar(argTy) : isScalarReal(argTy);
+        if (!ok) {
+          throw new UnsupportedConstruct(
+            `${name} ${argLabel} must be a ` +
+              `${allowsComplex ? "scalar" : "real scalar"} ` +
+              `(got ${typeToString(argTy)})`,
+            arg.span
+          );
+        }
       }
       return;
     case "vector":
@@ -161,6 +177,35 @@ function validateShape(
   void builtin;
 }
 
+/** Reject a complex argument when the param's `complexDomain` doesn't
+ *  admit one. Conversely, reject a real argument at a `complex-only`
+ *  slot. The error is a plain `TypeError` with the call's span so the
+ *  user sees the source location. */
+function validateComplexDomain(
+  name: string,
+  constraint: ParamConstraint,
+  arg: IRExpr,
+  argLabel: string,
+  span: Span
+): void {
+  const argTy = arg.ty;
+  if (!isNumeric(argTy)) return;
+  if (constraint.complexDomain === "real-only" && argTy.isComplex) {
+    throw new TypeError(
+      `${name} ${argLabel} cannot accept a complex argument ` +
+        `(got ${typeToString(argTy)})`,
+      span
+    );
+  }
+  if (constraint.complexDomain === "complex-only" && !argTy.isComplex) {
+    throw new TypeError(
+      `${name} ${argLabel} requires a complex argument ` +
+        `(got ${typeToString(argTy)})`,
+      span
+    );
+  }
+}
+
 function validateDomain(
   name: string,
   constraint: ParamConstraint,
@@ -171,6 +216,11 @@ function validateDomain(
   const dom = constraint.domain;
   if (!dom) return;
   const argTy = arg.ty;
+  // Sign is meaningless on complex inputs (the type-system invariant
+  // pins it to "unknown"), and the complex sibling implementation
+  // (e.g. `csqrt`) is total — so the real-side sign-domain check is
+  // moot. Skip when the arg is complex.
+  if (isNumeric(argTy) && argTy.isComplex) return;
   const argSign = isNumeric(argTy) ? argTy.sign : "unknown";
   const ok =
     dom === "nonnegative" ? signIsNonneg(argSign) : signIsPositive(argSign);

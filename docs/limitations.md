@@ -54,10 +54,15 @@ M)` with runtime `N`/`M` doesn't yet (the lowering surfaces a clear error).
 ## Source language
 
 - **Complex numbers are partial.** Scalar complex literals, unary `+`/`-`,
-  scalar `+ - * /`, and `disp` are byte-for-byte against numbl. Comparisons,
-  logicals (`&& || ~`), the complex math builtins (`real`, `imag`, `conj`,
-  `angle`, `cabs`, `csqrt`, `cexp`, `clog`, …), `^`, and complex tensors
-  (literals, broadcast, reductions) are not yet supported.
+  scalar `+ - * /`, comparisons + logicals, `disp`, and the complex-aware
+  scalar builtins (`sqrt`, `exp`, `log`, `log2`, `log10`, `expm1`, `log1p`,
+  `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`,
+  `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`, `angle`) are
+  byte-for-byte against numbl. `^` (complex pow), the rounding family
+  (`floor`/`ceil`/`round`/`fix`) on complex, `mod`/`rem` on complex, and
+  complex tensors (literals, broadcast, reductions) are not yet supported.
+  `floor`/`ceil`/`round`/`fix` would need a componentwise runtime helper;
+  `mod`/`rem` are real-only by numbl semantics.
 - **No char / string.** `'hello'` and `"hello"` raise
   `UnsupportedConstruct: Char` / `String`.
 - **No cell arrays, structs, classes.**
