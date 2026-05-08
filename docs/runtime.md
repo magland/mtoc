@@ -52,23 +52,39 @@ Multi-element tensors are passed through C as a single `mtoc_tensor_t` struct:
 
 ```
 typedef struct {
-  double *data;
+  double *MTOC_RESTRICT real;   /* always non-NULL */
+  double *MTOC_RESTRICT imag;   /* NULL iff statically real */
   long rows;
   long cols;
 } mtoc_tensor_t;
 ```
 
+Storage mirrors numbl's split layout: `real` and `imag` are separate
+`double` buffers (no interleaved pairs). For a real tensor `imag` is NULL.
+The type system tracks `isComplex` statically, so codegen knows up front
+whether to touch the imag side — there is no runtime branch on
+`imag != NULL`.
+
 Layout is **column-major** to match numbl / LAPACK. For a tensor of shape
-`(R, C)`, element `(r, c)` lives at `data[r + c * R]`.
+`(R, C)`, element `(r, c)` lives at `real[r + c * R]` (and, when complex,
+the imaginary part lives at `imag[r + c * R]`).
 
 For statically-known sizes (today's only mode), the codegen predeclares the
-backing storage as a stack array (`double _mtoc_<name>_data[N]`) right next
-to the struct value (`mtoc_tensor_t <name> = { _mtoc_<name>_data, R, C };`).
-No heap allocation, no cleanup. When dynamic sizing arrives, the plan is to
-switch the storage path to a per-function arena — the struct shape stays the
-same.
+backing storage as stack arrays (`double _mtoc_<name>_re[N]`, plus
+`_mtoc_<name>_im[N]` when complex) right next to the struct value
+(`mtoc_tensor_t <name> = { _mtoc_<name>_re, NULL, R, C };` for real;
+`{ _mtoc_<name>_re, _mtoc_<name>_im, R, C }` for complex). No heap
+allocation, no cleanup. When dynamic sizing arrives, the plan is to switch
+the storage path to a per-function arena — the struct shape stays the same.
 
-Scalars do **not** use the struct. They stay as bare `double` everywhere.
+`MTOC_RESTRICT` is a small macro defined alongside the struct: it expands to
+`__restrict__` under GCC/Clang and to nothing on compilers that don't
+recognize it. It tells the compiler that two distinct `mtoc_tensor_t`
+values' buffers do not alias each other, which the autovectorizer relies on
+for elementwise loops.
+
+Scalars do **not** use the struct. Real scalars are bare `double`; complex
+scalars are `double _Complex` (C99).
 
 ## Adding a helper
 
@@ -91,6 +107,7 @@ Scalars do **not** use the struct. They stay as bare `double` everywhere.
 ## Reserved name prefix
 
 Anything beginning with `_mtoc_` is reserved for the codegen — synthetic
-loop-counter names, per-tensor backing-buffer names, and so on. The lowerer
-defensively rejects user identifiers starting with `_mtoc_` (numbl syntax
-already disallows leading underscores, but it's belt-and-suspenders).
+loop-counter names, per-tensor backing-buffer names (`_mtoc_<name>_re`,
+`_mtoc_<name>_im`), and so on. The lowerer defensively rejects user
+identifiers starting with `_mtoc_` (numbl syntax already disallows leading
+underscores, but it's belt-and-suspenders).

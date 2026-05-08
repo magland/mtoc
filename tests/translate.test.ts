@@ -61,7 +61,7 @@ describe("translate scalar example", () => {
   it("accepts a row-vector literal (statically-sized)", () => {
     const c = translate("v = [1 2 3]; disp(v);");
     expect(c).toContain("mtoc_tensor_t v");
-    expect(c).toContain("v.data[0] = 1.0;");
+    expect(c).toContain("v.real[0] = 1.0;");
     expect(c).toContain("mtoc_disp_tensor(v);");
   });
 

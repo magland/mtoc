@@ -1,4 +1,4 @@
-/* mtoc runtime helper: disp(t) for a multi-element tensor.
+/* mtoc runtime helper: disp(t) for a multi-element real tensor.
  *
  * Mirrors numbl's `format2DSlice` for 2D tensors:
  *   - elements are formatted via mtoc_format_double
@@ -9,6 +9,9 @@
  * column-width array. Both freed on return. The disp path is not on
  * the hot path of typical numerical code, so the simplicity is worth
  * the alloc.
+ *
+ * Real-only today. A complex-tensor disp variant will land with
+ * complex tensor support; the lowerer dispatches on `isComplex`.
  */
 
 #include <stdio.h>
@@ -39,7 +42,7 @@ static void mtoc_disp_tensor(mtoc_tensor_t t) {
     for (long r = 0; r < rows; r++) {
       long idx = r + c * rows;
       char *cell = cells + idx * CELL_CAP;
-      mtoc_format_double(cell, CELL_CAP, t.data[idx]);
+      mtoc_format_double(cell, CELL_CAP, t.real[idx]);
       long len = (long)strlen(cell);
       if (len > col_widths[c]) col_widths[c] = len;
     }

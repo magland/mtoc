@@ -35,7 +35,8 @@ import {
 // output / assignedVars entry already carries the C identifier the
 // codegen emits — emit.ts consumes those fields directly. Synthetic
 // loop-counter names (`_mtoc_i`, `_mtoc_n`, etc.) and the per-tensor
-// `_mtoc_<cName>_data` buffer name are still synthesized here.
+// `_mtoc_<cName>_re` (and future `_im`) buffer names are still
+// synthesized here.
 
 function formatNumLit(n: number): string {
   if (Number.isNaN(n)) return "NAN";
@@ -120,7 +121,7 @@ interface EmitState {
   /** Stack of synthetic per-element loop-index C names from active
    *  `IRStmt.TensorElemwise` blocks. The top of the stack is the
    *  innermost iter name. When non-empty, multi-element `Var`s render
-   *  as `<cName>.data[<top>]` instead of `<cName>` (broadcast pattern
+   *  as `<cName>.real[<top>]` instead of `<cName>` (broadcast pattern
    *  for scalar `Var`s and `NumLit`s is unchanged). Empty at the top
    *  level — scalar codegen contexts reject multi-element sub-exprs as
    *  before. */
@@ -162,10 +163,13 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
 
     case "Var":
       // Inside a per-element loop, a multi-element `Var` reads the
-      // current slot; scalar `Var`s broadcast unchanged.
+      // current slot; scalar `Var`s broadcast unchanged. All tensors
+      // are real today, so the per-element view goes through `.real`;
+      // when complex tensors land, the loop will fan out into
+      // separate real / imag accesses based on `isComplex`.
       if (state.iterStack.length > 0 && isMultiElement(e.ty)) {
         const iter = state.iterStack[state.iterStack.length - 1];
-        return `${e.cName}.data[${iter}]`;
+        return `${e.cName}.real[${iter}]`;
       }
       return e.cName;
 
@@ -408,7 +412,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // Per-element loop emitted for tensor-result assignments. The
       // body is rendered once per element with the iter-name pushed
       // onto `state.iterStack`; multi-element `Var`s in the body then
-      // read `<cName>.data[<iterCName>]` (see `emitExpr.Var`). Wrapped
+      // read `<cName>.real[<iterCName>]` (see `emitExpr.Var`). Wrapped
       // in a block so `_mtoc_n` is scoped per stmt — nested elementwise
       // loops (not generated today) would shadow without collision.
       pushStmt(state, level, `{`);
@@ -424,7 +428,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       pushStmt(
         state,
         level + 2,
-        `${s.cTargetName}.data[${s.iterCName}] = ${bodyStr};`
+        `${s.cTargetName}.real[${s.iterCName}] = ${bodyStr};`
       );
       pushStmt(state, level + 1, `}`);
       pushStmt(state, level, `}`);
@@ -510,7 +514,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
 
 /** Emit element-by-element column-major writes for a tensor literal
  *  assignment. The target's storage was set up by predeclaration, so
- *  we just write into `<name>.data[idx]`. The literal's element rows
+ *  we just write into `<name>.real[idx]`. The literal's element rows
  *  are nested row-major as written in source — we re-order to
  *  column-major when computing the linear index. */
 function emitTensorLitAssign(
@@ -537,24 +541,25 @@ function emitTensorLitAssign(
       pushStmt(
         state,
         level,
-        `${target}.data[${idx}] = ${emitExpr(state, cellExpr, 0)};`
+        `${target}.real[${idx}] = ${emitExpr(state, cellExpr, 0)};`
       );
     }
   }
 }
 
 /** Emit predeclarations for a {matlabName → VarBinding} table. Scalars
- *  become `double <cName> = 0.0;`. Multi-element tensors get a
- *  stack-backed `mtoc_tensor_t <cName>` plus an underlying
- *  `double _mtoc_<cName>_data[N]` buffer sized to the unified type's
- *  exact dims. Activates the `mtoc_tensor_t` typedef snippet whenever
- *  any tensor is declared. */
+ *  become `double <cName> = 0.0;`. Multi-element real tensors get a
+ *  stack-backed `mtoc_tensor_t <cName>` whose `real` points at a sibling
+ *  `double _mtoc_<cName>_re[N]` buffer and whose `imag` is NULL.
+ *  Activates the `mtoc_tensor_t` typedef snippet whenever any tensor
+ *  is declared. (Complex tensors will add a parallel `_im` buffer
+ *  when complex support lands.) */
 function emitDeclarations(
   state: EmitState,
   level: number,
   vars: ReadonlyMap<string, VarBinding>
 ): void {
-  // Iteration order: by MATLAB name so the generated declaration order
+  // Iteration order: by numbl name so the generated declaration order
   // is stable across runs and matches the original (pre-mangling) names.
   const names = [...vars.keys()].sort();
   for (const name of names) {
@@ -575,15 +580,17 @@ function emitDeclarations(
       useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
       // Synthetic buffer name keyed off the C identifier (which is
       // unique within the scope). The `_mtoc_` prefix is reserved by
-      // lower.ts so it can never collide with a user variable.
-      const buf = `_mtoc_${cName}_data`;
+      // lower.ts so it can never collide with a user variable. The
+      // `_re` suffix mirrors numbl's split storage so the future `_im`
+      // buffer slots in symmetrically.
+      const buf = `_mtoc_${cName}_re`;
       const r = (ty.rows as { kind: "exact"; n: number }).n;
       const c = (ty.cols as { kind: "exact"; n: number }).n;
       pushStmt(state, level, `double ${buf}[${numel}];`);
       pushStmt(
         state,
         level,
-        `mtoc_tensor_t ${cName} = { ${buf}, ${r}, ${c} };`
+        `mtoc_tensor_t ${cName} = { ${buf}, NULL, ${r}, ${c} };`
       );
       continue;
     }
