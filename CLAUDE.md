@@ -8,7 +8,9 @@ Project instructions for agents working in mtoc.
 defines the dialect mtoc accepts. Two roles:
 
 - **Implementation**: mtoc's lexer and parser are vendored verbatim from
-  numbl. The AST shape mtoc consumes is numbl's AST shape.
+  numbl. The AST shape mtoc consumes is numbl's AST shape. The pinned numbl
+  SHA lives in `NUMBL_VERSION`; re-sync with
+  `npx tsx scripts/sync_from_numbl.ts --apply`.
 - **Testing**: numbl's CLI is the cross-runner oracle. Every `.m` script in
   `test_scripts/` is run through both numbl and mtoc, and the stdouts must
   match byte-for-byte.

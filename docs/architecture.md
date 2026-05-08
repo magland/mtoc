@@ -31,10 +31,23 @@ specialization caching.
 
 Live under `src/lexer/` and `src/parser/`. Both come straight from numbl with
 one tiny patch (a local `offsetToLine`) so the parser has no cross-module
-dependency. Treat them as read-only — bugs go upstream to numbl.
+dependency. Treat them as read-only — bugs go upstream to numbl, then sync.
 
 The parser produces a typed AST whose root is `AbstractSyntaxTree`. Every node
 carries a `Span` (file + offset range).
+
+**Sync mechanism.** `NUMBL_VERSION` records the numbl SHA the vendored sources
+were last copied from. `scripts/sync_from_numbl.ts` re-syncs:
+
+```
+npx tsx scripts/sync_from_numbl.ts            # report drift
+npx tsx scripts/sync_from_numbl.ts --check    # exit 1 if drifted (CI)
+npx tsx scripts/sync_from_numbl.ts --apply    # rewrite mtoc, bump pin
+```
+
+After `--apply`, run `npx tsc --noEmit`, the vitest suite, and the cross-runner
+before committing — the lowerer's exhaustive switches over the AST union are
+where upstream parser changes will surface as mtoc compile errors.
 
 ### Lowering (`src/lowering/`)
 
