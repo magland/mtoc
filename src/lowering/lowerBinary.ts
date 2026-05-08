@@ -15,7 +15,6 @@ import { UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
   arithResult,
-  isMultiElement,
   isScalar,
   isScalarComplex,
   isScalarReal,
@@ -228,16 +227,6 @@ function lowerArith(
     isNumeric(ty)
   ) {
     ty = { ...ty, sign: "nonnegative" };
-  }
-  // Complex tensors land in a later stage. For now, broadcasting a
-  // complex scalar against a real tensor (or any other shape that
-  // would produce a complex multi-element result) is rejected with a
-  // clean message at the offending expression.
-  if (isNumeric(ty) && ty.isComplex && isMultiElement(ty)) {
-    throw new UnsupportedConstruct(
-      `binary ${e.op} producing a complex tensor is not yet supported`,
-      e.span
-    );
   }
   if (ty.kind === "Unknown") {
     throw new UnsupportedConstruct(

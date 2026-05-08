@@ -182,12 +182,16 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
 
     case "Var":
       // Inside a per-element loop, a multi-element `Var` reads the
-      // current slot; scalar `Var`s broadcast unchanged. All tensors
-      // are real today, so the per-element view goes through `.real`;
-      // when complex tensors land, the loop will fan out into
-      // separate real / imag accesses based on `isComplex`.
+      // current slot; scalar `Var`s broadcast unchanged. Real
+      // multi-element Vars render as `<v>.real[<iter>]`; complex
+      // multi-element Vars compose `<v>.real[<iter>] + <v>.imag[<iter>] * I`
+      // so the resulting C value is a `double _Complex` that mixes
+      // cleanly with both real and complex sub-exprs in the body.
       if (state.iterStack.length > 0 && isMultiElement(e.ty)) {
         const iter = state.iterStack[state.iterStack.length - 1];
+        if (isNumeric(e.ty) && e.ty.isComplex) {
+          return `(${e.cName}.real[${iter}] + ${e.cName}.imag[${iter}] * I)`;
+        }
         return `${e.cName}.real[${iter}]`;
       }
       return e.cName;
@@ -497,12 +501,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         pushStmt(state, level, `${s.cName} = ${emitExpr(state, s.rhs, 0)};`);
         break;
       }
-      if (
-        isNumeric(s.ty) &&
-        isMultiElement(s.ty) &&
-        !s.ty.isComplex &&
-        s.ty.elem === "double"
-      ) {
+      if (isNumeric(s.ty) && isMultiElement(s.ty) && s.ty.elem === "double") {
         emitElemwiseLoop(state, level, s.cName, s.rhs);
         break;
       }
@@ -659,6 +658,7 @@ function emitElemwiseLoop(
   }
   const iterId = state.elemwiseLoopCounter++;
   const iterName = iterId === 0 ? "_mtoc_i" : `_mtoc_i${iterId}`;
+  const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
   pushStmt(state, level, `{`);
   pushStmt(state, level + 1, `long _mtoc_n = ${numel};`);
   pushStmt(
@@ -669,7 +669,25 @@ function emitElemwiseLoop(
   state.iterStack.push(iterName);
   const bodyStr = emitExpr(state, rhs, 0);
   state.iterStack.pop();
-  pushStmt(state, level + 2, `${cTarget}.real[${iterName}] = ${bodyStr};`);
+  if (isComplex) {
+    // Complex elementwise body: stash through a `double _Complex`
+    // temp so the body is evaluated once, then split with creal /
+    // cimag into the parallel real / imag buffers. Real-typed
+    // sub-exprs in the body promote to complex via C99 implicit rules.
+    pushStmt(state, level + 2, `double _Complex _mtoc_t = ${bodyStr};`);
+    pushStmt(
+      state,
+      level + 2,
+      `${cTarget}.real[${iterName}] = creal(_mtoc_t);`
+    );
+    pushStmt(
+      state,
+      level + 2,
+      `${cTarget}.imag[${iterName}] = cimag(_mtoc_t);`
+    );
+  } else {
+    pushStmt(state, level + 2, `${cTarget}.real[${iterName}] = ${bodyStr};`);
+  }
   pushStmt(state, level + 1, `}`);
   pushStmt(state, level, `}`);
 }
