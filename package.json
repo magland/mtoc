@@ -1,7 +1,7 @@
 {
   "name": "mtoc",
   "version": "0.0.1",
-  "description": "Static MATLAB-to-C translator",
+  "description": "Static numbl-to-C translator",
   "license": "Apache-2.0",
   "type": "module",
   "private": true,

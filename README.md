@@ -25,8 +25,12 @@ The subset is growing iteratively. Roughly:
 - Constants: `pi`, `eps`, `Inf`, `NaN`, `realmax`, `realmin`, `true`, `false`
 - Control flow: `if` / `elseif` / `else`, `while`, `for k = a:b` (and `a:s:b`),
   `break`, `continue`, `return`
-- Math builtins: `sqrt`, `abs`, `exp`, `log`, `sin`, `cos`, `tan`, `floor`,
-  `round`, `mod`, `rem`, `min`, `max`, `atan2`, `hypot`, `power`, `sign`, …
+- Math builtins (libm-mapped): `abs`, `sqrt`, `exp`, `log`, `log2`, `log10`,
+  `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`,
+  `cosh`, `tanh`, `floor`, `ceil`, `round`, `fix`, `rem`, `min`, `max`,
+  `atan2`, `hypot`, `power`
+- Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`
+  (full registry: [`src/workspace/builtins.ts`](src/workspace/builtins.ts))
 - User-defined scalar functions (single output), with one specialization per
   unique call-site argument-type tuple
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise

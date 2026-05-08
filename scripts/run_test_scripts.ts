@@ -12,6 +12,7 @@
  *   npx tsx scripts/run_test_scripts.ts                   # all scripts
  *   npx tsx scripts/run_test_scripts.ts foo.m bar.m       # specific files
  *   MTOC_TEST_CONCURRENCY=4 npx tsx scripts/run_test_scripts.ts
+ *   MTOC_TEST_TIMEOUT_MS=60000 npx tsx scripts/run_test_scripts.ts
  */
 
 import { execFile } from "node:child_process";
@@ -43,11 +44,26 @@ function discoverScripts(): string[] {
   return found.sort();
 }
 
+const TIMEOUT_MS = (() => {
+  const fromEnv = process.env.MTOC_TEST_TIMEOUT_MS;
+  if (fromEnv) {
+    const n = Number.parseInt(fromEnv, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 30_000;
+})();
+
+const MAX_DIFF_LINES = 30;
+
 async function captureStdout(cmd: string, args: string[]): Promise<string> {
   // We pipe stderr to /dev/null inside execFile by default; capture
   // stdout. `maxBuffer` is bumped so chatty test scripts don't trip it.
+  // `timeout` aborts a single-script hang so one bad script can't stall
+  // the whole sweep.
   const { stdout } = await execFileAsync(cmd, args, {
     maxBuffer: 16 * 1024 * 1024,
+    timeout: TIMEOUT_MS,
+    killSignal: "SIGKILL",
   });
   return stdout;
 }
@@ -57,12 +73,21 @@ function diff(expected: string, actual: string): string {
   const bl = actual.split("\n");
   const max = Math.max(al.length, bl.length);
   const lines: string[] = [];
+  let totalMismatch = 0;
   for (let i = 0; i < max; i++) {
     const av = al[i] ?? "";
     const bv = bl[i] ?? "";
     if (av === bv) continue;
+    totalMismatch++;
+    if (lines.length < MAX_DIFF_LINES) {
+      lines.push(
+        `  line ${i + 1}: numbl=${JSON.stringify(av)} mtoc=${JSON.stringify(bv)}`
+      );
+    }
+  }
+  if (totalMismatch > MAX_DIFF_LINES) {
     lines.push(
-      `  line ${i + 1}: numbl=${JSON.stringify(av)} mtoc=${JSON.stringify(bv)}`
+      `  … (${totalMismatch - MAX_DIFF_LINES} more differing line${totalMismatch - MAX_DIFF_LINES === 1 ? "" : "s"} suppressed; ${totalMismatch} total)`
     );
   }
   return lines.join("\n");
