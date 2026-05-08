@@ -539,12 +539,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         );
         break;
       }
-      if (
-        isNumeric(ty) &&
-        isMultiElement(ty) &&
-        !ty.isComplex &&
-        ty.elem === "double"
-      ) {
+      if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
         // The lowering pass requires tensor `disp` args to be a Var;
         // anything else would have thrown at lowering with a span.
         if (s.arg.kind !== "Var") {
@@ -553,8 +548,11 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
               "should have been rejected at lowering"
           );
         }
-        useRuntimeByName(state, "mtoc_disp_tensor");
-        pushStmt(state, level, `mtoc_disp_tensor(${s.arg.cName});`);
+        const helper = ty.isComplex
+          ? "mtoc_disp_tensor_complex"
+          : "mtoc_disp_tensor";
+        useRuntimeByName(state, helper);
+        pushStmt(state, level, `${helper}(${s.arg.cName});`);
         break;
       }
       throw new Error(
@@ -678,9 +676,10 @@ function emitElemwiseLoop(
 
 /** Emit element-by-element column-major writes for a tensor literal
  *  assignment. The target's storage was set up by predeclaration, so
- *  we just write into `<name>.real[idx]`. The literal's element rows
- *  are nested row-major as written in source — we re-order to
- *  column-major when computing the linear index. */
+ *  we just write into `<name>.real[idx]` (and, for a complex literal,
+ *  `<name>.imag[idx]`). The literal's element rows are nested
+ *  row-major as written in source — we re-order to column-major when
+ *  computing the linear index. */
 function emitTensorLitAssign(
   state: EmitState,
   level: number,
@@ -702,22 +701,76 @@ function emitTensorLitAssign(
     for (let r = 0; r < rows; r++) {
       const cellExpr = lit.elements[r][c];
       const idx = r + c * rows;
-      pushStmt(
-        state,
-        level,
-        `${target}.real[${idx}] = ${emitExpr(state, cellExpr, 0)};`
-      );
+      if (!ty.isComplex) {
+        pushStmt(
+          state,
+          level,
+          `${target}.real[${idx}] = ${emitExpr(state, cellExpr, 0)};`
+        );
+        continue;
+      }
+      // Complex literal: write both halves. Special-case structurally
+      // recognizable cells so the emitted C is the same shape numbl's
+      // values would print:
+      //   - NumLit v       → real=v, imag=0
+      //   - ImagLit v      → real=0, imag=v
+      //   - else (a complex-typed expression at this slot): emit a
+      //     temporary `double _Complex` and use creal / cimag. This
+      //     covers nested complex Binary/Unary/Var cells.
+      // Real-typed but not-NumLit cells (e.g. `x` where x is real
+      // scalar) write the cell expression to `.real` and 0 to `.imag`.
+      if (cellExpr.kind === "NumLit") {
+        pushStmt(
+          state,
+          level,
+          `${target}.real[${idx}] = ${formatNumLit(cellExpr.value)};`
+        );
+        pushStmt(state, level, `${target}.imag[${idx}] = 0.0;`);
+        continue;
+      }
+      if (cellExpr.kind === "ImagLit") {
+        pushStmt(state, level, `${target}.real[${idx}] = 0.0;`);
+        pushStmt(
+          state,
+          level,
+          `${target}.imag[${idx}] = ${formatNumLit(cellExpr.value)};`
+        );
+        continue;
+      }
+      const cellTy = cellExpr.ty;
+      if (isNumeric(cellTy) && !cellTy.isComplex) {
+        // Real scalar expression; promotes to (cell, 0i).
+        pushStmt(
+          state,
+          level,
+          `${target}.real[${idx}] = ${emitExpr(state, cellExpr, 0)};`
+        );
+        pushStmt(state, level, `${target}.imag[${idx}] = 0.0;`);
+        continue;
+      }
+      // Generic complex cell: stash into a temp and split with
+      // creal/cimag. The temp is scoped per-cell with a `{}` block so
+      // adjacent cells don't collide.
+      const tmp = `_mtoc_t${state.elemwiseLoopCounter++}`;
+      const cellStr = emitExpr(state, cellExpr, 0);
+      pushStmt(state, level, `{`);
+      pushStmt(state, level + 1, `double _Complex ${tmp} = ${cellStr};`);
+      pushStmt(state, level + 1, `${target}.real[${idx}] = creal(${tmp});`);
+      pushStmt(state, level + 1, `${target}.imag[${idx}] = cimag(${tmp});`);
+      pushStmt(state, level, `}`);
     }
   }
 }
 
 /** Emit predeclarations for a {matlabName → VarBinding} table. Scalars
- *  become `double <cName> = 0.0;`. Multi-element real tensors get a
- *  stack-backed `mtoc_tensor_t <cName>` whose `real` points at a sibling
+ *  become `double <cName> = 0.0;` (real) or `double _Complex <cName> = 0.0;`
+ *  (complex). Multi-element real tensors get a stack-backed
+ *  `mtoc_tensor_t <cName>` whose `real` points at a sibling
  *  `double _mtoc_<cName>_re[N]` buffer and whose `imag` is NULL.
- *  Activates the `mtoc_tensor_t` typedef snippet whenever any tensor
- *  is declared. (Complex tensors will add a parallel `_im` buffer
- *  when complex support lands.) */
+ *  Multi-element complex tensors additionally allocate a parallel
+ *  `double _mtoc_<cName>_im[N]` buffer and pass that as the struct's
+ *  `imag` field. Activates the `mtoc_tensor_t` typedef snippet whenever
+ *  any tensor is declared. */
 function emitDeclarations(
   state: EmitState,
   level: number,
@@ -737,12 +790,7 @@ function emitDeclarations(
       pushStmt(state, level, `double _Complex ${cName} = 0.0;`);
       continue;
     }
-    if (
-      isNumeric(ty) &&
-      isMultiElement(ty) &&
-      !ty.isComplex &&
-      ty.elem === "double"
-    ) {
+    if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
       const numel = staticNumElements(ty);
       if (numel === null) {
         throw new Error(
@@ -751,20 +799,30 @@ function emitDeclarations(
         );
       }
       useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-      // Synthetic buffer name keyed off the C identifier (which is
+      // Synthetic buffer names keyed off the C identifier (which is
       // unique within the scope). The `_mtoc_` prefix is reserved by
-      // lower.ts so it can never collide with a user variable. The
-      // `_re` suffix mirrors numbl's split storage so the future `_im`
-      // buffer slots in symmetrically.
-      const buf = `_mtoc_${cName}_re`;
+      // lower.ts so it can never collide with a user variable. `_re`
+      // and `_im` mirror numbl's split storage; `_im` is only emitted
+      // when the type is statically complex.
+      const reBuf = `_mtoc_${cName}_re`;
       const r = (ty.rows as { kind: "exact"; n: number }).n;
       const c = (ty.cols as { kind: "exact"; n: number }).n;
-      pushStmt(state, level, `double ${buf}[${numel}];`);
-      pushStmt(
-        state,
-        level,
-        `mtoc_tensor_t ${cName} = { ${buf}, NULL, ${r}, ${c} };`
-      );
+      pushStmt(state, level, `double ${reBuf}[${numel}];`);
+      if (ty.isComplex) {
+        const imBuf = `_mtoc_${cName}_im`;
+        pushStmt(state, level, `double ${imBuf}[${numel}];`);
+        pushStmt(
+          state,
+          level,
+          `mtoc_tensor_t ${cName} = { ${reBuf}, ${imBuf}, ${r}, ${c} };`
+        );
+      } else {
+        pushStmt(
+          state,
+          level,
+          `mtoc_tensor_t ${cName} = { ${reBuf}, NULL, ${r}, ${c} };`
+        );
+      }
       continue;
     }
     throw new Error(

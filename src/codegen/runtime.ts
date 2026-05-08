@@ -76,6 +76,11 @@ const MTOC_DISP_TENSOR = loadSnippet("disp_tensor.h", [
   "mtoc_tensor_t",
 ]);
 
+const MTOC_DISP_TENSOR_COMPLEX = loadSnippet("disp_tensor_complex.h", [
+  "mtoc_format_complex",
+  "mtoc_tensor_t",
+]);
+
 /**
  * Map of helper-name → RuntimeSnippet, keyed by the C identifier the
  * codegen emits (e.g. "mtoc_mod"). When emit.ts encounters a call to
@@ -88,6 +93,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_disp_complex", MTOC_DISP_COMPLEX],
   ["mtoc_tensor_t", MTOC_TENSOR_STRUCT],
   ["mtoc_disp_tensor", MTOC_DISP_TENSOR],
+  ["mtoc_disp_tensor_complex", MTOC_DISP_TENSOR_COMPLEX],
   ["mtoc_mod", loadSnippet("mod.h")],
   ["mtoc_sign", loadSnippet("sign.h")],
   ["mtoc_sum", loadSnippet("sum.h", ["mtoc_tensor_t"])],
