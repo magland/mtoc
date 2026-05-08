@@ -9,6 +9,11 @@ import { parseMFile } from "../src/parser/index.js";
 import { Workspace } from "../src/workspace/workspace.js";
 import { lower } from "../src/lowering/lower.js";
 import { emitC } from "../src/codegen/emit.js";
+import {
+  canonicalizeType,
+  unify,
+  type NumericType,
+} from "../src/lowering/types.js";
 // Note: parseMFile / Workspace / lower are also used directly by the
 // IRStmt.Disp assertion below (it inspects the lowered IR rather than
 // the emitted C, to exercise the lowering boundary explicitly).
@@ -192,5 +197,39 @@ describe("CLI translate + run", () => {
         stdio: "pipe",
       })
     ).toThrow();
+  });
+});
+
+describe("type system invariants", () => {
+  // Sign is meaningful only when isComplex === false. The invariant is
+  // enforced at observation sites (canonicalizeType, unify) so a stray
+  // sign carried through can't bloat the specialization cache.
+
+  const complexScalar = (sign: NumericType["sign"]): NumericType => ({
+    kind: "Numeric",
+    elem: "double",
+    isComplex: true,
+    rows: { kind: "exact", n: 1 },
+    cols: { kind: "exact", n: 1 },
+    sign,
+  });
+
+  it("canonicalizeType normalizes sign on complex to 'unknown'", () => {
+    const a = canonicalizeType(complexScalar("positive"));
+    const b = canonicalizeType(complexScalar("negative"));
+    const c = canonicalizeType(complexScalar("unknown"));
+    // All three must hash identically — sign must not influence the
+    // specialization key when isComplex is true.
+    expect(a).toEqual(c);
+    expect(b).toEqual(c);
+  });
+
+  it("unify of complex types produces sign='unknown' regardless of inputs", () => {
+    const merged = unify(complexScalar("positive"), complexScalar("negative"));
+    expect(merged.kind).toBe("Numeric");
+    if (merged.kind === "Numeric") {
+      expect(merged.isComplex).toBe(true);
+      expect(merged.sign).toBe("unknown");
+    }
   });
 });

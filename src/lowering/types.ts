@@ -49,6 +49,15 @@ export type Sign =
  * (isScalar / isRowVec / etc.); codegen uses cTypeFor() to pick the
  * C representation (`double` vs `double _Complex` vs the
  * `mtoc_tensor_t` struct).
+ *
+ * Invariant: `sign` is meaningful only when `isComplex === false`.
+ * For complex numerics, `sign` MUST be `"unknown"`. The invariant is
+ * enforced wherever the type is observed for behavioral effect:
+ * `canonicalizeType` (specialization keys) and `unify` (assigned-var
+ * type merging) both normalize a complex type's sign to "unknown"
+ * before producing their output. Constructors should already respect
+ * the invariant; the normalize step exists so a stray `sign` carried
+ * through a join can't bloat the specialization cache.
  */
 export interface NumericType {
   kind: "Numeric";
@@ -56,7 +65,18 @@ export interface NumericType {
   isComplex: boolean;
   rows: DimInfo;
   cols: DimInfo;
+  /** Meaningful only when `isComplex === false`; "unknown" otherwise. */
   sign: Sign;
+}
+
+/**
+ * Return `t` with `sign: "unknown"` when `t.isComplex === true`, else
+ * `t` unchanged. Internal — used by `canonicalizeType` and `unify` to
+ * enforce the "sign is undefined on complex" invariant at observation
+ * sites without forcing every constructor to remember the rule.
+ */
+function normalizeComplexSign(t: NumericType): NumericType {
+  return t.isComplex && t.sign !== "unknown" ? { ...t, sign: "unknown" } : t;
 }
 
 export type MType = NumericType | { kind: "Unknown" } | { kind: "Void" };
@@ -443,7 +463,7 @@ export function unify(a: MType, b: MType): MType {
   for (const f of NUMERIC_FIELDS) {
     if (!f.joinInto(a, b, out)) return { kind: "Unknown" };
   }
-  return out as unknown as NumericType;
+  return normalizeComplexSign(out as unknown as NumericType);
 }
 
 export type ArithKind = "Add" | "Sub" | "Mul" | "Div";
@@ -545,9 +565,12 @@ export const arithResultScalar = arithResult;
 export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Unknown") return { kind: "Unknown" };
   if (t.kind === "Void") return { kind: "Void" };
+  // Normalize before serializing so two complex types differing only
+  // in a leftover `sign` field hash to the same specialization key.
+  const normalized = normalizeComplexSign(t);
   const out: Record<string, unknown> = { kind: "Numeric" };
   for (const f of NUMERIC_FIELDS) {
-    out[f.name] = f.canonicalize(t);
+    out[f.name] = f.canonicalize(normalized);
   }
   return out;
 }
