@@ -1,0 +1,11 @@
+disp(sign(-5));
+disp(sign(0));
+disp(sign(7));
+disp(fix(3.7));
+disp(fix(-3.7));
+disp(round(asin(1) * 10000));
+disp(round(acos(0) * 10000));
+disp(round(atan(1) * 10000));
+disp(round(sinh(1) * 10000));
+disp(round(cosh(1) * 10000));
+disp(round(tanh(1) * 10000));

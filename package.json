@@ -1,0 +1,24 @@
+{
+  "name": "mtoc",
+  "version": "0.0.1",
+  "description": "Static MATLAB-to-C translator",
+  "license": "Apache-2.0",
+  "type": "module",
+  "private": true,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "translate": "tsx src/cli.ts translate",
+    "run": "tsx src/cli.ts run",
+    "test": "vitest run",
+    "test:scripts": "tsx scripts/run_test_scripts.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1",
+    "tsx": "^4.21.0",
+    "typescript": "~5.9.3",
+    "vitest": "^4.0.18"
+  }
+}

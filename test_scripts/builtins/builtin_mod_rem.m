@@ -1,0 +1,10 @@
+disp(mod(7, 3));
+disp(mod(-7, 3));
+disp(mod(7, -3));
+disp(mod(-7, -3));
+disp(rem(7, 3));
+disp(rem(-7, 3));
+disp(rem(7, -3));
+disp(rem(-7, -3));
+disp(mod(0, 5));
+disp(mod(10, 0));

@@ -1,0 +1,114 @@
+{
+  "operators": {
+    "twoChar": [
+      { "pattern": ".*", "token": "DotStar" },
+      { "pattern": "./", "token": "DotSlash" },
+      { "pattern": ".\\", "token": "DotBackslash" },
+      { "pattern": ".^", "token": "DotCaret" },
+      { "pattern": "&&", "token": "AndAnd" },
+      { "pattern": "||", "token": "OrOr" },
+      { "pattern": "==", "token": "Equal" },
+      { "pattern": "~=", "token": "NotEqual" },
+      { "pattern": "<=", "token": "LessEqual" },
+      { "pattern": ">=", "token": "GreaterEqual" }
+    ],
+    "singleChar": [
+      { "pattern": "+", "token": "Plus" },
+      { "pattern": "-", "token": "Minus" },
+      { "pattern": "*", "token": "Star" },
+      { "pattern": "/", "token": "Slash" },
+      { "pattern": "\\", "token": "Backslash" },
+      { "pattern": "^", "token": "Caret" },
+      { "pattern": "&", "token": "And" },
+      { "pattern": "|", "token": "Or" },
+      { "pattern": "~", "token": "Tilde" },
+      { "pattern": "@", "token": "At" },
+      { "pattern": "?", "token": "Question" },
+      { "pattern": "<", "token": "Less" },
+      { "pattern": ">", "token": "Greater" },
+      { "pattern": ".", "token": "Dot" },
+      { "pattern": ":", "token": "Colon" },
+      { "pattern": ",", "token": "Comma" },
+      { "pattern": "=", "token": "Assign" },
+      {
+        "pattern": ";",
+        "token": "Semicolon",
+        "special": "semicolonQuoteHeuristic"
+      },
+      { "pattern": "(", "token": "LParen" },
+      { "pattern": ")", "token": "RParen" },
+      { "pattern": "[", "token": "LBracket" },
+      { "pattern": "]", "token": "RBracket" },
+      { "pattern": "{", "token": "LBrace" },
+      { "pattern": "}", "token": "RBrace" }
+    ]
+  },
+  "comments": {
+    "blockComment": {
+      "start": "%{",
+      "end": "%}",
+      "consumeTrailingNewline": true
+    },
+    "sectionMarker": {
+      "pattern": "%%",
+      "requireLineStart": true,
+      "token": "Section",
+      "consumeToEOL": true,
+      "consumeTrailingNewline": true,
+      "fallbackToLineComment": true
+    },
+    "lineComment": {
+      "start": "%"
+    }
+  },
+  "strings": [
+    {
+      "delimiter": "\"",
+      "escape": "\"\"",
+      "token": "Str",
+      "allowMultiline": false
+    },
+    {
+      "delimiter": "'",
+      "escape": "''",
+      "token": "Char",
+      "allowMultiline": false,
+      "disambiguation": {
+        "type": "transpose",
+        "transposeToken": "Transpose",
+        "conditions": {
+          "requireAdjacency": true,
+          "requirePrevValueOrDot": true
+        }
+      }
+    }
+  ],
+  "special": {
+    "ellipsis": {
+      "pattern": "...",
+      "token": "Ellipsis",
+      "consumeToEOL": true,
+      "consumeTrailingNewline": true
+    },
+    "newline": {
+      "pattern": "\n",
+      "token": "Newline",
+      "coalesceMultiple": true,
+      "setsLineStart": true
+    }
+  },
+  "numbers": {
+    "allowUnderscores": true,
+    "stripUnderscores": true,
+    "integerToken": "Integer",
+    "floatToken": "Float",
+    "exponentChars": ["e", "E", "d", "D"],
+    "decimalPoint": ".",
+    "dotOperatorPrefixes": ["*", "/", "\\", "^"]
+  },
+  "identifiers": {
+    "token": "Ident",
+    "startChars": "alpha",
+    "continueChars": "alnum"
+  }
+}
