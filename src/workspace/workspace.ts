@@ -8,7 +8,7 @@
  */
 
 import type { AbstractSyntaxTree, Stmt } from "../parser/index.js";
-import { allScalarBuiltinNames, getScalarBuiltin } from "./builtins.js";
+import { allBuiltinNames, getBuiltin } from "./builtins.js";
 
 /** Narrowed alias for the parser's `Stmt.Function`. */
 export type FunctionStmt = Extract<Stmt, { type: "Function" }>;
@@ -53,14 +53,15 @@ export class Workspace {
     if (this.localFunctions.has(name)) {
       return { kind: "userFunction", name };
     }
-    // Single registry: both `disp` (category="stmt") and every scalar
-    // expression-builtin live in `getScalarBuiltin`. Lowering routes
-    // ExprStmt(disp(...)) into `IRStmt.Disp` based on `categoryOf`.
-    if (getScalarBuiltin(name)) return { kind: "builtin", name };
+    // Single registry: both `disp` (category="stmt") and every
+    // expression-builtin live in `getBuiltin`. Lowering routes
+    // ExprStmt(disp(...)) into `IRStmt.Disp` based on the builtin's
+    // `category`.
+    if (getBuiltin(name)) return { kind: "builtin", name };
     return null;
   }
 
   hasBuiltin(name: string): boolean {
-    return allScalarBuiltinNames().includes(name);
+    return allBuiltinNames().includes(name);
   }
 }

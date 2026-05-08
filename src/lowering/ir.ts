@@ -7,6 +7,7 @@
  */
 
 import type { Span, BinaryOperation, UnaryOperation } from "../parser/index.js";
+import type { BuiltinSig } from "../workspace/builtins.js";
 import type { MType } from "./types.js";
 
 export type IRExpr =
@@ -63,10 +64,12 @@ export type IRExpr =
     };
 
 /** Discriminator on a `Call`'s C-side target. Codegen consumes this
- *  directly — no map lookup against the runtime registry. */
+ *  directly — builtin calls hold a reference to the typed
+ *  `BuiltinSig` (whose `emit` closure activates any runtime helper
+ *  it needs and renders the C expression); user-function calls hold
+ *  the mangled specialization name. */
 export type CallTarget =
-  | { kind: "libm"; cName: string }
-  | { kind: "runtime"; helperName: string }
+  | { kind: "builtin"; sig: BuiltinSig }
   | { kind: "userFunc"; mangled: string };
 
 export type IRStmt =

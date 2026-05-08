@@ -9,22 +9,19 @@ import { createHash } from "node:crypto";
 
 import type { Expr, Span } from "../parser/index.js";
 import { offsetToLine } from "../parser/sourceLoc.js";
-import { argShapeOf, categoryOf, getScalarBuiltin } from "../workspace/builtins.js";
+import { getBuiltin, type BuiltinSig, type ParamConstraint } from "../workspace/builtins.js";
 import type { FunctionStmt } from "../workspace/workspace.js";
-import { RUNTIME_HELPERS } from "../codegen/runtime.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
-import type { CallTarget, IRExpr, IRFunction } from "./ir.js";
+import type { IRExpr, IRFunction } from "./ir.js";
 import {
   canonicalizeType,
   isMultiElement,
   isScalarReal,
   isTensor,
   isVector,
-  scalarDouble,
   signIsNonneg,
   signIsPositive,
   type MType,
-  type Sign,
   typeToString,
 } from "./types.js";
 import { Lowerer, assertNotMtocReserved, cNameFor } from "./lower.js";
@@ -51,8 +48,8 @@ export function lowerFuncCall(
   // lower.ts before reaching here; any other position is rejected with
   // a span. Routing through the unified registry means new stmt-only
   // builtins (error, assert, …) get this rejection for free.
-  const builtin = getScalarBuiltin(e.name);
-  if (builtin && categoryOf(builtin) === "stmt") {
+  const builtin = getBuiltin(e.name);
+  if (builtin && builtin.category === "stmt") {
     throw new UnsupportedConstruct(
       `'${e.name}' is a statement-only builtin and cannot be used as a ` +
         `value-producing call`,
@@ -62,102 +59,125 @@ export function lowerFuncCall(
   return lowerBuiltinCall.call(this, e.name, e.args, e.span);
 }
 
-/** Lower a builtin call. Validates per-arg shape + sign domain, then
- *  produces an `IRExpr.Call` with the right `callee` discriminator —
- *  libm vs mtoc runtime helper. */
+/** Lower a builtin call. Walks the builtin's `params` for shape +
+ *  sign-domain validation, asks the builtin for its result type, and
+ *  produces an `IRExpr.Call` whose `callee` carries a reference to
+ *  the typed `BuiltinSig` (the closure that renders the C call). */
 export function lowerBuiltinCall(
   this: Lowerer,
   name: string,
   argExprs: Expr[],
   span: Span
 ): IRExpr {
-  const builtin = getScalarBuiltin(name);
+  const builtin = getBuiltin(name);
   if (!builtin) {
     throw new UnsupportedConstruct(
       `builtin '${name}' is not yet supported`,
       span
     );
   }
-  if (argExprs.length !== builtin.arity) {
+  if (argExprs.length !== builtin.params.length) {
     throw new UnsupportedConstruct(
-      `${name} expects ${builtin.arity} argument(s), got ${argExprs.length}`,
+      `${name} expects ${builtin.params.length} argument(s), got ${argExprs.length}`,
       span
     );
   }
   const args = argExprs.map(a => this.lowerExpr(a));
-  // Per-arg shape validation: scalar / vector / tensor. The default
-  // is scalar (matches every legacy builtin entry).
+  // Per-arg shape + sign-domain validation, both driven by ParamConstraint.
+  const argLabel = (i: number): string =>
+    builtin.params.length === 1 ? "x" : `arg ${i + 1}`;
   for (let i = 0; i < args.length; i++) {
-    const shape = argShapeOf(builtin, i);
-    const argTy = args[i].ty;
-    const argLabel = builtin.arity === 1 ? "x" : `arg ${i + 1}`;
-    if (shape === "scalar") {
-      if (!isScalarReal(argTy)) {
-        throw new UnsupportedConstruct(
-          `${name} ${argLabel} must be a real scalar ` +
-            `(got ${typeToString(argTy)})`,
-          args[i].span
-        );
-      }
-    } else if (shape === "vector") {
-      if (!isVector(argTy)) {
-        throw new UnsupportedConstruct(
-          `${name} ${argLabel} must be a vector ` +
-            `(got ${typeToString(argTy)})`,
-          args[i].span
-        );
-      }
-    } else if (shape === "tensor") {
-      if (!isMultiElement(argTy)) {
-        throw new UnsupportedConstruct(
-          `${name} ${argLabel} must be a non-scalar tensor ` +
-            `(got ${typeToString(argTy)})`,
-          args[i].span
-        );
-      }
+    const constraint = builtin.params[i];
+    validateShape(name, builtin, constraint, args[i], argLabel(i));
+    validateDomain(name, constraint, args[i], argLabel(i), span);
+  }
+  // The builtin computes its own result MType from the lowered arg
+  // types — captures arg-sign-preserving reductions (sum), fixed-sign
+  // libm wrappers (sqrt → nonneg), etc. May throw TypeError; rewrap
+  // with the call's span if the throw landed without one.
+  const argTys: MType[] = args.map(a => a.ty);
+  let resultTy: MType;
+  try {
+    resultTy = builtin.result(argTys);
+  } catch (err) {
+    if (err instanceof TypeError && err.span === null) {
+      throw new TypeError(err.message, span);
     }
+    throw err;
   }
-  // Sign-domain validation — applies in any shape.
-  for (let i = 0; i < args.length; i++) {
-    const dom = builtin.argDomains[i];
-    if (!dom) continue;
-    const argTy = args[i].ty;
-    const argSign = isTensor(argTy) ? argTy.sign : "unknown";
-    const ok =
-      dom === "nonnegative"
-        ? signIsNonneg(argSign)
-        : signIsPositive(argSign);
-    if (!ok) {
-      const argLabel = builtin.arity === 1 ? "x" : `arg ${i + 1}`;
-      throw new TypeError(
-        `${name} requires ${argLabel} to be statically ${dom} ` +
-          `(got sign='${argSign}'). ` +
-          `Use abs(...) or restructure the expression.`,
-        span
-      );
-    }
-  }
-  let resultSign: Sign;
-  if (builtin.resultSign === "preserve") {
-    const argTy = args[0].ty;
-    resultSign = isTensor(argTy) ? argTy.sign : "unknown";
-  } else {
-    resultSign = builtin.resultSign;
-  }
-  // Pick the codegen-side variant: builtins whose `cFunc` is a
-  // registered runtime helper need that helper activated; everything
-  // else routes to libm.
-  const callee: CallTarget = RUNTIME_HELPERS.has(builtin.cFunc)
-    ? { kind: "runtime", helperName: builtin.cFunc }
-    : { kind: "libm", cName: builtin.cFunc };
   return {
     kind: "Call",
     name,
-    callee,
+    callee: { kind: "builtin", sig: builtin },
     args,
-    ty: scalarDouble(resultSign),
+    ty: resultTy,
     span,
   };
+}
+
+function validateShape(
+  name: string,
+  builtin: BuiltinSig,
+  constraint: ParamConstraint,
+  arg: IRExpr,
+  argLabel: string
+): void {
+  const argTy = arg.ty;
+  switch (constraint.shape) {
+    case "any":
+      return;
+    case "scalar":
+      if (!isScalarReal(argTy)) {
+        throw new UnsupportedConstruct(
+          `${name} ${argLabel} must be a real scalar (got ${typeToString(argTy)})`,
+          arg.span
+        );
+      }
+      return;
+    case "vector":
+      if (!isVector(argTy)) {
+        throw new UnsupportedConstruct(
+          `${name} ${argLabel} must be a vector (got ${typeToString(argTy)})`,
+          arg.span
+        );
+      }
+      return;
+    case "tensor":
+      if (!isMultiElement(argTy)) {
+        throw new UnsupportedConstruct(
+          `${name} ${argLabel} must be a non-scalar tensor (got ${typeToString(argTy)})`,
+          arg.span
+        );
+      }
+      return;
+  }
+  // Element-kind validation would live here once we have something
+  // other than "double" to compare against; for now `elem` is purely
+  // declarative.
+  void builtin;
+}
+
+function validateDomain(
+  name: string,
+  constraint: ParamConstraint,
+  arg: IRExpr,
+  argLabel: string,
+  span: Span
+): void {
+  const dom = constraint.domain;
+  if (!dom) return;
+  const argTy = arg.ty;
+  const argSign = isTensor(argTy) ? argTy.sign : "unknown";
+  const ok =
+    dom === "nonnegative" ? signIsNonneg(argSign) : signIsPositive(argSign);
+  if (!ok) {
+    throw new TypeError(
+      `${name} requires ${argLabel} to be statically ${dom} ` +
+        `(got sign='${argSign}'). ` +
+        `Use abs(...) or restructure the expression.`,
+      span
+    );
+  }
 }
 
 /** Lower a user-function call. Specializes (or reuses an existing

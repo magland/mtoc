@@ -22,6 +22,7 @@ import {
   typeToString,
   type TensorType,
 } from "../lowering/types.js";
+import type { BuiltinEmitState } from "../workspace/builtins.js";
 import {
   MTOC_DISP_DOUBLE,
   MTOC_TENSOR_STRUCT,
@@ -108,7 +109,9 @@ function precedence(op: BinaryOperation | UnaryOperation): number {
 }
 
 interface EmitState {
-  needMath: boolean;
+  /** Boxed so the `BuiltinSig.emit` closure (which receives a small
+   *  facade view, not the whole EmitState) can flip it. */
+  needMath: { value: boolean };
   /** Runtime helpers used by the program, in stable order. */
   runtime: RuntimeSnippet[];
   /** Names of helpers already added to `runtime` (dedup). */
@@ -122,6 +125,16 @@ interface EmitState {
    *  level — scalar codegen contexts reject multi-element sub-exprs as
    *  before. */
   iterStack: string[];
+}
+
+/** Build the small facade view passed to `BuiltinSig.emit` closures.
+ *  Hides the full `EmitState`; exposes only what the closures need
+ *  (boxed needMath + a useRuntime function). */
+function builtinEmitFacade(state: EmitState): BuiltinEmitState {
+  return {
+    needMath: state.needMath,
+    useRuntime: name => useRuntimeByName(state, name),
+  };
 }
 
 function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
@@ -167,17 +180,17 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       );
 
     case "Call": {
-      // Activation of mtoc_* helpers is handled by the analyze pre-pass
-      // before `emitExpr` is called. Each callee variant maps to its C
-      // identifier directly — no registry lookup.
-      const argList = e.args.map(a => emitExpr(state, a, 0)).join(", ");
-      const cName =
-        e.callee.kind === "libm"
-          ? e.callee.cName
-          : e.callee.kind === "runtime"
-            ? e.callee.helperName
-            : e.callee.mangled;
-      return `${cName}(${argList})`;
+      // User-function calls render as `mangled(args)`. Builtins delegate
+      // to the registry's `emit` closure, which renders the C call and
+      // activates any runtime helper it depends on (libm builtins return
+      // a plain `cName(args)`; runtime-helper builtins also call
+      // `state.useRuntime(name)`). The closure can also flip
+      // `needMath` for builtins that conditionally pull in <math.h>.
+      const argStrs = e.args.map(a => emitExpr(state, a, 0));
+      if (e.callee.kind === "userFunc") {
+        return `${e.callee.mangled}(${argStrs.join(", ")})`;
+      }
+      return e.callee.sig.emit(argStrs, builtinEmitFacade(state));
     }
 
     case "Binary": {
@@ -256,7 +269,7 @@ function analyzeExpr(state: EmitState, e: IRExpr): void {
   switch (e.kind) {
     case "NumLit":
       // INFINITY / NAN macros come from <math.h>.
-      if (!Number.isFinite(e.value)) state.needMath = true;
+      if (!Number.isFinite(e.value)) state.needMath.value = true;
       return;
     case "Var":
       return;
@@ -267,16 +280,17 @@ function analyzeExpr(state: EmitState, e: IRExpr): void {
     case "Call": {
       // Every builtin we currently emit lives in <math.h> (libm + the
       // mtoc runtime helpers all `#include <math.h>` themselves), so
-      // any Call forces <math.h>.
-      state.needMath = true;
-      if (e.callee.kind === "runtime") {
-        useRuntimeByName(state, e.callee.helperName);
-      }
+      // any Call forces <math.h>. Runtime-helper activation happens
+      // inside `BuiltinSig.emit` when the call renders — see emitExpr's
+      // Call case. We don't pre-walk for activation here because emit
+      // and analyze share the same traversal order, so the resulting
+      // helper-list ordering matches.
+      state.needMath.value = true;
       for (const a of e.args) analyzeExpr(state, a);
       return;
     }
     case "Binary":
-      if (e.op === "Pow" || e.op === "ElemPow") state.needMath = true;
+      if (e.op === "Pow" || e.op === "ElemPow") state.needMath.value = true;
       analyzeExpr(state, e.left);
       analyzeExpr(state, e.right);
       return;
@@ -319,7 +333,7 @@ function analyzeStmt(state: EmitState, s: IRStmt): void {
     case "For":
       // The emitted iteration-count formula calls floor(), so any For
       // forces <math.h> regardless of what its bounds analyze to.
-      state.needMath = true;
+      state.needMath.value = true;
       analyzeExpr(state, s.start);
       analyzeExpr(state, s.step);
       analyzeExpr(state, s.end);
@@ -647,7 +661,7 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
 
 export function emitC(prog: IRProgram): string {
   const state: EmitState = {
-    needMath: false,
+    needMath: { value: false },
     runtime: [],
     runtimeNames: new Set(),
     lines: [],
@@ -677,7 +691,7 @@ export function emitC(prog: IRProgram): string {
 
   // Headers: union of explicit needs + every runtime snippet's headers.
   const headerSet = new Set<string>(["<stdio.h>"]);
-  if (state.needMath) headerSet.add("<math.h>");
+  if (state.needMath.value) headerSet.add("<math.h>");
   for (const snippet of state.runtime) {
     for (const h of snippet.headers) headerSet.add(h);
   }
