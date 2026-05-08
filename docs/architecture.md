@@ -87,10 +87,11 @@ A discriminated-union IR. Two trees:
   `userFunc`) — codegen no longer does string lookups against the runtime
   registry.
 - `IRStmt` — `Assign`, `ExprStmt`, `Disp`, `If`, `While`, `For`, `Break`,
-  `Continue`, `ReturnFromFunction`, `TensorElemwise`. `TensorElemwise` is the
-  per-element loop emitted for tensor-result assignments; codegen has *one*
-  expression visitor that renders multi-element `Var`s differently when an
-  iter-stack is active.
+  `Continue`, `ReturnFromFunction`. `Assign` carries any RHS — scalar,
+  `TensorLit`, or any other multi-element expression; codegen dispatches on
+  RHS kind/shape and emits a per-element loop when needed. The expression
+  visitor maintains an iter-stack so multi-element `Var`s render as
+  `<cName>.real[<iter>]` while a loop is active.
 
 The IR carries enough information that codegen never has to re-derive types or
 re-mangle names — every `Var` / `Assign` / param has its `cName` baked in.
@@ -102,8 +103,8 @@ Responsibilities:
 
 - Activate runtime helpers on demand (one walk; see "Runtime" below).
 - Predeclare every `assignedVars` entry at the top of `main()` and inside each
-  function body (scalars as `double x = 0.0;`, tensors as
-  `double _mtoc_<name>_data[N]; mtoc_tensor_t <name> = { … };`).
+  function body (scalars as `double x = 0.0;`, real tensors as
+  `double _mtoc_<name>_re[N]; mtoc_tensor_t <name> = { _mtoc_<name>_re, NULL, R, C };`).
 - Emit user-function specializations ahead of `main`, each with a header
   comment showing the source span and the inferred type signature.
 - Map operators to C with a precedence-aware printer; nested unary operands

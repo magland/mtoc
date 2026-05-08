@@ -118,14 +118,17 @@ interface EmitState {
   /** Names of helpers already added to `runtime` (dedup). */
   runtimeNames: Set<string>;
   lines: string[];
-  /** Stack of synthetic per-element loop-index C names from active
-   *  `IRStmt.TensorElemwise` blocks. The top of the stack is the
-   *  innermost iter name. When non-empty, multi-element `Var`s render
-   *  as `<cName>.real[<top>]` instead of `<cName>` (broadcast pattern
-   *  for scalar `Var`s and `NumLit`s is unchanged). Empty at the top
-   *  level — scalar codegen contexts reject multi-element sub-exprs as
-   *  before. */
+  /** Stack of synthetic per-element loop-index C names. emit pushes
+   *  one when it opens a per-element loop for a multi-element `Assign`
+   *  RHS; the top of the stack is the innermost iter name. When the
+   *  stack is non-empty, multi-element `Var`s render as
+   *  `<cName>.real[<top>]` instead of `<cName>` (scalar `Var`s and
+   *  `NumLit`s broadcast unchanged). Empty at the top level — scalar
+   *  codegen contexts reject multi-element sub-exprs as before. */
   iterStack: string[];
+  /** Counter for synthetic loop-index names so nested elementwise
+   *  loops don't shadow each other. */
+  elemwiseLoopCounter: number;
 }
 
 /** Build the small facade view passed to `BuiltinSig.emit` closures.
@@ -321,9 +324,6 @@ function analyzeStmt(state: EmitState, s: IRStmt): void {
     case "Disp":
       analyzeExpr(state, s.arg);
       return;
-    case "TensorElemwise":
-      analyzeExpr(state, s.body);
-      return;
     case "If":
       analyzeExpr(state, s.cond);
       for (const t of s.thenBody) analyzeStmt(state, t);
@@ -359,15 +359,29 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
     case "Assign": {
       // `state.needMath` and runtime activations were set up by the
       // analyzeStmt pre-pass; this function only generates lines.
-      // Multi-element tensor RHSs are lowered to `TensorElemwise`, so
-      // by the time we reach Assign the only multi-element case left is
-      // a TensorLit.
+      // Three RHS shapes:
+      //   - TensorLit: codegen writes literal values directly into
+      //     `<cName>.real[idx]` slots (no runtime loop).
+      //   - scalar: a single `<cName> = <expr>;` assignment.
+      //   - any other multi-element expression: emit a per-element
+      //     loop that walks the RHS body once per slot, with multi-
+      //     element `Var`s inside reading from `<varCName>.real[<iter>]`
+      //     (see `emitExpr.Var`).
       if (s.rhs.kind === "TensorLit") {
         emitTensorLitAssign(state, level, s.cName, s.rhs);
         break;
       }
       if (isScalarReal(s.ty)) {
         pushStmt(state, level, `${s.cName} = ${emitExpr(state, s.rhs, 0)};`);
+        break;
+      }
+      if (
+        isNumeric(s.ty) &&
+        isMultiElement(s.ty) &&
+        !s.ty.isComplex &&
+        s.ty.elem === "double"
+      ) {
+        emitElemwiseLoop(state, level, s.cName, s.rhs);
         break;
       }
       throw new Error(
@@ -406,33 +420,6 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       throw new Error(
         `codegen: disp of ${typeToString(ty)} is not yet supported`
       );
-    }
-
-    case "TensorElemwise": {
-      // Per-element loop emitted for tensor-result assignments. The
-      // body is rendered once per element with the iter-name pushed
-      // onto `state.iterStack`; multi-element `Var`s in the body then
-      // read `<cName>.real[<iterCName>]` (see `emitExpr.Var`). Wrapped
-      // in a block so `_mtoc_n` is scoped per stmt — nested elementwise
-      // loops (not generated today) would shadow without collision.
-      pushStmt(state, level, `{`);
-      pushStmt(state, level + 1, `long _mtoc_n = ${s.numel};`);
-      pushStmt(
-        state,
-        level + 1,
-        `for (long ${s.iterCName} = 0; ${s.iterCName} < _mtoc_n; ${s.iterCName}++) {`
-      );
-      state.iterStack.push(s.iterCName);
-      const bodyStr = emitExpr(state, s.body, 0);
-      state.iterStack.pop();
-      pushStmt(
-        state,
-        level + 2,
-        `${s.cTargetName}.real[${s.iterCName}] = ${bodyStr};`
-      );
-      pushStmt(state, level + 1, `}`);
-      pushStmt(state, level, `}`);
-      break;
     }
 
     case "If": {
@@ -510,6 +497,47 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       break;
     }
   }
+}
+
+/** Emit a per-element loop that walks an `Assign`'s multi-element
+ *  RHS once per slot. The body expression is rendered with the loop's
+ *  iter name pushed onto `state.iterStack` so multi-element `Var`s
+ *  inside it read `<varCName>.real[<iter>]` (see `emitExpr.Var`).
+ *  Scalar `Var`s and `NumLit`s broadcast unchanged. The loop is
+ *  wrapped in a `{}` block so `_mtoc_n` is scoped per Assign; the
+ *  iter name itself is fresh per call (counter on EmitState) so
+ *  nested elementwise loops never shadow each other. */
+function emitElemwiseLoop(
+  state: EmitState,
+  level: number,
+  cTarget: string,
+  rhs: IRExpr
+): void {
+  const numel = staticNumElements(rhs.ty);
+  if (numel === null) {
+    // Lowering rejects non-exact dims for multi-element Assign RHSs,
+    // so reaching here means the lowerer let one through.
+    throw new Error(
+      `codegen internal: elementwise assign target '${cTarget}' has ` +
+        `non-exact dims (${typeToString(rhs.ty)}); should have been ` +
+        `rejected at lowering`
+    );
+  }
+  const iterId = state.elemwiseLoopCounter++;
+  const iterName = iterId === 0 ? "_mtoc_i" : `_mtoc_i${iterId}`;
+  pushStmt(state, level, `{`);
+  pushStmt(state, level + 1, `long _mtoc_n = ${numel};`);
+  pushStmt(
+    state,
+    level + 1,
+    `for (long ${iterName} = 0; ${iterName} < _mtoc_n; ${iterName}++) {`
+  );
+  state.iterStack.push(iterName);
+  const bodyStr = emitExpr(state, rhs, 0);
+  state.iterStack.pop();
+  pushStmt(state, level + 2, `${cTarget}.real[${iterName}] = ${bodyStr};`);
+  pushStmt(state, level + 1, `}`);
+  pushStmt(state, level, `}`);
 }
 
 /** Emit element-by-element column-major writes for a tensor literal
@@ -673,6 +701,7 @@ export function emitC(prog: IRProgram): string {
     runtimeNames: new Set(),
     lines: [],
     iterStack: [],
+    elemwiseLoopCounter: 0,
   };
 
   // One-pass pre-walk: activates runtime helpers referenced by the

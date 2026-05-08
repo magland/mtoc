@@ -74,8 +74,18 @@ export type CallTarget =
 
 export type IRStmt =
   | {
+      /** `<name> = <rhs>`. The RHS may be:
+       *    - a scalar expression (codegen emits `<cName> = <expr>;`),
+       *    - a `TensorLit` (codegen writes literal values into the
+       *      slots of `<cName>.real[idx]` directly),
+       *    - any other multi-element expression (codegen emits a
+       *      per-element loop over `numel(rhs.ty)` slots, evaluating
+       *      the body once per slot with multi-element `Var`s reading
+       *      `<varCName>.real[<iter>]`).
+       *  All three paths use the same `Assign` node — codegen
+       *  dispatches on `rhs.kind` and `rhs.ty`'s shape. */
       kind: "Assign";
-      /** MATLAB target name (for diagnostics and assignedVars lookup). */
+      /** numbl target name (for diagnostics and assignedVars lookup). */
       name: string;
       /** Pre-mangled C identifier of the target. */
       cName: string;
@@ -85,23 +95,6 @@ export type IRStmt =
     }
   | { kind: "ExprStmt"; expr: IRExpr; span: Span }
   | { kind: "Disp"; arg: IRExpr; span: Span }
-  | {
-      /** Per-element loop emitted for tensor-result assignments. The
-       *  body is an expression evaluated once per element with `iterCName`
-       *  bound to the linear index; tensor-typed `Var`s inside `body`
-       *  read `<cName>.data[<iterCName>]`. */
-      kind: "TensorElemwise";
-      cTargetName: string;
-      /** Number of elements to write (`rows*cols`). Statically known
-       *  today (the lowerer ensures the result has exact dims). */
-      numel: number;
-      /** Synthetic loop index name, scoped to this stmt's `{...}` block.
-       *  Default is `_mtoc_i` but each loop gets a fresh name to avoid
-       *  shadowing pitfalls when we add nested tensor ops later. */
-      iterCName: string;
-      body: IRExpr;
-      span: Span;
-    }
   | {
       kind: "If";
       cond: IRExpr;

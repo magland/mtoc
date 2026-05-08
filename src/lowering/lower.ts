@@ -309,29 +309,22 @@ export class Lowerer {
       case "Assign": {
         const rhs = this.lowerExpr(s.expr);
         this.recordAssignment(s.name, rhs.ty, s.span);
-        // Multi-element tensor RHS that isn't a TensorLit lowers to a
-        // per-element loop; emit.ts walks the body once per slot and
-        // renders multi-element `Var`s inside as `<cName>.data[<iter>]`.
-        // TensorLit keeps its own codegen path — it writes literal
-        // values directly into `.data[idx]` with no runtime loop.
-        if (isMultiElement(rhs.ty) && rhs.kind !== "TensorLit") {
-          const numel = staticNumElements(rhs.ty);
-          if (numel === null) {
-            throw new UnsupportedConstruct(
-              `assignment to '${s.name}' produces a tensor with non-exact ` +
-                `dimensions (${typeToString(rhs.ty)}); mtoc requires a ` +
-                `statically-known shape for tensor results`,
-              s.span
-            );
-          }
-          return {
-            kind: "TensorElemwise",
-            cTargetName: cNameFor(s.name),
-            numel,
-            iterCName: "_mtoc_i",
-            body: rhs,
-            span: s.span,
-          };
+        // Reject non-exact dims up front: codegen needs a statically
+        // known numel to emit a stack-backed `mtoc_tensor_t`, and a
+        // multi-element RHS without exact dims has nowhere safe to
+        // land. We surface this at lowering time so the user sees a
+        // span. (TensorLit always has exact dims by construction.)
+        if (
+          isMultiElement(rhs.ty) &&
+          rhs.kind !== "TensorLit" &&
+          staticNumElements(rhs.ty) === null
+        ) {
+          throw new UnsupportedConstruct(
+            `assignment to '${s.name}' produces a tensor with non-exact ` +
+              `dimensions (${typeToString(rhs.ty)}); mtoc requires a ` +
+              `statically-known shape for tensor results`,
+            s.span
+          );
         }
         return {
           kind: "Assign",
@@ -568,12 +561,6 @@ function validateStmt(s: IRStmt): void {
       return;
     case "Disp":
       rejectNestedTensorLit(s.arg);
-      return;
-    case "TensorElemwise":
-      // Per-element body — same constraints as the old Assign-with-
-      // tensor-RHS path: no nested TensorLits, no Calls inside.
-      rejectNestedTensorLit(s.body);
-      rejectCallInTensorContext(s.body);
       return;
     case "If":
       rejectNestedTensorLit(s.cond);
