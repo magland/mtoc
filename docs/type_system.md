@@ -57,14 +57,22 @@ A small set of constructor helpers (`scalarDouble`, `rowVecDouble`,
 
 ```
 DimInfo =
-  | { kind: "exact"; n }          // statically known size
-  | { kind: "atLeast"; n }        // lower bound (e.g. for-loop range bounds)
-  | { kind: "unknown" }           // anything we couldn't pin down
+  | { kind: "exact"; n }          // statically known size (including n=1)
+  | { kind: "notOne" }            // provably not 1; specific size unknown
+                                  //   (admits empty n=0 and any n≥2)
+  | { kind: "unknown" }           // nothing known — could be 1, could not be
 ```
+
+The `notOne` rung is the lattice signal `lowerBinary`'s scalar-vs-matmul
+dispatch (and the shape predicates) actually care about: is this axis a scalar
+broadcast or not? It lets a partially-known shape decide instead of falling
+through to a conservative reject.
 
 Today every successfully-codegen'd tensor has both dims `exact` (dynamic-size
 tensors aren't supported yet — the lowerer surfaces a clear error when a
-type-merge would widen to non-exact).
+type-merge would widen past `exact`). `notOne` shows up at lattice joins and
+will become reachable to codegen once partial-shape inputs (function params,
+slice results) are wired through.
 
 ## Sign
 

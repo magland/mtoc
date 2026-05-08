@@ -13,9 +13,19 @@
 
 export type ElemKind = "double";
 
+/**
+ * What we know about a single tensor dimension.
+ *
+ *   exact n  — fully known, including n=1.
+ *   notOne   — provably not 1 (admits 0 for empty tensors and any n≥2);
+ *              specific size unknown. The signal `lowerBinary`'s
+ *              scalar-vs-matmul dispatch actually cares about: is this
+ *              axis a scalar broadcast or not?
+ *   unknown  — nothing known (might be 1, might not).
+ */
 export type DimInfo =
   | { kind: "exact"; n: number }
-  | { kind: "atLeast"; n: number }
+  | { kind: "notOne" }
   | { kind: "unknown" };
 
 /**
@@ -116,8 +126,23 @@ export function isNumeric(t: MType): t is NumericType {
   return t.kind === "Numeric";
 }
 
-function dimIsExactly(d: DimInfo, n: number): boolean {
+/** Statically known to equal exactly `n`. `dimIsOne` is the n=1
+ *  specialization; this stays for callers that need to pin a specific
+ *  size (n>1). */
+export function dimIsExactly(d: DimInfo, n: number): boolean {
   return d.kind === "exact" && d.n === n;
+}
+
+/** Statically known to be exactly 1 — i.e. broadcastable in this axis. */
+export function dimIsOne(d: DimInfo): boolean {
+  return d.kind === "exact" && d.n === 1;
+}
+
+/** Statically known to NOT be 1 — exact-non-1 or `notOne`. Admits
+ *  empty (n=0) and any n≥2 alike; what matters for dispatch is just
+ *  "is this a scalar broadcast in this axis or not?" */
+export function dimIsNotOne(d: DimInfo): boolean {
+  return (d.kind === "exact" && d.n !== 1) || d.kind === "notOne";
 }
 
 // Note on shape predicates: these return plain `boolean`, not type
@@ -128,17 +153,17 @@ function dimIsExactly(d: DimInfo, n: number): boolean {
 
 /** True when both dimensions are statically known to be exactly 1. */
 export function isScalar(t: MType): boolean {
-  return isNumeric(t) && dimIsExactly(t.rows, 1) && dimIsExactly(t.cols, 1);
+  return isNumeric(t) && dimIsOne(t.rows) && dimIsOne(t.cols);
 }
 
-/** True when rows is exactly 1 but cols is not (i.e., not a scalar). */
+/** True when rows is exactly 1 and cols is statically known to be not 1. */
 export function isRowVec(t: MType): boolean {
-  return isNumeric(t) && dimIsExactly(t.rows, 1) && !dimIsExactly(t.cols, 1);
+  return isNumeric(t) && dimIsOne(t.rows) && dimIsNotOne(t.cols);
 }
 
-/** True when cols is exactly 1 but rows is not. */
+/** True when cols is exactly 1 and rows is statically known to be not 1. */
 export function isColVec(t: MType): boolean {
-  return isNumeric(t) && dimIsExactly(t.cols, 1) && !dimIsExactly(t.rows, 1);
+  return isNumeric(t) && dimIsOne(t.cols) && dimIsNotOne(t.rows);
 }
 
 /** A vector is a row vector or a column vector (and not a scalar). */
@@ -148,13 +173,14 @@ export function isVector(t: MType): boolean {
 
 /** A matrix is anything tensor-shaped that isn't a scalar or vector. */
 export function isMatrix(t: MType): boolean {
-  return isNumeric(t) && !isScalar(t) && !isVector(t);
+  return isMultiElement(t) && !isVector(t);
 }
 
-/** Multi-element tensor (vector or matrix). Codegen uses this to pick
- *  between the bare `double` representation and `mtoc_tensor_t`. */
+/** Multi-element tensor (vector or matrix). At least one dim is
+ *  statically known to be not 1. Codegen uses this to pick between the
+ *  bare `double` representation and `mtoc_tensor_t`. */
 export function isMultiElement(t: MType): boolean {
-  return isNumeric(t) && !isScalar(t);
+  return isNumeric(t) && (dimIsNotOne(t.rows) || dimIsNotOne(t.cols));
 }
 
 export function isScalarReal(t: MType): boolean {
@@ -291,12 +317,29 @@ export function signDiv(a: Sign, b: Sign): Sign {
 
 // ── Lattice operations ───────────────────────────────────────────────────
 
+// joinDim — least upper bound on the DimInfo lattice. Symmetric.
+//
+//   exact n  ∨ exact n                          → exact n
+//   exact n  ∨ exact m  (n ≠ m, both ≠ 1)       → notOne
+//   exact n  ∨ exact m  (one of them is 1)      → unknown
+//   exact 1  ∨ notOne                           → unknown
+//   exact n  ∨ notOne   (n ≠ 1)                 → notOne
+//   notOne   ∨ notOne                           → notOne
+//   unknown  ∨ _                                → unknown
 function joinDim(a: DimInfo, b: DimInfo): DimInfo {
-  if (a.kind === "exact" && b.kind === "exact" && a.n === b.n) return a;
   if (a.kind === "unknown" || b.kind === "unknown") return { kind: "unknown" };
-  // Same lower bound? (atLeast/exact merging) — drop to atLeast of the min,
-  // or unknown if shapes differ. For the seed we just go to unknown.
-  return { kind: "unknown" };
+  if (a.kind === "exact" && b.kind === "exact") {
+    if (a.n === b.n) return a;
+    if (a.n !== 1 && b.n !== 1) return { kind: "notOne" };
+    return { kind: "unknown" };
+  }
+  // From here, exactly one of a/b is `notOne` and the other is either
+  // `exact` or `notOne`.
+  if (a.kind === "notOne" && b.kind === "notOne") return { kind: "notOne" };
+  const exact =
+    a.kind === "exact" ? a : (b as Extract<DimInfo, { kind: "exact" }>);
+  if (exact.n === 1) return { kind: "unknown" };
+  return { kind: "notOne" };
 }
 
 // ── NumericType field template ───────────────────────────────────────────
@@ -511,7 +554,7 @@ export function canonicalizeType(t: MType): unknown {
 
 function dimToString(d: DimInfo): string {
   if (d.kind === "exact") return `${d.n}`;
-  if (d.kind === "atLeast") return `>=${d.n}`;
+  if (d.kind === "notOne") return "≠1";
   return "?";
 }
 
