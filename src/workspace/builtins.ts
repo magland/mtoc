@@ -34,9 +34,26 @@ export type ArgShape = "scalar" | "vector" | "tensor";
  */
 export type ResultShape = "scalar";
 
+/**
+ * Builtin "category" — does this name appear at expression position
+ * (a value-producing call like `sqrt(x)`) or only at statement position
+ * (e.g. `disp(x)`, the future `error(...)`, `assert(...)`)?
+ *
+ * Defaults to `"expr"` when omitted so existing entries don't need
+ * updating. Statement-only builtins are routed through their own
+ * lowering path (today: `IRStmt.Disp`); the registry lookup just
+ * provides the discovery + name.
+ */
+export type BuiltinCategory = "expr" | "stmt";
+
 export interface ScalarBuiltin {
   /** MATLAB function name. */
   name: string;
+  /** Whether this builtin is callable at expression position
+   *  ("expr", default) or only as a statement ("stmt", e.g. `disp`).
+   *  Statement-only entries route through a dedicated lowering path
+   *  rather than producing an `IRExpr.Call`. */
+  category?: BuiltinCategory;
   /** Number of arguments mtoc accepts for this builtin. */
   arity: 1 | 2;
   /** Per-argument shape constraint. Length matches `arity`. Defaults
@@ -55,8 +72,18 @@ export interface ScalarBuiltin {
    * C function the codegen emits. May be a libm name (e.g. "sqrt") or
    * a mtoc runtime helper (e.g. "mtoc_mod"); helpers in `runtime.ts`
    * are activated automatically when their name appears here.
+   *
+   * For statement-only entries whose codegen branches on argument
+   * shape (today only `disp`, which picks `mtoc_disp_double` vs
+   * `mtoc_disp_tensor` at emit time), this field is empty — codegen
+   * special-cases the dispatch.
    */
   cFunc: string;
+}
+
+/** Returns the category, defaulting to "expr". */
+export function categoryOf(b: ScalarBuiltin): BuiltinCategory {
+  return b.category ?? "expr";
 }
 
 /** Returns the per-arg shape constraint, defaulting to "scalar" when
@@ -66,6 +93,23 @@ export function argShapeOf(b: ScalarBuiltin, i: number): ArgShape {
 }
 
 const BUILTINS: ScalarBuiltin[] = [
+  // ── Statement-only ───────────────────────────────────────────────────
+  // `disp(x)` is special-cased at codegen: it picks `mtoc_disp_double`
+  // for scalar args and `mtoc_disp_tensor` for tensor Vars (see
+  // emit.ts → `IRStmt.Disp`). The registry entry exists so
+  // `Workspace.resolve("disp")` returns from the same path as every
+  // other builtin lookup; lowering still routes ExprStmt(disp(...))
+  // into `IRStmt.Disp` rather than producing an `IRExpr.Call`.
+  {
+    name: "disp",
+    category: "stmt",
+    arity: 1,
+    argShapes: ["scalar"], // Not actually enforced — see lowering of Disp.
+    argDomains: [null],
+    resultSign: "unknown",
+    cFunc: "",
+  },
+
   // ── 1-arg ────────────────────────────────────────────────────────────
   { name: "abs", arity: 1, argDomains: [null], resultSign: "nonnegative", cFunc: "fabs" },
   { name: "sqrt", arity: 1, argDomains: ["nonnegative"], resultSign: "nonnegative", cFunc: "sqrt" },

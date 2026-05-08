@@ -23,10 +23,6 @@ export type ResolvedTarget =
   | { kind: "builtin"; name: string }
   | { kind: "userFunction"; name: string };
 
-/** Builtin names recognized by the lowerer at the statement level (not via
- *  the scalar registry). `disp` is special-cased into an IR.Disp node. */
-const STMT_BUILTINS: ReadonlySet<string> = new Set(["disp"]);
-
 export class Workspace {
   readonly files: Map<string, WorkspaceFile> = new Map();
   /** Local user-defined functions found in the main file (script-level
@@ -57,12 +53,14 @@ export class Workspace {
     if (this.localFunctions.has(name)) {
       return { kind: "userFunction", name };
     }
-    if (STMT_BUILTINS.has(name)) return { kind: "builtin", name };
+    // Single registry: both `disp` (category="stmt") and every scalar
+    // expression-builtin live in `getScalarBuiltin`. Lowering routes
+    // ExprStmt(disp(...)) into `IRStmt.Disp` based on `categoryOf`.
     if (getScalarBuiltin(name)) return { kind: "builtin", name };
     return null;
   }
 
   hasBuiltin(name: string): boolean {
-    return STMT_BUILTINS.has(name) || allScalarBuiltinNames().includes(name);
+    return allScalarBuiltinNames().includes(name);
   }
 }

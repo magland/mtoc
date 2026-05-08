@@ -4,6 +4,13 @@
  * Walks the AST, infers types, and rejects any construct outside the
  * currently supported subset by raising `UnsupportedConstruct`.
  *
+ * The `Lowerer` class owns the per-scope state (env / assignedVars /
+ * params / output var). The bulk of the logic lives in focused
+ * sibling files (`lowerIf.ts`, `lowerFor.ts`, `lowerWhile.ts`,
+ * `lowerBinary.ts`, `lowerUnary.ts`, `lowerFuncCall.ts`,
+ * `lowerTensorLiteral.ts`); each is a `this`-typed helper that
+ * `lowerStmt` / `lowerExpr` dispatch to.
+ *
  * Supported subset:
  *   - script body of plain assignments to scalar `double` variables
  *   - arithmetic / comparison / logical ops
@@ -13,123 +20,111 @@
  *     on the (shape, elem) of the call-site argument types
  */
 
-import { createHash } from "node:crypto";
-
 import type {
   AbstractSyntaxTree,
   Expr,
   Span,
   Stmt,
-  BinaryOperation as BinOp,
-  UnaryOperation as UnOp,
 } from "../parser/index.js";
-import { offsetToLine } from "../parser/sourceLoc.js";
-import { Workspace, type FunctionStmt } from "../workspace/workspace.js";
-import { argShapeOf, getScalarBuiltin } from "../workspace/builtins.js";
+import { Workspace } from "../workspace/workspace.js";
 import { getConstant } from "../workspace/constants.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
-import type { IRExpr, IRFunction, IRProgram, IRStmt } from "./ir.js";
+import type {
+  IRExpr,
+  IRFunction,
+  IRProgram,
+  IRStmt,
+  VarBinding,
+} from "./ir.js";
 import {
-  arithResult,
-  canonicalizeType,
   isMultiElement,
-  isScalar,
   isScalarReal,
   isTensor,
-  isVector,
-  joinSign,
-  matrixDouble,
   MType,
   scalarDouble,
-  SCALAR_DOUBLE,
   signFromValue,
-  signIsNonneg,
-  signIsPositive,
-  signNegate,
-  type Sign,
+  staticNumElements,
   typeToString,
   unify,
 } from "./types.js";
 
-const SUPPORTED_BIN_OPS: ReadonlySet<BinOp> = new Set([
-  "Add",
-  "Sub",
-  "Mul",
-  "Div",
-  "Pow",
-  "ElemMul",
-  "ElemDiv",
-  "ElemPow",
-  "Equal",
-  "NotEqual",
-  "Less",
-  "LessEqual",
-  "Greater",
-  "GreaterEqual",
-  "AndAnd",
-  "OrOr",
-] as BinOp[]);
+import { lowerIf } from "./lowerIf.js";
+import { lowerFor } from "./lowerFor.js";
+import { lowerWhile } from "./lowerWhile.js";
+import { lowerBinary } from "./lowerBinary.js";
+import { lowerUnary } from "./lowerUnary.js";
+import { lowerFuncCall } from "./lowerFuncCall.js";
+import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
 
-const COMPARISON_BIN_OPS: ReadonlySet<BinOp> = new Set([
-  "Equal",
-  "NotEqual",
-  "Less",
-  "LessEqual",
-  "Greater",
-  "GreaterEqual",
-  "AndAnd",
-  "OrOr",
-] as BinOp[]);
+// Reserved C identifiers that need mangling. Mirrors numbl's
+// cJit/codegen.ts list. Centralized here so emit.ts never has to
+// mangle a name itself.
+const C_RESERVED: ReadonlySet<string> = new Set([
+  "auto",
+  "break",
+  "case",
+  "char",
+  "const",
+  "continue",
+  "default",
+  "do",
+  "double",
+  "else",
+  "enum",
+  "extern",
+  "float",
+  "for",
+  "goto",
+  "if",
+  "inline",
+  "int",
+  "long",
+  "register",
+  "restrict",
+  "return",
+  "short",
+  "signed",
+  "sizeof",
+  "static",
+  "struct",
+  "switch",
+  "typedef",
+  "union",
+  "unsigned",
+  "void",
+  "volatile",
+  "while",
+  "main",
+]);
 
-const SUPPORTED_UN_OPS: ReadonlySet<UnOp> = new Set([
-  "Plus",
-  "Minus",
-  "Not",
-] as UnOp[]);
-
-/** Map a parser BinaryOperation onto the abstract arith kind used by the
- *  type system's `arithResultScalar`. Returns null for non-arithmetic ops. */
-function arithKindForOp(op: BinOp): "Add" | "Sub" | "Mul" | "Div" | null {
-  switch (op) {
-    case "Add":
-      return "Add";
-    case "Sub":
-      return "Sub";
-    case "Mul":
-    case "ElemMul":
-      return "Mul";
-    case "Div":
-    case "ElemDiv":
-      return "Div";
-    default:
-      return null;
-  }
+/** Map a MATLAB identifier to the C identifier the codegen will emit.
+ *  Reserved C keywords get a `v_` prefix; everything else passes
+ *  through. Exported so helper files can reuse the same mapping. */
+export function cNameFor(matlabName: string): string {
+  return C_RESERVED.has(matlabName) ? `v_${matlabName}` : matlabName;
 }
 
-/**
- * Build the C identifier for a specialization.
- *
- * Hashes the full canonicalized argument-type tuple (every field of
- * every type, including sign). Two calls with identical type tuples
- * produce the same hash and so land on the same specialization; any
- * difference — sign, shape, complex, future fields — produces a
- * different specialization with its own emitted C function.
- *
- * Body-level deduplication (collapsing two specializations whose
- * generated C is byte-identical) is a separate pass we'll add later;
- * for now each unique type tuple emits its own function.
- */
-function mangleSpecName(matlabName: string, argTypes: MType[]): string {
-  const canonical = JSON.stringify(argTypes.map(canonicalizeType));
-  const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 8);
-  return `${matlabName}__${hash}`;
+/** Defensive: reject any user MATLAB name starting with `_mtoc_`. The
+ *  codegen synthesizes helpers with that prefix (e.g. `_mtoc_i`,
+ *  `_mtoc_n`, `_mtoc_<name>_data`); a user var with the same prefix
+ *  could shadow them. MATLAB syntax already disallows leading `_` so
+ *  this is mostly belt-and-suspenders, but it's a clear error if a
+ *  weird parser path lets one through. */
+export function assertNotMtocReserved(name: string, span: Span): void {
+  if (name.startsWith("_mtoc_")) {
+    throw new UnsupportedConstruct(
+      `identifier '${name}' starts with the reserved prefix '_mtoc_' ` +
+        `(used by mtoc's generated C helpers)`,
+      span
+    );
+  }
 }
 
 /** Module-level shared state: the function-specialization cache + ordered
  *  list, plus a stack of names currently being lowered (for cycle/recursion
  *  detection). Threaded into every `Lowerer` so script-scope and
  *  function-scope lowerers share specializations. */
-interface SharedSpecState {
+export interface SharedSpecState {
   workspace: Workspace;
   /** name → IRFunction. Names are mangled (see `mangleSpecName`). */
   cache: Map<string, IRFunction>;
@@ -139,24 +134,31 @@ interface SharedSpecState {
   inFlight: Set<string>;
 }
 
-class Lowerer {
+export class Lowerer {
   /** Type lookup for in-scope identifiers. Includes params (function
-   *  scope) and assigned vars (any scope). */
-  private env = new Map<string, MType>();
+   *  scope) and assigned vars (any scope). Helpers in sibling files
+   *  read/write this directly. */
+  env = new Map<string, MType>();
   /** Vars assigned inside the current scope. EXCLUDES params — they are
-   *  declared via the C function signature, not predeclared. */
-  private assignedVars = new Map<string, MType>();
+   *  declared via the C function signature, not predeclared. Each entry
+   *  carries the C identifier so codegen never has to mangle. */
+  private assignedVars = new Map<string, VarBinding>();
   /** Names of params for the current scope (function scope only). */
   private params: ReadonlySet<string>;
   /** Output variable for the current function scope, or null at script
-   *  scope. Used to lower MATLAB `return` into `return <outputVar>;`. */
+   *  scope. Used to lower MATLAB `return` into `return <outputCName>;`. */
   private outputVar: string | null;
 
+  /** Function-specialization cache + workspace handle. Helpers in
+   *  sibling files reach through this for user-call dispatch. */
+  readonly shared: SharedSpecState;
+
   constructor(
-    private shared: SharedSpecState,
+    shared: SharedSpecState,
     paramBindings: Array<{ name: string; ty: MType }> = [],
     outputVar: string | null = null
   ) {
+    this.shared = shared;
     this.params = new Set(paramBindings.map(p => p.name));
     for (const p of paramBindings) {
       this.env.set(p.name, p.ty);
@@ -175,7 +177,7 @@ class Lowerer {
     return out;
   }
 
-  getAssignedVars(): Map<string, MType> {
+  getAssignedVars(): Map<string, VarBinding> {
     return this.assignedVars;
   }
 
@@ -183,7 +185,8 @@ class Lowerer {
     return this.env.get(name);
   }
 
-  private recordAssignment(name: string, ty: MType, span: Span): void {
+  recordAssignment(name: string, ty: MType, span: Span): void {
+    assertNotMtocReserved(name, span);
     // env tracks the LATEST type at the current program point — sequential
     // assignment replaces, it does not unify with prior types.
     this.env.set(name, ty);
@@ -193,7 +196,8 @@ class Lowerer {
     // two assignments can't share one C storage location — flag it at
     // the offending line.
     if (!this.params.has(name)) {
-      const prev = this.assignedVars.get(name);
+      const prevBinding = this.assignedVars.get(name);
+      const prev = prevBinding?.ty;
       const merged = prev ? unify(prev, ty) : ty;
       if (prev && merged.kind === "Unknown") {
         throw new TypeError(
@@ -203,7 +207,28 @@ class Lowerer {
           span
         );
       }
-      this.assignedVars.set(name, merged);
+      // Reject assignments that would unify into a tensor with non-exact
+      // dims — codegen needs an exact size for the predeclared storage.
+      // This typically arises when two assignments give the variable
+      // different shapes (e.g. `v=[1 2 3]` then `v=[1 2 3 4]`).
+      if (
+        prev &&
+        isTensor(merged) &&
+        isMultiElement(merged) &&
+        (merged.rows.kind !== "exact" || merged.cols.kind !== "exact")
+      ) {
+        throw new UnsupportedConstruct(
+          `'${name}' was previously ${typeToString(prev)} and is now being ` +
+            `assigned ${typeToString(ty)}; mtoc requires a fixed shape ` +
+            `across all assignments to a tensor variable. Use a different ` +
+            `name for the new value.`,
+          span
+        );
+      }
+      this.assignedVars.set(name, {
+        ty: merged,
+        cName: prevBinding?.cName ?? cNameFor(name),
+      });
     }
   }
 
@@ -222,7 +247,7 @@ class Lowerer {
    * whose body's sign-flow oscillates may keep a sound but imprecise
    * post-loop type. (Sufficient for the scalar lattice we have today.)
    */
-  private mergeBranchEnvs(
+  mergeBranchEnvs(
     envs: ReadonlyArray<ReadonlyMap<string, MType>>,
     span: Span,
     construct: string
@@ -261,6 +286,15 @@ class Lowerer {
     return result;
   }
 
+  requireScalarReal(ty: MType, role: string, span: Span): void {
+    if (!isScalarReal(ty)) {
+      throw new UnsupportedConstruct(
+        `${role} must be a real scalar (got ${typeToString(ty)})`,
+        span
+      );
+    }
+  }
+
   private lowerStmt(s: Stmt): IRStmt | null {
     switch (s.type) {
       case "Function":
@@ -275,9 +309,34 @@ class Lowerer {
       case "Assign": {
         const rhs = this.lowerExpr(s.expr);
         this.recordAssignment(s.name, rhs.ty, s.span);
+        // Multi-element tensor RHS that isn't a TensorLit lowers to a
+        // per-element loop; emit.ts walks the body once per slot and
+        // renders multi-element `Var`s inside as `<cName>.data[<iter>]`.
+        // TensorLit keeps its own codegen path — it writes literal
+        // values directly into `.data[idx]` with no runtime loop.
+        if (isMultiElement(rhs.ty) && rhs.kind !== "TensorLit") {
+          const numel = staticNumElements(rhs.ty);
+          if (numel === null) {
+            throw new UnsupportedConstruct(
+              `assignment to '${s.name}' produces a tensor with non-exact ` +
+                `dimensions (${typeToString(rhs.ty)}); mtoc requires a ` +
+                `statically-known shape for tensor results`,
+              s.span
+            );
+          }
+          return {
+            kind: "TensorElemwise",
+            cTargetName: cNameFor(s.name),
+            numel,
+            iterCName: "_mtoc_i",
+            body: rhs,
+            span: s.span,
+          };
+        }
         return {
           kind: "Assign",
           name: s.name,
+          cName: cNameFor(s.name),
           rhs,
           ty: rhs.ty,
           span: s.span,
@@ -294,80 +353,37 @@ class Lowerer {
           s.expr.args.length === 1
         ) {
           const arg = this.lowerExpr(s.expr.args[0]);
+          // Codegen can only print scalars or named tensor variables; a
+          // tensor expression has no addressable storage to hand to the
+          // runtime helper, so reject it with a span before codegen.
+          if (isMultiElement(arg.ty) && arg.kind !== "Var") {
+            throw new UnsupportedConstruct(
+              `'disp' of a tensor expression is only supported for ` +
+                `variable references; assign the value to a name first`,
+              s.expr.args[0].span
+            );
+          }
           return { kind: "Disp", arg, span: s.span };
         }
         const expr = this.lowerExpr(s.expr);
+        // A bare tensor-valued expression at statement scope can't be
+        // emitted today — there's no target buffer to write into. Reject
+        // here so the user sees a span instead of a codegen stack trace.
+        if (isMultiElement(expr.ty)) {
+          throw new UnsupportedConstruct(
+            `tensor-valued expression at statement scope is not yet ` +
+              `supported (assign it to a variable first)`,
+            s.span
+          );
+        }
         return { kind: "ExprStmt", expr, span: s.span };
       }
 
-      case "If": {
-        const cond = this.lowerExpr(s.cond);
-        this.requireScalarReal(cond.ty, "if condition", s.span);
+      case "If":
+        return lowerIf.call(this, s);
 
-        const envBefore = new Map(this.env);
-
-        // Then-arm: starts fresh from envBefore.
-        this.env = new Map(envBefore);
-        const thenBody = this.lowerStmts(s.thenBody);
-        const envThen = new Map(this.env);
-
-        // Each elseif arm: starts fresh from envBefore. The condition is
-        // lowered inside the arm so any (future) refinement gets the
-        // correct visibility scope.
-        const elseifs: Array<{ cond: IRExpr; body: IRStmt[] }> = [];
-        const envElseifs: Map<string, MType>[] = [];
-        for (const b of s.elseifBlocks) {
-          this.env = new Map(envBefore);
-          const ec = this.lowerExpr(b.cond);
-          this.requireScalarReal(ec.ty, "elseif condition", b.cond.span);
-          const body = this.lowerStmts(b.body);
-          elseifs.push({ cond: ec, body });
-          envElseifs.push(new Map(this.env));
-        }
-
-        // Else-arm: starts from envBefore. Without an explicit `else`,
-        // the "no arm ran" path's env is just envBefore.
-        let elseBody: IRStmt[] | null = null;
-        let envElse: Map<string, MType>;
-        if (s.elseBody) {
-          this.env = new Map(envBefore);
-          elseBody = this.lowerStmts(s.elseBody);
-          envElse = new Map(this.env);
-        } else {
-          envElse = envBefore;
-        }
-
-        this.env = this.mergeBranchEnvs(
-          [envThen, ...envElseifs, envElse],
-          s.span,
-          "if"
-        );
-
-        return {
-          kind: "If",
-          cond,
-          thenBody,
-          elseifs,
-          elseBody,
-          span: s.span,
-        };
-      }
-
-      case "While": {
-        const envBefore = new Map(this.env);
-        const cond = this.lowerExpr(s.cond);
-        this.requireScalarReal(cond.ty, "while condition", s.span);
-        const body = this.lowerStmts(s.body);
-        // After the loop: either the body never ran (envBefore), or it
-        // ran one+ times (current env). Single-pass merge — see
-        // mergeBranchEnvs for the soundness note on oscillating loops.
-        this.env = this.mergeBranchEnvs(
-          [envBefore, new Map(this.env)],
-          s.span,
-          "while"
-        );
-        return { kind: "While", cond, body, span: s.span };
-      }
+      case "While":
+        return lowerWhile.call(this, s);
 
       case "Break":
         return { kind: "Break", span: s.span };
@@ -384,91 +400,13 @@ class Lowerer {
         }
         return {
           kind: "ReturnFromFunction",
-          outputVar: this.outputVar,
+          outputCName: cNameFor(this.outputVar),
           span: s.span,
         };
       }
 
-      case "For": {
-        if (s.expr.type !== "Range") {
-          throw new UnsupportedConstruct(
-            `for-loop iterables other than ranges are not yet supported`,
-            s.span
-          );
-        }
-        const start = this.lowerExpr(s.expr.start);
-        const end = this.lowerExpr(s.expr.end);
-        this.requireScalarReal(start.ty, "for-loop start", s.expr.start.span);
-        this.requireScalarReal(end.ty, "for-loop end", s.expr.end.span);
-        let step: IRExpr;
-        if (s.expr.step) {
-          step = this.lowerExpr(s.expr.step);
-          this.requireScalarReal(step.ty, "for-loop step", s.expr.step.span);
-          if (step.kind !== "NumLit") {
-            throw new UnsupportedConstruct(
-              `for-loop step must be a numeric literal (got expression)`,
-              s.expr.step.span
-            );
-          }
-          if (step.value === 0) {
-            throw new UnsupportedConstruct(
-              `for-loop step must be non-zero`,
-              s.expr.step.span
-            );
-          }
-        } else {
-          step = {
-            kind: "NumLit",
-            value: 1,
-            ty: SCALAR_DOUBLE,
-            span: s.expr.span,
-          };
-        }
-        // Refine the loop variable's sign when start + step have the
-        // same direction. `for k = 1:n` ⇒ k positive; `for k = 0:n` ⇒
-        // k nonneg; symmetric for negative-stride loops. Anything that
-        // could cross zero falls back to unknown.
-        const startSign = isTensor(start.ty) ? start.ty.sign : "unknown";
-        let loopVarSign:
-          | "positive"
-          | "nonnegative"
-          | "negative"
-          | "nonpositive"
-          | "unknown" = "unknown";
-        if (step.value > 0) {
-          if (signIsPositive(startSign)) loopVarSign = "positive";
-          else if (signIsNonneg(startSign)) loopVarSign = "nonnegative";
-        } else if (step.value < 0) {
-          if (startSign === "negative") loopVarSign = "negative";
-          else if (startSign === "nonpositive" || startSign === "zero") {
-            loopVarSign = "nonpositive";
-          }
-        }
-        // Snapshot before introducing the loop variable; after the
-        // loop, the merge widens the loop var's type with `zero` so
-        // the post-loop sign reflects "loop may not have run".
-        const envBefore = new Map(this.env);
-        this.recordAssignment(
-          s.varName,
-          scalarDouble(loopVarSign),
-          s.span
-        );
-        const body = this.lowerStmts(s.body);
-        this.env = this.mergeBranchEnvs(
-          [envBefore, new Map(this.env)],
-          s.span,
-          "for"
-        );
-        return {
-          kind: "For",
-          var: s.varName,
-          start,
-          step,
-          end,
-          body,
-          span: s.span,
-        };
-      }
+      case "For":
+        return lowerFor.call(this, s);
 
       default:
         throw new UnsupportedConstruct(
@@ -478,18 +416,9 @@ class Lowerer {
     }
   }
 
-  private requireScalarReal(ty: MType, role: string, span: Span): void {
-    if (!isScalarReal(ty)) {
-      throw new UnsupportedConstruct(
-        `${role} must be a real scalar (got ${typeToString(ty)})`,
-        span
-      );
-    }
-  }
-
   // ── Expressions ───────────────────────────────────────────────────────
 
-  private lowerExpr(e: Expr): IRExpr {
+  lowerExpr(e: Expr): IRExpr {
     switch (e.type) {
       case "Number": {
         const n = Number(e.value);
@@ -510,7 +439,13 @@ class Lowerer {
       case "Ident": {
         const ty = this.env.get(e.name);
         if (ty) {
-          return { kind: "Var", name: e.name, ty, span: e.span };
+          return {
+            kind: "Var",
+            name: e.name,
+            cName: cNameFor(e.name),
+            ty,
+            span: e.span,
+          };
         }
         const k = getConstant(e.name);
         if (k) {
@@ -527,175 +462,17 @@ class Lowerer {
         );
       }
 
-      case "Binary": {
-        if (!SUPPORTED_BIN_OPS.has(e.op)) {
-          throw new UnsupportedConstruct(
-            `binary operator ${e.op} is not yet supported`,
-            e.span
-          );
-        }
-        const left = this.lowerExpr(e.left);
-        const right = this.lowerExpr(e.right);
-        if (!isTensor(left.ty) || !isTensor(right.ty)) {
-          throw new UnsupportedConstruct(
-            `binary ${e.op} on ${typeToString(left.ty)} and ${typeToString(
-              right.ty
-            )} is not yet supported`,
-            e.span
-          );
-        }
+      case "Binary":
+        return lowerBinary.call(this, e);
 
-        // Comparisons/logical ops require scalar real operands today —
-        // elementwise comparison on tensors needs its own codegen path.
-        if (COMPARISON_BIN_OPS.has(e.op)) {
-          if (!isScalarReal(left.ty) || !isScalarReal(right.ty)) {
-            throw new UnsupportedConstruct(
-              `comparison/logical ${e.op} on tensors is not yet supported`,
-              e.span
-            );
-          }
-          return {
-            kind: "Binary",
-            op: e.op,
-            left,
-            right,
-            ty: scalarDouble("nonnegative"),
-            span: e.span,
-          };
-        }
+      case "Unary":
+        return lowerUnary.call(this, e);
 
-        // Arithmetic ops. Reject the matrix-only variants on
-        // tensor⊙tensor (we don't have matrix multiply / divide /
-        // power yet); the elementwise variants `.* ./ .^` are fine.
-        const arithOp = arithKindForOp(e.op);
-        if (!arithOp && e.op !== "Pow" && e.op !== "ElemPow") {
-          throw new UnsupportedConstruct(
-            `unsupported arith operator ${e.op}`,
-            e.span
-          );
-        }
-        const leftScalar = isScalar(left.ty);
-        const rightScalar = isScalar(right.ty);
-        const matrixOnly = e.op === "Mul" || e.op === "Div" || e.op === "Pow";
-        if (!leftScalar && !rightScalar && matrixOnly) {
-          throw new UnsupportedConstruct(
-            `binary ${e.op} on two tensors is not yet supported ` +
-              `(matrix multiply / divide / power need a separate ` +
-              `codegen path; use .* ./ .^ for elementwise instead)`,
-            e.span
-          );
-        }
-        // Pow is currently scalar-only end-to-end (codegen emits pow()
-        // inline). Reject any tensor operand for Pow/ElemPow until we
-        // add tensor pow.
-        if (e.op === "Pow" || e.op === "ElemPow") {
-          if (!leftScalar || !rightScalar) {
-            throw new UnsupportedConstruct(
-              `binary ${e.op} on tensors is not yet supported`,
-              e.span
-            );
-          }
-        }
+      case "Tensor":
+        return lowerTensorLiteral.call(this, e);
 
-        let ty: MType;
-        if (arithOp) {
-          ty = arithResult(arithOp, left.ty, right.ty);
-        } else {
-          // Pow / ElemPow on two scalars — result is a scalar real.
-          ty = scalarDouble("unknown");
-        }
-        // Structural square detection: `x*x` (same variable) is nonneg
-        // regardless of x's sign. Applies for scalars and tensors.
-        if (
-          (e.op === "Mul" || e.op === "ElemMul") &&
-          left.kind === "Var" &&
-          right.kind === "Var" &&
-          left.name === right.name &&
-          isTensor(ty)
-        ) {
-          ty = { ...ty, sign: "nonnegative" };
-        }
-        if (ty.kind === "Unknown") {
-          throw new UnsupportedConstruct(
-            `binary ${e.op} on ${typeToString(left.ty)} and ${typeToString(
-              right.ty
-            )} produces an incompatible result type`,
-            e.span
-          );
-        }
-        return { kind: "Binary", op: e.op, left, right, ty, span: e.span };
-      }
-
-      case "Unary": {
-        if (!SUPPORTED_UN_OPS.has(e.op)) {
-          throw new UnsupportedConstruct(
-            `unary operator ${e.op} is not yet supported`,
-            e.span
-          );
-        }
-        const operand = this.lowerExpr(e.operand);
-        if (!isTensor(operand.ty) || operand.ty.isComplex) {
-          throw new UnsupportedConstruct(
-            `unary ${e.op} on ${typeToString(operand.ty)} is not yet supported`,
-            e.span
-          );
-        }
-        if (operand.kind === "NumLit") {
-          if (e.op === "Plus") {
-            return { ...operand, span: e.span };
-          }
-          if (e.op === "Minus") {
-            const v = -operand.value;
-            return {
-              ...operand,
-              value: v,
-              ty: scalarDouble(signFromValue(v)),
-              span: e.span,
-            };
-          }
-          if (e.op === "Not") {
-            return {
-              kind: "NumLit",
-              value: operand.value !== 0 ? 0 : 1,
-              ty: scalarDouble("nonnegative"),
-              span: e.span,
-            };
-          }
-        }
-        let ty: MType = operand.ty;
-        if (isTensor(operand.ty)) {
-          if (e.op === "Minus") {
-            ty = { ...operand.ty, sign: signNegate(operand.ty.sign) };
-          } else if (e.op === "Not") {
-            ty = scalarDouble("nonnegative");
-          }
-        }
-        return { kind: "Unary", op: e.op, operand, ty, span: e.span };
-      }
-
-      case "Tensor": {
-        return this.lowerTensorLiteral(e);
-      }
-
-      case "FuncCall": {
-        const target = this.shared.workspace.resolve(e.name);
-        if (!target) {
-          throw new UnsupportedConstruct(
-            `unresolved function or builtin '${e.name}'`,
-            e.span
-          );
-        }
-        if (e.name === "disp") {
-          throw new UnsupportedConstruct(
-            `'disp' as a value-producing call is not supported`,
-            e.span
-          );
-        }
-        if (target.kind === "userFunction") {
-          return this.lowerUserCall(e.name, e.args, e.span);
-        }
-        return this.lowerBuiltinCall(e.name, e.args, e.span);
-      }
+      case "FuncCall":
+        return lowerFuncCall.call(this, e);
 
       default:
         throw new UnsupportedConstruct(
@@ -704,261 +481,136 @@ class Lowerer {
         );
     }
   }
+}
 
-  private lowerTensorLiteral(
-    e: Extract<Expr, { type: "Tensor" }>
-  ): IRExpr {
-    if (e.rows.length === 0) {
+/**
+ * Reject a TensorLit anywhere inside an expression subtree. Used to
+ * enforce the rule "TensorLit only at top level of Assign.rhs" — every
+ * other position recurses through here.
+ */
+function rejectNestedTensorLit(e: IRExpr): void {
+  switch (e.kind) {
+    case "TensorLit":
       throw new UnsupportedConstruct(
-        `empty tensor literal '[]' is not yet supported`,
+        `tensor literals are only supported as the right-hand side of an ` +
+          `assignment (not inside a larger expression)`,
         e.span
       );
-    }
-    const numRows = e.rows.length;
-    const numCols = e.rows[0].length;
-    if (numCols === 0) {
+    case "NumLit":
+    case "Var":
+      return;
+    case "Binary":
+      rejectNestedTensorLit(e.left);
+      rejectNestedTensorLit(e.right);
+      return;
+    case "Unary":
+      rejectNestedTensorLit(e.operand);
+      return;
+    case "Call":
+      for (const a of e.args) rejectNestedTensorLit(a);
+      return;
+  }
+}
+
+/**
+ * Reject any `Call` node inside an expression subtree. Used to enforce
+ * the rule "no function calls inside a multi-element tensor expression"
+ * — codegen's elementwise loop has no way to materialize a Call result
+ * yet.
+ */
+function rejectCallInTensorContext(e: IRExpr): void {
+  switch (e.kind) {
+    case "Call":
       throw new UnsupportedConstruct(
-        `tensor literal with zero-length row is not yet supported`,
+        `function calls inside a multi-element tensor expression are not ` +
+          `yet supported (assign the call result to a name first)`,
         e.span
       );
-    }
-    const elements: IRExpr[][] = [];
-    const elementSigns: Sign[] = [];
-    for (let r = 0; r < numRows; r++) {
-      const row = e.rows[r];
-      if (row.length !== numCols) {
-        throw new TypeError(
-          `tensor literal has rows of different lengths ` +
-            `(row 1 has ${numCols}, row ${r + 1} has ${row.length})`,
-          e.span
-        );
-      }
-      const loweredRow: IRExpr[] = [];
-      for (const cell of row) {
-        const ir = this.lowerExpr(cell);
-        if (!isScalarReal(ir.ty)) {
-          throw new UnsupportedConstruct(
-            `tensor literal elements must be real scalars today ` +
-              `(got ${typeToString(ir.ty)}); nested tensors and ` +
-              `concatenation are not yet supported`,
-            cell.span
-          );
-        }
-        loweredRow.push(ir);
-        if (isTensor(ir.ty)) elementSigns.push(ir.ty.sign);
-      }
-      elements.push(loweredRow);
-    }
-    // Sign of the literal: the join of every element's sign.
-    let sign: Sign = elementSigns[0];
-    for (let i = 1; i < elementSigns.length; i++) {
-      sign = joinSign(sign, elementSigns[i]);
-    }
-    const ty = matrixDouble(numRows, numCols, sign);
-    return { kind: "TensorLit", elements, ty, span: e.span };
+    case "NumLit":
+    case "Var":
+    case "TensorLit":
+      // TensorLit has already been rejected by `rejectNestedTensorLit`
+      // before we get here; if it slipped through, the codegen-side
+      // assertion will fire.
+      return;
+    case "Binary":
+      rejectCallInTensorContext(e.left);
+      rejectCallInTensorContext(e.right);
+      return;
+    case "Unary":
+      rejectCallInTensorContext(e.operand);
+      return;
   }
+}
 
-  private lowerBuiltinCall(name: string, argExprs: Expr[], span: Span): IRExpr {
-    const builtin = getScalarBuiltin(name);
-    if (!builtin) {
-      throw new UnsupportedConstruct(
-        `builtin '${name}' is not yet supported`,
-        span
-      );
-    }
-    if (argExprs.length !== builtin.arity) {
-      throw new UnsupportedConstruct(
-        `${name} expects ${builtin.arity} argument(s), got ${argExprs.length}`,
-        span
-      );
-    }
-    const args = argExprs.map(a => this.lowerExpr(a));
-    // Per-arg shape validation: scalar / vector / tensor. The default
-    // is scalar (matches every legacy builtin entry).
-    for (let i = 0; i < args.length; i++) {
-      const shape = argShapeOf(builtin, i);
-      const argTy = args[i].ty;
-      const argLabel = builtin.arity === 1 ? "x" : `arg ${i + 1}`;
-      if (shape === "scalar") {
-        if (!isScalarReal(argTy)) {
-          throw new UnsupportedConstruct(
-            `${name} ${argLabel} must be a real scalar ` +
-              `(got ${typeToString(argTy)})`,
-            args[i].span
-          );
+function validateStmts(stmts: ReadonlyArray<IRStmt>): void {
+  for (const s of stmts) validateStmt(s);
+}
+
+function validateStmt(s: IRStmt): void {
+  switch (s.kind) {
+    case "Assign":
+      if (s.rhs.kind === "TensorLit") {
+        // Top-level TensorLit at Assign.rhs is the one supported
+        // position. Cells were already required to be scalar-real.
+        for (const row of s.rhs.elements) {
+          for (const cell of row) rejectNestedTensorLit(cell);
         }
-      } else if (shape === "vector") {
-        if (!isVector(argTy)) {
-          throw new UnsupportedConstruct(
-            `${name} ${argLabel} must be a vector ` +
-              `(got ${typeToString(argTy)})`,
-            args[i].span
-          );
-        }
-      } else if (shape === "tensor") {
-        if (!isMultiElement(argTy)) {
-          throw new UnsupportedConstruct(
-            `${name} ${argLabel} must be a non-scalar tensor ` +
-              `(got ${typeToString(argTy)})`,
-            args[i].span
-          );
+      } else {
+        rejectNestedTensorLit(s.rhs);
+        if (isMultiElement(s.rhs.ty)) {
+          rejectCallInTensorContext(s.rhs);
         }
       }
-    }
-    // Sign-domain validation — applies in any shape.
-    for (let i = 0; i < args.length; i++) {
-      const dom = builtin.argDomains[i];
-      if (!dom) continue;
-      const argTy = args[i].ty;
-      const argSign = isTensor(argTy) ? argTy.sign : "unknown";
-      const ok =
-        dom === "nonnegative"
-          ? signIsNonneg(argSign)
-          : signIsPositive(argSign);
-      if (!ok) {
-        const argLabel = builtin.arity === 1 ? "x" : `arg ${i + 1}`;
-        throw new TypeError(
-          `${name} requires ${argLabel} to be statically ${dom} ` +
-            `(got sign='${argSign}'). ` +
-            `Use abs(...) or restructure the expression.`,
-          span
-        );
+      return;
+    case "ExprStmt":
+      rejectNestedTensorLit(s.expr);
+      return;
+    case "Disp":
+      rejectNestedTensorLit(s.arg);
+      return;
+    case "TensorElemwise":
+      // Per-element body — same constraints as the old Assign-with-
+      // tensor-RHS path: no nested TensorLits, no Calls inside.
+      rejectNestedTensorLit(s.body);
+      rejectCallInTensorContext(s.body);
+      return;
+    case "If":
+      rejectNestedTensorLit(s.cond);
+      validateStmts(s.thenBody);
+      for (const eif of s.elseifs) {
+        rejectNestedTensorLit(eif.cond);
+        validateStmts(eif.body);
       }
-    }
-    let resultSign: Sign;
-    if (builtin.resultSign === "preserve") {
-      const argTy = args[0].ty;
-      resultSign = isTensor(argTy) ? argTy.sign : "unknown";
-    } else {
-      resultSign = builtin.resultSign;
-    }
-    return {
-      kind: "Call",
-      name,
-      cFunc: builtin.cFunc,
-      args,
-      ty: scalarDouble(resultSign),
-      span,
-    };
+      if (s.elseBody) validateStmts(s.elseBody);
+      return;
+    case "While":
+      rejectNestedTensorLit(s.cond);
+      validateStmts(s.body);
+      return;
+    case "For":
+      rejectNestedTensorLit(s.start);
+      rejectNestedTensorLit(s.step);
+      rejectNestedTensorLit(s.end);
+      validateStmts(s.body);
+      return;
+    case "Break":
+    case "Continue":
+    case "ReturnFromFunction":
+      return;
   }
+}
 
-  private lowerUserCall(name: string, argExprs: Expr[], span: Span): IRExpr {
-    const fnAst = this.shared.workspace.localFunctions.get(name);
-    if (!fnAst) {
-      throw new UnsupportedConstruct(
-        `internal: workspace claimed '${name}' is a user function but no AST is registered`,
-        span
-      );
-    }
-    if (fnAst.outputs.length !== 1) {
-      throw new UnsupportedConstruct(
-        `function '${name}' must have exactly one output (got ${fnAst.outputs.length})`,
-        span
-      );
-    }
-    if (argExprs.length !== fnAst.params.length) {
-      throw new TypeError(
-        `function '${name}' expects ${fnAst.params.length} argument(s), got ${argExprs.length}`,
-        span
-      );
-    }
-    const args = argExprs.map(a => this.lowerExpr(a));
-    for (const a of args) {
-      if (!isScalarReal(a.ty)) {
-        throw new UnsupportedConstruct(
-          `function '${name}' currently only accepts real-scalar arguments ` +
-            `(got ${typeToString(a.ty)})`,
-          a.span
-        );
-      }
-    }
-    const argTypes = args.map(a => a.ty);
-    const mangledName = mangleSpecName(name, argTypes);
-
-    let spec = this.shared.cache.get(mangledName);
-    if (!spec) {
-      if (this.shared.inFlight.has(mangledName)) {
-        throw new UnsupportedConstruct(
-          `recursive call to '${name}' is not yet supported`,
-          span
-        );
-      }
-      spec = this.specialize(name, fnAst, argTypes, mangledName);
-    }
-    return {
-      kind: "Call",
-      name,
-      cFunc: mangledName,
-      args,
-      ty: spec.returnTy,
-      span,
-    };
-  }
-
-  /** Lower a function body for a specific argument type signature.
-   *  Each unique type tuple gets its own specialization (and its own
-   *  emitted C function), so the body sees params bound to the actual
-   *  call-site type — including sign. Sign-sensitive ops like
-   *  `sqrt(x)` then resolve at the call site that introduced the
-   *  type. */
-  private specialize(
-    matlabName: string,
-    fnAst: FunctionStmt,
-    argTypes: MType[],
-    mangledName: string
-  ): IRFunction {
-    this.shared.inFlight.add(mangledName);
-    try {
-      const paramBindings = fnAst.params.map((p, i) => ({
-        name: p,
-        ty: argTypes[i],
-      }));
-      const inner = new Lowerer(
-        this.shared,
-        paramBindings,
-        fnAst.outputs[0]
-      );
-      const body = inner.lowerStmts(fnAst.body);
-      const outputName = fnAst.outputs[0];
-      const returnTy = inner.envLookup(outputName);
-      if (!returnTy) {
-        throw new TypeError(
-          `function '${matlabName}' did not assign its output variable '${outputName}' on any path`,
-          fnAst.span
-        );
-      }
-      if (!isScalarReal(returnTy)) {
-        throw new UnsupportedConstruct(
-          `function '${matlabName}' must return a real scalar ` +
-            `(got ${typeToString(returnTy)})`,
-          fnAst.span
-        );
-      }
-      const file = fnAst.span.file;
-      const source = this.shared.workspace.files.get(file)?.source ?? "";
-      const sourceLocation = {
-        file,
-        startLine: offsetToLine(source, fnAst.span.start),
-        endLine: offsetToLine(source, fnAst.span.end),
-      };
-      const spec: IRFunction = {
-        mangledName,
-        matlabName,
-        params: paramBindings,
-        outputVar: outputName,
-        returnTy,
-        assignedVars: inner.getAssignedVars(),
-        body,
-        span: fnAst.span,
-        sourceLocation,
-      };
-      this.shared.cache.set(mangledName, spec);
-      this.shared.order.push(spec);
-      return spec;
-    } finally {
-      this.shared.inFlight.delete(mangledName);
-    }
-  }
+/**
+ * Walk the lowered program rejecting constructs that would have made
+ * codegen throw a stack trace — TensorLit nested inside expressions,
+ * Call nodes inside multi-element tensor RHSs. Errors thrown here carry
+ * a span, so users see a line number instead of a codegen-internal
+ * trace.
+ */
+function validateIR(prog: IRProgram): void {
+  for (const fn of prog.functions) validateStmts(fn.body);
+  validateStmts(prog.stmts);
 }
 
 export function lower(
@@ -985,9 +637,11 @@ export function lower(
   };
   const top = new Lowerer(shared);
   const stmts = top.lowerStmts(scriptBody);
-  return {
+  const prog: IRProgram = {
     assignedVars: top.getAssignedVars(),
     functions: shared.order,
     stmts,
   };
+  validateIR(prog);
+  return prog;
 }

@@ -11,7 +11,17 @@ import type { MType } from "./types.js";
 
 export type IRExpr =
   | { kind: "NumLit"; value: number; ty: MType; span: Span }
-  | { kind: "Var"; name: string; ty: MType; span: Span }
+  | {
+      kind: "Var";
+      /** MATLAB name (for diagnostics and assignedVars lookups). */
+      name: string;
+      /** C identifier the codegen emits for this variable. Computed
+       *  once during lowering (see `cNameFor`) so emit.ts never has to
+       *  re-mangle. */
+      cName: string;
+      ty: MType;
+      span: Span;
+    }
   | {
       /** Tensor literal `[a b c; d e f]`. Elements are stored in
        *  row-major nested arrays mirroring the source syntax; codegen
@@ -38,29 +48,57 @@ export type IRExpr =
       span: Span;
     }
   | {
-      /** Function call — covers both builtins (cFunc is a libm or runtime
-       *  helper name) and user-defined scalar functions (cFunc is the
-       *  mangled specialization name). */
+      /** Function call — covers builtins (libm scalar math and mtoc
+       *  runtime helpers) and user-defined scalar functions. The `callee`
+       *  variant tells codegen which header / runtime snippet to pull
+       *  in (libm needs `<math.h>`, runtime helpers self-activate, user
+       *  funcs need no extra activation). */
       kind: "Call";
       /** MATLAB name (for diagnostics). */
       name: string;
-      /** C identifier the codegen emits. */
-      cFunc: string;
+      callee: CallTarget;
       args: IRExpr[];
       ty: MType;
       span: Span;
     };
 
+/** Discriminator on a `Call`'s C-side target. Codegen consumes this
+ *  directly — no map lookup against the runtime registry. */
+export type CallTarget =
+  | { kind: "libm"; cName: string }
+  | { kind: "runtime"; helperName: string }
+  | { kind: "userFunc"; mangled: string };
+
 export type IRStmt =
   | {
       kind: "Assign";
+      /** MATLAB target name (for diagnostics and assignedVars lookup). */
       name: string;
+      /** Pre-mangled C identifier of the target. */
+      cName: string;
       rhs: IRExpr;
       ty: MType;
       span: Span;
     }
   | { kind: "ExprStmt"; expr: IRExpr; span: Span }
   | { kind: "Disp"; arg: IRExpr; span: Span }
+  | {
+      /** Per-element loop emitted for tensor-result assignments. The
+       *  body is an expression evaluated once per element with `iterCName`
+       *  bound to the linear index; tensor-typed `Var`s inside `body`
+       *  read `<cName>.data[<iterCName>]`. */
+      kind: "TensorElemwise";
+      cTargetName: string;
+      /** Number of elements to write (`rows*cols`). Statically known
+       *  today (the lowerer ensures the result has exact dims). */
+      numel: number;
+      /** Synthetic loop index name, scoped to this stmt's `{...}` block.
+       *  Default is `_mtoc_i` but each loop gets a fresh name to avoid
+       *  shadowing pitfalls when we add nested tensor ops later. */
+      iterCName: string;
+      body: IRExpr;
+      span: Span;
+    }
   | {
       kind: "If";
       cond: IRExpr;
@@ -71,7 +109,10 @@ export type IRStmt =
     }
   | {
       kind: "For";
+      /** MATLAB loop-variable name (for diagnostics). */
       var: string;
+      /** C identifier for the loop variable's storage. */
+      cVar: string;
       start: IRExpr;
       step: IRExpr;
       end: IRExpr;
@@ -87,8 +128,16 @@ export type IRStmt =
   | { kind: "Break"; span: Span }
   | { kind: "Continue"; span: Span }
   /** MATLAB `return` inside a function — emitted by lowering only when
-   *  inside a function scope. Codegen turns it into `return <output>;`. */
-  | { kind: "ReturnFromFunction"; outputVar: string; span: Span };
+   *  inside a function scope. Codegen turns it into `return <outputCName>;`. */
+  | { kind: "ReturnFromFunction"; outputCName: string; span: Span };
+
+/** A predeclared variable: its inferred type plus the C identifier the
+ *  codegen will emit. Computed once during lowering so emit.ts never
+ *  has to re-mangle. */
+export interface VarBinding {
+  ty: MType;
+  cName: string;
+}
 
 /** A single specialization of a user-defined function, ready for codegen. */
 export interface IRFunction {
@@ -96,12 +145,17 @@ export interface IRFunction {
   mangledName: string;
   /** MATLAB-source name (for diagnostics). */
   matlabName: string;
-  params: { name: string; ty: MType }[];
-  /** Name of the output variable. Codegen emits `return <outputVar>;`. */
+  params: { name: string; cName: string; ty: MType }[];
+  /** MATLAB name of the output variable (for diagnostics). */
   outputVar: string;
+  /** C identifier of the output variable. Codegen emits
+   *  `return <outputCName>;` at the bottom of the function body. */
+  outputCName: string;
   returnTy: MType;
-  /** Locals declared inside the body (excluding params). */
-  assignedVars: Map<string, MType>;
+  /** Locals declared inside the body (excluding params). Keyed by
+   *  MATLAB name; each entry carries the C identifier the codegen
+   *  emits for that variable's storage. */
+  assignedVars: Map<string, VarBinding>;
   body: IRStmt[];
   span: Span;
   /** 1-based line range of the original `function … end` block. Codegen
@@ -111,9 +165,10 @@ export interface IRFunction {
 }
 
 export interface IRProgram {
-  /** Variables assigned anywhere in the program (with their inferred type).
-   *  Codegen uses this to predeclare them at the top of main(). */
-  assignedVars: Map<string, MType>;
+  /** Variables assigned anywhere in the program (with their inferred
+   *  type and C identifier). Codegen uses this to predeclare them at
+   *  the top of main(). */
+  assignedVars: Map<string, VarBinding>;
   /** User-function specializations, in lowering order. Emitted before
    *  `main()` in the C output. */
   functions: IRFunction[];

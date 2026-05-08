@@ -12,6 +12,7 @@ import type {
   IRFunction,
   IRProgram,
   IRStmt,
+  VarBinding,
 } from "../lowering/ir.js";
 import {
   isMultiElement,
@@ -19,7 +20,6 @@ import {
   isTensor,
   staticNumElements,
   typeToString,
-  type MType,
   type TensorType,
 } from "../lowering/types.js";
 import {
@@ -29,49 +29,12 @@ import {
   type RuntimeSnippet,
 } from "./runtime.js";
 
-// Reserved C identifiers that need mangling. Mirrors numbl's
-// cJit/codegen.ts list.
-const C_RESERVED: ReadonlySet<string> = new Set([
-  "auto",
-  "break",
-  "case",
-  "char",
-  "const",
-  "continue",
-  "default",
-  "do",
-  "double",
-  "else",
-  "enum",
-  "extern",
-  "float",
-  "for",
-  "goto",
-  "if",
-  "inline",
-  "int",
-  "long",
-  "register",
-  "restrict",
-  "return",
-  "short",
-  "signed",
-  "sizeof",
-  "static",
-  "struct",
-  "switch",
-  "typedef",
-  "union",
-  "unsigned",
-  "void",
-  "volatile",
-  "while",
-  "main",
-]);
-
-function mangle(name: string): string {
-  return C_RESERVED.has(name) ? `v_${name}` : name;
-}
+// Note: C-name mangling lives in lower.ts (`cNameFor`). Every IR.Var,
+// IR.Assign, IR.For, IR.ReturnFromFunction and IRFunction param /
+// output / assignedVars entry already carries the C identifier the
+// codegen emits — emit.ts consumes those fields directly. Synthetic
+// loop-counter names (`_mtoc_i`, `_mtoc_n`, etc.) and the per-tensor
+// `_mtoc_<cName>_data` buffer name are still synthesized here.
 
 function formatNumLit(n: number): string {
   if (Number.isNaN(n)) return "NAN";
@@ -144,20 +107,39 @@ function precedence(op: BinaryOperation | UnaryOperation): number {
   return 0;
 }
 
-function emitExpr(e: IRExpr, parentPrec: number): string {
-  // Tensor-typed sub-expressions can only be materialized via the
-  // dedicated tensor-assignment path (which uses emitElementwise +
-  // a per-element loop). If we land in `emitExpr` with a tensor
-  // result, the caller is trying to use the tensor in a context that
-  // requires a single C value (printf arg, function call arg, etc.).
-  // Today the workaround is to assign to an intermediate variable
-  // first; eventually we'll lift these to temporaries automatically.
-  if (e.kind !== "Var" && e.kind !== "TensorLit" && isMultiElement(e.ty)) {
+interface EmitState {
+  needMath: boolean;
+  /** Runtime helpers used by the program, in stable order. */
+  runtime: RuntimeSnippet[];
+  /** Names of helpers already added to `runtime` (dedup). */
+  runtimeNames: Set<string>;
+  lines: string[];
+  /** Stack of synthetic per-element loop-index C names from active
+   *  `IRStmt.TensorElemwise` blocks. The top of the stack is the
+   *  innermost iter name. When non-empty, multi-element `Var`s render
+   *  as `<cName>.data[<top>]` instead of `<cName>` (broadcast pattern
+   *  for scalar `Var`s and `NumLit`s is unchanged). Empty at the top
+   *  level — scalar codegen contexts reject multi-element sub-exprs as
+   *  before. */
+  iterStack: string[];
+}
+
+function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
+  // Tensor-typed sub-expressions in scalar codegen contexts are caught
+  // by the lowering-pass validator (lower.ts: `validateIR`). If one
+  // reaches here, the lowerer let it through — that's an internal bug.
+  // Inside an iter context, multi-element Binary/Unary nodes are
+  // expected (each iteration consumes one element), so we only enforce
+  // the check at the top level.
+  if (
+    state.iterStack.length === 0 &&
+    e.kind !== "Var" &&
+    e.kind !== "TensorLit" &&
+    isMultiElement(e.ty)
+  ) {
     throw new Error(
-      `codegen: tensor-valued expression (${typeToString(e.ty)}) cannot ` +
-        `appear here yet — assign it to a variable first and then use ` +
-        `the variable. Auto-materialization of tensor temporaries is on ` +
-        `the roadmap.`
+      `codegen internal: tensor-valued expression (${typeToString(e.ty)}) ` +
+        `reached emitExpr; should have been rejected at lowering`
     );
   }
 
@@ -166,24 +148,36 @@ function emitExpr(e: IRExpr, parentPrec: number): string {
       return formatNumLit(e.value);
 
     case "Var":
-      return mangle(e.name);
+      // Inside a per-element loop, a multi-element `Var` reads the
+      // current slot; scalar `Var`s broadcast unchanged.
+      if (state.iterStack.length > 0 && isMultiElement(e.ty)) {
+        const iter = state.iterStack[state.iterStack.length - 1];
+        return `${e.cName}.data[${iter}]`;
+      }
+      return e.cName;
 
     case "TensorLit":
-      // Tensor literals don't have a useful "C expression" form — they
-      // need to write into a known target buffer. The Assign handler
-      // intercepts TensorLit RHS directly. Reaching here means a tensor
-      // literal showed up somewhere we don't yet support (inside an
-      // arithmetic expression, as a function argument, etc.).
+      // Tensor literals are only legal at the top level of Assign.rhs
+      // (handled directly by `emitTensorLitAssign`); every other
+      // position is rejected by the lowering-pass validator. Reaching
+      // here means the lowerer let one through.
       throw new Error(
-        "codegen: tensor literals are only supported as the right-hand " +
-          "side of an assignment so far"
+        "codegen internal: TensorLit reached emitExpr; should have been " +
+          "rejected at lowering"
       );
 
     case "Call": {
-      // Activation of mtoc_* helpers is handled by `collectBuiltinHelpers`
-      // before `emitExpr` is called.
-      const argList = e.args.map(a => emitExpr(a, 0)).join(", ");
-      return `${e.cFunc}(${argList})`;
+      // Activation of mtoc_* helpers is handled by the analyze pre-pass
+      // before `emitExpr` is called. Each callee variant maps to its C
+      // identifier directly — no registry lookup.
+      const argList = e.args.map(a => emitExpr(state, a, 0)).join(", ");
+      const cName =
+        e.callee.kind === "libm"
+          ? e.callee.cName
+          : e.callee.kind === "runtime"
+            ? e.callee.helperName
+            : e.callee.mangled;
+      return `${cName}(${argList})`;
     }
 
     case "Binary": {
@@ -192,11 +186,11 @@ function emitExpr(e: IRExpr, parentPrec: number): string {
         const p = precedence(e.op);
         // Left-associative: left at p, right at p+1 to force parens on
         // equal-precedence right-nested operators.
-        const inner = `${emitExpr(e.left, p)} ${cOp} ${emitExpr(e.right, p + 1)}`;
+        const inner = `${emitExpr(state, e.left, p)} ${cOp} ${emitExpr(state, e.right, p + 1)}`;
         return p < parentPrec ? `(${inner})` : inner;
       }
       if (e.op === "Pow" || e.op === "ElemPow") {
-        return `pow(${emitExpr(e.left, 0)}, ${emitExpr(e.right, 0)})`;
+        return `pow(${emitExpr(state, e.left, 0)}, ${emitExpr(state, e.right, 0)})`;
       }
       throw new Error(`codegen: unsupported binary op ${e.op}`);
     }
@@ -209,21 +203,12 @@ function emitExpr(e: IRExpr, parentPrec: number): string {
       // (e.g. `-(-x)` not `--x`, which would be a decrement).
       const operandStr =
         e.operand.kind === "Unary"
-          ? `(${emitExpr(e.operand, 0)})`
-          : emitExpr(e.operand, p);
+          ? `(${emitExpr(state, e.operand, 0)})`
+          : emitExpr(state, e.operand, p);
       const inner = `${cOp}${operandStr}`;
       return p < parentPrec ? `(${inner})` : inner;
     }
   }
-}
-
-interface EmitState {
-  needMath: boolean;
-  /** Runtime helpers used by the program, in stable order. */
-  runtime: RuntimeSnippet[];
-  /** Names of helpers already added to `runtime` (dedup). */
-  runtimeNames: Set<string>;
-  lines: string[];
 }
 
 function useRuntime(
@@ -260,87 +245,89 @@ function pushStmt(state: EmitState, level: number, s: string): void {
   state.lines.push(`${indent(level)}${s}`);
 }
 
-/** Walks an expression to decide whether <math.h> must be included. */
-function exprNeedsMath(e: IRExpr): boolean {
+/**
+ * One-pass walker over an expression. Mutates `state.needMath`
+ * whenever a node forces `<math.h>` (Call, Pow/ElemPow, infinite
+ * NumLit) and activates any runtime snippet referenced by a Call.
+ * Libm and user-function callees don't need a snippet; runtime
+ * helpers do.
+ */
+function analyzeExpr(state: EmitState, e: IRExpr): void {
   switch (e.kind) {
     case "NumLit":
       // INFINITY / NAN macros come from <math.h>.
-      return !Number.isFinite(e.value);
-    case "Var":
-      return false;
-    case "TensorLit":
-      return e.elements.some(row => row.some(c => exprNeedsMath(c)));
-    case "Call":
-      // Every builtin we currently emit lives in <math.h>; if that ever
-      // changes, look up `getScalarBuiltin(e.name).needsMath` instead.
-      return true;
-    case "Binary":
-      if (e.op === "Pow" || e.op === "ElemPow") return true;
-      return exprNeedsMath(e.left) || exprNeedsMath(e.right);
-    case "Unary":
-      return exprNeedsMath(e.operand);
-  }
-}
-
-/** Walks an expression and activates any runtime helper its Calls
- *  reference (e.g. `mtoc_mod`, `mtoc_sign`). Libm names are skipped. */
-function activateExprHelpers(state: EmitState, e: IRExpr): void {
-  switch (e.kind) {
-    case "NumLit":
+      if (!Number.isFinite(e.value)) state.needMath = true;
+      return;
     case "Var":
       return;
     case "TensorLit":
       for (const row of e.elements)
-        for (const c of row) activateExprHelpers(state, c);
+        for (const c of row) analyzeExpr(state, c);
       return;
     case "Call": {
-      // Libm names + user-function specializations don't have a runtime
-      // helper; only mtoc_* helper names appear in RUNTIME_HELPERS.
-      const snippet = RUNTIME_HELPERS.get(e.cFunc);
-      if (snippet) useRuntime(state, e.cFunc, snippet);
-      for (const a of e.args) activateExprHelpers(state, a);
+      // Every builtin we currently emit lives in <math.h> (libm + the
+      // mtoc runtime helpers all `#include <math.h>` themselves), so
+      // any Call forces <math.h>.
+      state.needMath = true;
+      if (e.callee.kind === "runtime") {
+        useRuntimeByName(state, e.callee.helperName);
+      }
+      for (const a of e.args) analyzeExpr(state, a);
       return;
     }
     case "Binary":
-      activateExprHelpers(state, e.left);
-      activateExprHelpers(state, e.right);
+      if (e.op === "Pow" || e.op === "ElemPow") state.needMath = true;
+      analyzeExpr(state, e.left);
+      analyzeExpr(state, e.right);
       return;
     case "Unary":
-      activateExprHelpers(state, e.operand);
+      analyzeExpr(state, e.operand);
       return;
   }
 }
 
-function activateStmtHelpers(state: EmitState, s: IRStmt): void {
+/**
+ * Statement-level companion to `analyzeExpr`. Walks every expression
+ * the statement transitively contains, plus sets `needMath` for stmts
+ * whose codegen always emits a math.h call (currently only For — its
+ * iteration-count formula uses floor()).
+ */
+function analyzeStmt(state: EmitState, s: IRStmt): void {
   switch (s.kind) {
     case "Assign":
-      activateExprHelpers(state, s.rhs);
+      analyzeExpr(state, s.rhs);
       return;
     case "ExprStmt":
-      activateExprHelpers(state, s.expr);
+      analyzeExpr(state, s.expr);
       return;
     case "Disp":
-      activateExprHelpers(state, s.arg);
+      analyzeExpr(state, s.arg);
+      return;
+    case "TensorElemwise":
+      analyzeExpr(state, s.body);
       return;
     case "If":
-      activateExprHelpers(state, s.cond);
-      for (const t of s.thenBody) activateStmtHelpers(state, t);
+      analyzeExpr(state, s.cond);
+      for (const t of s.thenBody) analyzeStmt(state, t);
       for (const eif of s.elseifs) {
-        activateExprHelpers(state, eif.cond);
-        for (const t of eif.body) activateStmtHelpers(state, t);
+        analyzeExpr(state, eif.cond);
+        for (const t of eif.body) analyzeStmt(state, t);
       }
       if (s.elseBody)
-        for (const t of s.elseBody) activateStmtHelpers(state, t);
+        for (const t of s.elseBody) analyzeStmt(state, t);
       return;
     case "For":
-      activateExprHelpers(state, s.start);
-      activateExprHelpers(state, s.step);
-      activateExprHelpers(state, s.end);
-      for (const t of s.body) activateStmtHelpers(state, t);
+      // The emitted iteration-count formula calls floor(), so any For
+      // forces <math.h> regardless of what its bounds analyze to.
+      state.needMath = true;
+      analyzeExpr(state, s.start);
+      analyzeExpr(state, s.step);
+      analyzeExpr(state, s.end);
+      for (const t of s.body) analyzeStmt(state, t);
       return;
     case "While":
-      activateExprHelpers(state, s.cond);
-      for (const t of s.body) activateStmtHelpers(state, t);
+      analyzeExpr(state, s.cond);
+      for (const t of s.body) analyzeStmt(state, t);
       return;
     case "Break":
     case "Continue":
@@ -352,17 +339,17 @@ function activateStmtHelpers(state: EmitState, s: IRStmt): void {
 function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   switch (s.kind) {
     case "Assign": {
+      // `state.needMath` and runtime activations were set up by the
+      // analyzeStmt pre-pass; this function only generates lines.
+      // Multi-element tensor RHSs are lowered to `TensorElemwise`, so
+      // by the time we reach Assign the only multi-element case left is
+      // a TensorLit.
       if (s.rhs.kind === "TensorLit") {
-        emitTensorLitAssign(state, level, s.name, s.rhs);
+        emitTensorLitAssign(state, level, s.cName, s.rhs);
         break;
       }
       if (isScalarReal(s.ty)) {
-        if (exprNeedsMath(s.rhs)) state.needMath = true;
-        pushStmt(state, level, `${mangle(s.name)} = ${emitExpr(s.rhs, 0)};`);
-        break;
-      }
-      if (isMultiElement(s.ty)) {
-        emitTensorElemwiseAssign(state, level, s.name, s.rhs, s.ty);
+        pushStmt(state, level, `${s.cName} = ${emitExpr(state, s.rhs, 0)};`);
         break;
       }
       throw new Error(
@@ -372,33 +359,30 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
     }
 
     case "ExprStmt": {
-      if (exprNeedsMath(s.expr)) state.needMath = true;
-      pushStmt(state, level, `(void)(${emitExpr(s.expr, 0)});`);
+      pushStmt(state, level, `(void)(${emitExpr(state, s.expr, 0)});`);
       break;
     }
 
     case "Disp": {
       const ty = s.arg.ty;
       if (isScalarReal(ty)) {
-        if (exprNeedsMath(s.arg)) state.needMath = true;
         useRuntime(state, "mtoc_disp_double", MTOC_DISP_DOUBLE);
         // Non-variadic call — `int` operands auto-promote to `double`,
         // so no manual cast is needed (unlike `printf("%g", ...)`).
-        pushStmt(state, level, `mtoc_disp_double(${emitExpr(s.arg, 0)});`);
+        pushStmt(state, level, `mtoc_disp_double(${emitExpr(state, s.arg, 0)});`);
         break;
       }
       if (isTensor(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
-        // Today only Var args are supported — tensor literals or other
-        // expressions would need a temporary, which we'll add when we
-        // teach the codegen to materialize tensor expressions.
+        // The lowering pass requires tensor `disp` args to be a Var;
+        // anything else would have thrown at lowering with a span.
         if (s.arg.kind !== "Var") {
           throw new Error(
-            "codegen: disp of a tensor expression is only supported for " +
-              "variables; assign the value to a name first"
+            "codegen internal: non-Var tensor disp arg reached emit; " +
+              "should have been rejected at lowering"
           );
         }
         useRuntimeByName(state, "mtoc_disp_tensor");
-        pushStmt(state, level, `mtoc_disp_tensor(${mangle(s.arg.name)});`);
+        pushStmt(state, level, `mtoc_disp_tensor(${s.arg.cName});`);
         break;
       }
       throw new Error(
@@ -406,13 +390,38 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       );
     }
 
+    case "TensorElemwise": {
+      // Per-element loop emitted for tensor-result assignments. The
+      // body is rendered once per element with the iter-name pushed
+      // onto `state.iterStack`; multi-element `Var`s in the body then
+      // read `<cName>.data[<iterCName>]` (see `emitExpr.Var`). Wrapped
+      // in a block so `_mtoc_n` is scoped per stmt — nested elementwise
+      // loops (not generated today) would shadow without collision.
+      pushStmt(state, level, `{`);
+      pushStmt(state, level + 1, `long _mtoc_n = ${s.numel};`);
+      pushStmt(
+        state,
+        level + 1,
+        `for (long ${s.iterCName} = 0; ${s.iterCName} < _mtoc_n; ${s.iterCName}++) {`
+      );
+      state.iterStack.push(s.iterCName);
+      const bodyStr = emitExpr(state, s.body, 0);
+      state.iterStack.pop();
+      pushStmt(
+        state,
+        level + 2,
+        `${s.cTargetName}.data[${s.iterCName}] = ${bodyStr};`
+      );
+      pushStmt(state, level + 1, `}`);
+      pushStmt(state, level, `}`);
+      break;
+    }
+
     case "If": {
-      if (exprNeedsMath(s.cond)) state.needMath = true;
-      pushStmt(state, level, `if (${emitExpr(s.cond, 0)}) {`);
+      pushStmt(state, level, `if (${emitExpr(state, s.cond, 0)}) {`);
       for (const t of s.thenBody) emitStmt(state, level + 1, t);
       for (const eif of s.elseifs) {
-        if (exprNeedsMath(eif.cond)) state.needMath = true;
-        pushStmt(state, level, `} else if (${emitExpr(eif.cond, 0)}) {`);
+        pushStmt(state, level, `} else if (${emitExpr(state, eif.cond, 0)}) {`);
         for (const t of eif.body) emitStmt(state, level + 1, t);
       }
       if (s.elseBody) {
@@ -424,8 +433,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
     }
 
     case "While": {
-      if (exprNeedsMath(s.cond)) state.needMath = true;
-      pushStmt(state, level, `while (${emitExpr(s.cond, 0)}) {`);
+      pushStmt(state, level, `while (${emitExpr(state, s.cond, 0)}) {`);
       for (const t of s.body) emitStmt(state, level + 1, t);
       pushStmt(state, level, `}`);
       break;
@@ -440,7 +448,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       break;
 
     case "ReturnFromFunction":
-      pushStmt(state, level, `return ${mangle(s.outputVar)};`);
+      pushStmt(state, level, `return ${s.outputCName};`);
       break;
 
     case "For": {
@@ -448,13 +456,9 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       if (s.step.kind !== "NumLit") {
         throw new Error("codegen: for-loop step must be a NumLit");
       }
-      // floor() comes from <math.h>; the iteration-count formula needs it.
-      state.needMath = true;
-      if (exprNeedsMath(s.start) || exprNeedsMath(s.end)) state.needMath = true;
-
-      const v = mangle(s.var);
-      const startStr = emitExpr(s.start, 0);
-      const endStr = emitExpr(s.end, 0);
+      const v = s.cVar;
+      const startStr = emitExpr(state, s.start, 0);
+      const endStr = emitExpr(state, s.end, 0);
       const stepStr = formatNumLit(s.step.value);
 
       // MATLAB semantics: after the loop, the loop variable holds the
@@ -490,103 +494,6 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   }
 }
 
-/**
- * Emit a single-element expression in "tensor element" context.
- *
- * Behaves like `emitExpr` for the most part, but where the scalar
- * version emits a tensor `Var` as `name`, this version emits
- * `name.data[_mtoc_i]` so the surrounding per-element loop reads/writes
- * the right slot. Scalar `Var`s (and NumLits) pass through unchanged —
- * they get broadcast across the loop body.
- *
- * Constructs we don't yet support inside tensor expressions throw —
- * the assign-level orchestration only invokes this for arithmetic on
- * tensor `Var`s + scalar literals/vars.
- */
-function emitElementwise(e: IRExpr, parentPrec: number): string {
-  switch (e.kind) {
-    case "NumLit":
-      return formatNumLit(e.value);
-    case "Var":
-      if (isMultiElement(e.ty)) {
-        return `${mangle(e.name)}.data[_mtoc_i]`;
-      }
-      return mangle(e.name);
-    case "TensorLit":
-      throw new Error(
-        "codegen: nested tensor literal inside a tensor expression " +
-          "is not yet supported; assign the literal to a name first"
-      );
-    case "Call":
-      throw new Error(
-        "codegen: function calls inside a tensor expression are not " +
-          "yet supported"
-      );
-    case "Binary": {
-      const cOp = BIN_OP_C[e.op];
-      if (cOp) {
-        const p = precedence(e.op);
-        const inner =
-          `${emitElementwise(e.left, p)} ${cOp} ` +
-          `${emitElementwise(e.right, p + 1)}`;
-        return p < parentPrec ? `(${inner})` : inner;
-      }
-      if (e.op === "Pow" || e.op === "ElemPow") {
-        return `pow(${emitElementwise(e.left, 0)}, ${emitElementwise(e.right, 0)})`;
-      }
-      throw new Error(
-        `codegen: binary op ${e.op} not supported in tensor expression`
-      );
-    }
-    case "Unary": {
-      const cOp = UN_OP_C[e.op];
-      if (!cOp) throw new Error(`codegen: unary op ${e.op}`);
-      const p = precedence(e.op);
-      const operandStr =
-        e.operand.kind === "Unary"
-          ? `(${emitElementwise(e.operand, 0)})`
-          : emitElementwise(e.operand, p);
-      const inner = `${cOp}${operandStr}`;
-      return p < parentPrec ? `(${inner})` : inner;
-    }
-  }
-}
-
-/** Emit an elementwise tensor assignment as a per-element loop. The
- *  target has already been predeclared with the right storage; we
- *  just walk the RHS and write each slot. */
-function emitTensorElemwiseAssign(
-  state: EmitState,
-  level: number,
-  targetName: string,
-  rhs: IRExpr,
-  ty: MType
-): void {
-  const numel = staticNumElements(ty);
-  if (numel === null) {
-    throw new Error(
-      `codegen: tensor assignment with dynamic dimensions ` +
-        `(${typeToString(ty)}) is not yet supported`
-    );
-  }
-  if (exprNeedsMath(rhs)) state.needMath = true;
-  const target = mangle(targetName);
-  pushStmt(state, level, `{`);
-  pushStmt(state, level + 1, `long _mtoc_n = ${numel};`);
-  pushStmt(
-    state,
-    level + 1,
-    `for (long _mtoc_i = 0; _mtoc_i < _mtoc_n; _mtoc_i++) {`
-  );
-  pushStmt(
-    state,
-    level + 2,
-    `${target}.data[_mtoc_i] = ${emitElementwise(rhs, 0)};`
-  );
-  pushStmt(state, level + 1, `}`);
-  pushStmt(state, level, `}`);
-}
-
 /** Emit element-by-element column-major writes for a tensor literal
  *  assignment. The target's storage was set up by predeclaration, so
  *  we just write into `<name>.data[idx]`. The literal's element rows
@@ -595,7 +502,7 @@ function emitTensorElemwiseAssign(
 function emitTensorLitAssign(
   state: EmitState,
   level: number,
-  targetName: string,
+  target: string,
   lit: Extract<IRExpr, { kind: "TensorLit" }>
 ): void {
   if (!isTensor(lit.ty)) {
@@ -609,57 +516,60 @@ function emitTensorLitAssign(
   }
   const rows = ty.rows.n;
   const cols = ty.cols.n;
-  const target = mangle(targetName);
   for (let c = 0; c < cols; c++) {
     for (let r = 0; r < rows; r++) {
       const cellExpr = lit.elements[r][c];
-      if (exprNeedsMath(cellExpr)) state.needMath = true;
       const idx = r + c * rows;
       pushStmt(
         state,
         level,
-        `${target}.data[${idx}] = ${emitExpr(cellExpr, 0)};`
+        `${target}.data[${idx}] = ${emitExpr(state, cellExpr, 0)};`
       );
     }
   }
 }
 
-/** Emit predeclarations for a {name → type} table. Scalars become
- *  `double <name> = 0.0;`. Multi-element tensors get a stack-backed
- *  `mtoc_tensor_t <name>` plus an underlying `double <name>_data[N]`
- *  buffer sized to the unified type's exact dims. Activates the
- *  `mtoc_tensor_t` typedef snippet whenever any tensor is declared. */
+/** Emit predeclarations for a {matlabName → VarBinding} table. Scalars
+ *  become `double <cName> = 0.0;`. Multi-element tensors get a
+ *  stack-backed `mtoc_tensor_t <cName>` plus an underlying
+ *  `double _mtoc_<cName>_data[N]` buffer sized to the unified type's
+ *  exact dims. Activates the `mtoc_tensor_t` typedef snippet whenever
+ *  any tensor is declared. */
 function emitDeclarations(
   state: EmitState,
   level: number,
-  vars: ReadonlyMap<string, MType>
+  vars: ReadonlyMap<string, VarBinding>
 ): void {
+  // Iteration order: by MATLAB name so the generated declaration order
+  // is stable across runs and matches the original (pre-mangling) names.
   const names = [...vars.keys()].sort();
   for (const name of names) {
-    const ty = vars.get(name)!;
+    const binding = vars.get(name)!;
+    const { ty, cName } = binding;
     if (isScalarReal(ty)) {
-      pushStmt(state, level, `double ${mangle(name)} = 0.0;`);
+      pushStmt(state, level, `double ${cName} = 0.0;`);
       continue;
     }
     if (isTensor(ty) && isMultiElement(ty) && !ty.isComplex && ty.elem === "double") {
       const numel = staticNumElements(ty);
       if (numel === null) {
         throw new Error(
-          `codegen: variable '${name}' has dynamic dimensions ` +
-            `(${typeToString(ty)}); dynamic-size tensors are not yet ` +
-            `supported. Try keeping the tensor's shape constant across ` +
-            `all assignments.`
+          `codegen internal: variable '${name}' has dynamic dimensions ` +
+            `(${typeToString(ty)}); should have been rejected at lowering`
         );
       }
       useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-      const buf = `_mtoc_${mangle(name)}_data`;
+      // Synthetic buffer name keyed off the C identifier (which is
+      // unique within the scope). The `_mtoc_` prefix is reserved by
+      // lower.ts so it can never collide with a user variable.
+      const buf = `_mtoc_${cName}_data`;
       const r = (ty.rows as { kind: "exact"; n: number }).n;
       const c = (ty.cols as { kind: "exact"; n: number }).n;
       pushStmt(state, level, `double ${buf}[${numel}];`);
       pushStmt(
         state,
         level,
-        `mtoc_tensor_t ${mangle(name)} = { ${buf}, ${r}, ${c} };`
+        `mtoc_tensor_t ${cName} = { ${buf}, ${r}, ${c} };`
       );
       continue;
     }
@@ -685,7 +595,7 @@ function emitFunctionBody(
 
   const bodyLines = state.lines;
   state.lines = outerLines;
-  return { lines: bodyLines, cReturn: `return ${mangle(fn.outputVar)};` };
+  return { lines: bodyLines, cReturn: `return ${fn.outputCName};` };
 }
 
 /** Render the per-specialization header comment that goes above each
@@ -722,7 +632,7 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
     );
   }
   const paramList = fn.params
-    .map(p => `double ${mangle(p.name)}`)
+    .map(p => `double ${p.cName}`)
     .join(", ");
   const sig = `static double ${fn.mangledName}(${paramList || "void"}) {`;
   const { lines, cReturn } = emitFunctionBody(state, fn);
@@ -741,15 +651,17 @@ export function emitC(prog: IRProgram): string {
     runtime: [],
     runtimeNames: new Set(),
     lines: [],
+    iterStack: [],
   };
 
-  // Activate runtime helpers referenced by the program (main + every
-  // function body). Walking everything before emitting keeps the helper
-  // ordering stable.
+  // One-pass pre-walk: activates runtime helpers referenced by the
+  // program (main + every function body) AND sets `state.needMath`
+  // for every node that forces <math.h>. Walking everything before
+  // emitting keeps the helper ordering stable.
   for (const fn of prog.functions) {
-    for (const s of fn.body) activateStmtHelpers(state, s);
+    for (const s of fn.body) analyzeStmt(state, s);
   }
-  for (const s of prog.stmts) activateStmtHelpers(state, s);
+  for (const s of prog.stmts) analyzeStmt(state, s);
 
   // Emit user-function bodies first into separate buffers; we paste
   // them into the output below, before main.

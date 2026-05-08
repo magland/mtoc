@@ -296,6 +296,84 @@ function joinDim(a: DimInfo, b: DimInfo): DimInfo {
   return { kind: "unknown" };
 }
 
+// ── TensorType field template ───────────────────────────────────────────
+//
+// Single source of truth describing every storable field on `TensorType`.
+// `canonicalizeType`, `typeToString`, and `unify` all iterate this list
+// instead of hand-rolling a copy of every field. Adding a new field
+// (say, `complexKind`) means appending one entry here — the three
+// shared routines pick it up automatically.
+//
+// IMPORTANT: the field ORDER below is the canonical hash order. Since
+// the lowerer hashes `JSON.stringify(canonicalizeType(...))` to produce
+// a function specialization's mangled C name, reordering would change
+// every emitted specialization name (and therefore the generated C).
+// New fields MUST be appended to the end.
+
+interface TensorFieldEntry {
+  /** Field key on `TensorType`. */
+  readonly name: keyof TensorType;
+  /** Canonical-hash value contributed by this field (deterministic JSON
+   *  for `canonicalizeType`). Default: pass-through of `t[name]`. */
+  readonly canonicalize: (t: TensorType) => unknown;
+  /** typeToString fragment contributed by this field. Empty string is
+   *  fine — the framing handles separators. Receives the whole type so
+   *  paired-field renderings (rows+cols → "RxC") can be coalesced into
+   *  a single field's contribution. */
+  readonly format: (t: TensorType) => string;
+  /** Joins this field across `a` and `b`, writing the result into
+   *  `out`. Returns `false` when the two values can't share a single
+   *  C representation — `unify` then short-circuits to Unknown. */
+  readonly joinInto: (
+    a: TensorType,
+    b: TensorType,
+    out: Record<string, unknown>
+  ) => boolean;
+}
+
+/** Build a field entry with per-field types preserved. The resulting
+ *  closures cast inside the union so callers see a uniform interface. */
+function makeField<K extends keyof TensorType>(
+  name: K,
+  format: (t: TensorType) => string,
+  join: (a: TensorType[K], b: TensorType[K]) => TensorType[K] | null
+): TensorFieldEntry {
+  return {
+    name,
+    canonicalize: t => t[name],
+    format,
+    joinInto: (a, b, out) => {
+      const r = join(a[name], b[name]);
+      if (r === null) return false;
+      out[name] = r;
+      return true;
+    },
+  };
+}
+
+const TENSOR_FIELDS: ReadonlyArray<TensorFieldEntry> = [
+  makeField(
+    "elem",
+    t => t.elem,
+    (a, b) => (a === b ? a : null)
+  ),
+  makeField(
+    "isComplex",
+    t => (t.isComplex ? "complex" : "real"),
+    (a, b) => a || b
+  ),
+  // rows/cols emit the empty fragment — their pretty-printed form
+  // ("RxC") is rendered by typeToString itself in the framing prefix
+  // because it reads both fields together.
+  makeField("rows", () => "", joinDim),
+  makeField("cols", () => "", joinDim),
+  makeField(
+    "sign",
+    t => (t.sign === "unknown" ? "" : `sign=${t.sign}`),
+    joinSign
+  ),
+];
+
 /**
  * Compute the least upper bound of two types (used at control-flow joins
  * and at re-assignment). Returns `Unknown` if the types can't share a
@@ -310,15 +388,16 @@ function joinDim(a: DimInfo, b: DimInfo): DimInfo {
 export function unify(a: MType, b: MType): MType {
   if (a.kind === "Unknown" || b.kind === "Unknown") return { kind: "Unknown" };
   if (a.kind === "Void" || b.kind === "Void") return { kind: "Unknown" };
-  if (a.elem !== b.elem) return { kind: "Unknown" };
-  return {
-    kind: "Tensor",
-    elem: a.elem,
-    isComplex: a.isComplex || b.isComplex,
-    rows: joinDim(a.rows, b.rows),
-    cols: joinDim(a.cols, b.cols),
-    sign: joinSign(a.sign, b.sign),
-  };
+  // Walk the field template, building a fresh TensorType in the
+  // canonical field order (kind, then TENSOR_FIELDS in array order).
+  // Insertion order matters because canonicalizeType normalizes by
+  // re-iterating the same template, but keeping it consistent here
+  // keeps debug-prints stable too.
+  const out: Record<string, unknown> = { kind: "Tensor" };
+  for (const f of TENSOR_FIELDS) {
+    if (!f.joinInto(a, b, out)) return { kind: "Unknown" };
+  }
+  return out as unknown as TensorType;
 }
 
 export type ArithKind = "Add" | "Sub" | "Mul" | "Div";
@@ -416,20 +495,19 @@ export const arithResultScalar = arithResult;
  * Canonical (deterministic) representation of an MType. Used by the
  * lowerer to hash a function's argument type tuple into a stable suffix:
  * two calls with identical type tuples produce the same hash, and so
- * land on the same specialization. Field order is explicit so the
- * serialization doesn't depend on the order TS happened to insert keys.
+ * land on the same specialization. Iterates `TENSOR_FIELDS` so the
+ * serialization doesn't depend on the order TS happened to insert keys
+ * (and so a new field shows up in the hash automatically by being
+ * appended to the template above).
  */
 export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Unknown") return { kind: "Unknown" };
   if (t.kind === "Void") return { kind: "Void" };
-  return {
-    kind: "Tensor",
-    elem: t.elem,
-    isComplex: t.isComplex,
-    rows: t.rows,
-    cols: t.cols,
-    sign: t.sign,
-  };
+  const out: Record<string, unknown> = { kind: "Tensor" };
+  for (const f of TENSOR_FIELDS) {
+    out[f.name] = f.canonicalize(t);
+  }
+  return out;
 }
 
 function dimToString(d: DimInfo): string {
@@ -441,9 +519,13 @@ function dimToString(d: DimInfo): string {
 export function typeToString(t: MType): string {
   if (t.kind === "Unknown") return "Unknown";
   if (t.kind === "Void") return "Void";
-  const cstr = t.isComplex ? ", complex" : ", real";
-  const signStr = t.sign === "unknown" ? "" : `, sign=${t.sign}`;
   const cat = shapeCategory(t);
+  // Dims are rendered into the framing prefix — they're a paired
+  // rows+cols read, which doesn't fit the per-field iteration model.
+  // The corresponding TENSOR_FIELDS entries return the empty fragment.
   const dims = `${dimToString(t.rows)}x${dimToString(t.cols)}`;
-  return `Tensor<${cat}(${dims}), ${t.elem}${cstr}${signStr}>`;
+  const fragments = TENSOR_FIELDS
+    .map(f => f.format(t))
+    .filter(s => s !== "");
+  return `Tensor<${cat}(${dims}), ${fragments.join(", ")}>`;
 }

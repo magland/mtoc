@@ -89,6 +89,51 @@ describe("translate scalar example", () => {
       /log requires .* to be statically positive/
     );
   });
+
+  it("rejects shape-changing reassignment at lowering with a span", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3];\nv = [1 2 3 4];\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/fixed shape|dynamic|shape/i);
+  });
+
+  it("rejects a tensor literal embedded inside a binary expression", () => {
+    let err: unknown;
+    try {
+      translate("a = [1 2 3];\nb = a + [4 5 6];\n");
+    } catch (e) {
+      err = e;
+    }
+    // Either passes (Binary tensor + tensor lowered to elementwise; we
+    // reject TensorLit nested inside Binary at lowering). Confirm the
+    // error has a span and the right name.
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/tensor literal/i);
+  });
+
+  it("rejects disp of a non-Var tensor expression at lowering", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3];\ndisp(v + 1);\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/disp/i);
+  });
 });
 
 describe("CLI translate + run", () => {
