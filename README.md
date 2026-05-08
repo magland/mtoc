@@ -1,39 +1,60 @@
 # mtoc
 
-Static MATLAB-to-C translator. Operates on a strict subset of MATLAB-style code: parses, infers types, generates a self-contained C source file.
+Static numbl-to-C translator. Reads a `.m` numbl source file, infers types, and
+emits a self-contained C source file. Companion to [numbl] (the runtime
+interpreter / JIT for the same dialect); mtoc targets a strict subset that can
+be reasoned about statically.
 
-## Usage
+[numbl]: ../numbl
+
+## Quickstart
 
 ```bash
-npx tsx src/cli.ts translate input.m output.c
-npx tsx src/cli.ts run input.m
+npx tsx src/cli.ts translate input.m output.c   # write the .c
+npx tsx src/cli.ts run       input.m            # translate + compile + run
 ```
 
-`run` translates to a temporary directory, compiles with `cc` (override via the `CC` env var), and runs the resulting binary.
+`run` translates to a temporary directory, compiles with `cc` (override via the
+`CC` env var), and runs the resulting binary, streaming stdout/stderr through.
 
-## Status
+## What works today
 
-Early scaffold. Today only a tiny scalar subset works:
+The subset is growing iteratively. Roughly:
 
-```matlab
-% examples/example1.m
-x = 3;
-y = 4.5;
-z = x + y * 2;
-disp(z);
-```
+- Scalars: arithmetic, comparisons, logicals, unary `+ - !`
+- Constants: `pi`, `eps`, `Inf`, `NaN`, `realmax`, `realmin`, `true`, `false`
+- Control flow: `if` / `elseif` / `else`, `while`, `for k = a:b` (and `a:s:b`),
+  `break`, `continue`, `return`
+- Math builtins: `sqrt`, `abs`, `exp`, `log`, `sin`, `cos`, `tan`, `floor`,
+  `round`, `mod`, `rem`, `min`, `max`, `atan2`, `hypot`, `power`, `sign`, …
+- User-defined scalar functions (single output), with one specialization per
+  unique call-site argument-type tuple
+- Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
+  arithmetic on them, `sum`, `length`, `numel`
 
-emits
+Anything outside the supported subset raises `UnsupportedConstruct` with a
+source span pointing to the offending line.
 
-```c
-#include <stdio.h>
-int main(void) {
-  double x = 3.0;
-  double y = 4.5;
-  double z = x + y * 2.0;
-  printf("%g\n", z);
-  return 0;
-}
-```
+For a developer-oriented map of the codebase — pipeline, type system,
+runtime, extension recipes — see [`docs/`](docs/).
 
-Anything outside this subset (tensors, control flow, user-defined functions, complex numbers, strings, classes, …) currently raises an `UnsupportedConstruct` error. Each addition is a separate iteration.
+## Tests
+
+Two tracks:
+
+- **Cross-runner**: every `.m` under `test_scripts/` is run through both numbl
+  and mtoc, and stdouts are compared byte-for-byte. The parallel runner
+  (`scripts/run_test_scripts.ts`) finishes the corpus in a few seconds.
+
+  ```bash
+  npx tsx scripts/run_test_scripts.ts                 # all scripts
+  npx tsx scripts/run_test_scripts.ts foo.m bar.m     # specific files
+  MTOC_TEST_CONCURRENCY=4 npx tsx scripts/run_test_scripts.ts
+  ```
+
+- **Unit tests** (`vitest`): assertions about emitted C, error attribution,
+  type-system invariants. Run with `npx vitest run`.
+
+When adding a feature, drop a `.m` file into the appropriate
+`test_scripts/<category>/` subdirectory (the runner picks it up automatically)
+and add focused vitest assertions for any new error paths or codegen shapes.
