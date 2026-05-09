@@ -23,9 +23,11 @@ import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
   cTypeFor,
   isCharScalar,
+  isColVec,
   isMultiElement,
   isNumeric,
   isOwned,
+  isRowVec,
   isScalarComplex,
   isScalarReal,
   typeToString,
@@ -149,6 +151,11 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       }
       if (s.rhs.kind === "TensorLit") {
         emitTensorLitAssign(state, level, s.cName, s.rhs);
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
+        break;
+      }
+      if (s.rhs.kind === "IndexSlice") {
+        emitIndexSliceAssign(state, level, s.cName, s.rhs);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
@@ -825,6 +832,144 @@ function emitTensorLitAssign(
       pushStmt(state, level + 1, `}`);
     }
   }
+  pushStmt(state, level + 1, `mtoc_tensor_assign(&${target}, _mtoc_t);`);
+  pushStmt(state, level, `}`);
+}
+
+/** Emit a range/colon-indexed read: `target = base(a:b)`,
+ *  `target = base(a:s:b)`, or `target = base(:)`. The slice
+ *  allocates a fresh result tensor sized by the index range,
+ *  fills it via a counted loop, and consume-replaces the target.
+ *
+ *  The result-shape rules match `lowerIndexSlice`:
+ *    - `Colon`        → column tensor of `base.rows * base.cols`.
+ *    - `Range`, base is row-vec → row tensor of count.
+ *    - `Range`, otherwise       → column tensor of count.
+ *
+ *  For complex bases the result is a complex tensor; the codegen
+ *  copies both `.real` and `.imag` per slot. Char ranges are
+ *  rejected at lowering, so this function only handles double. */
+function emitIndexSliceAssign(
+  state: EmitState,
+  level: number,
+  target: string,
+  rhs: Extract<IRExpr, { kind: "IndexSlice" }>
+): void {
+  const base = rhs.base;
+  const baseTy = base.ty;
+  if (!isNumeric(baseTy) || baseTy.elem !== "double") {
+    throw new Error(
+      `codegen internal: emitIndexSliceAssign called with non-double base ` +
+        `(${typeToString(baseTy)}); should have been rejected at lowering`
+    );
+  }
+  const isComplex = baseTy.isComplex;
+  useRuntimeByName(state, "mtoc_tensor_t");
+  useRuntimeByName(state, "mtoc_tensor_assign");
+  const allocHelper = isComplex
+    ? "mtoc_tensor_alloc_complex"
+    : "mtoc_tensor_alloc";
+  useRuntimeByName(state, allocHelper);
+
+  // Render the source-index expression for iteration k:
+  //   - Colon:  k          (already 0-based; reads base.real[k])
+  //   - Range:  start + step*k - 1   (1-based MATLAB → 0-based C)
+  //
+  // Plus a count-and-shape preamble that depends on the slot kind.
+  // The whole emission is wrapped in `{ … }` so per-slice locals
+  // (`_mtoc_n`, `_mtoc_t`, `_mtoc_k`, `_mtoc_start`, `_mtoc_step`)
+  // are scoped to this statement.
+  pushStmt(state, level, `{`);
+
+  let count: string;
+  let srcIndexFor: (kVar: string) => string;
+  let resultRows: string;
+  let resultCols: string;
+
+  if (rhs.index.kind === "Colon") {
+    pushStmt(
+      state,
+      level + 1,
+      `long _mtoc_n = ${base.cName}.rows * ${base.cName}.cols;`
+    );
+    count = "_mtoc_n";
+    srcIndexFor = k => k;
+    resultRows = "_mtoc_n";
+    resultCols = "1";
+  } else {
+    // Range slot. Step is guaranteed to be a numeric literal by
+    // lowering; render as a `double` expression for the count
+    // formula, then cast inside the per-iteration source-index
+    // expression.
+    if (rhs.index.step.kind !== "NumLit") {
+      throw new Error(
+        "codegen internal: IndexSlice range step must be a NumLit; " +
+          "should have been caught at lowering"
+      );
+    }
+    const startStr = emitExpr(state, rhs.index.start, 0);
+    const endStr = emitExpr(state, rhs.index.end, 0);
+    const stepStr = formatNumLit(rhs.index.step.value);
+    pushStmt(state, level + 1, `double _mtoc_start = ${startStr};`);
+    pushStmt(state, level + 1, `double _mtoc_end = ${endStr};`);
+    pushStmt(
+      state,
+      level + 1,
+      `long _mtoc_n = (long)floor((_mtoc_end - _mtoc_start) / ${stepStr}) + 1;`
+    );
+    pushStmt(state, level + 1, `if (_mtoc_n < 0) _mtoc_n = 0;`);
+    count = "_mtoc_n";
+    srcIndexFor = k => `(long)(_mtoc_start + ${stepStr} * (double)${k}) - 1L`;
+    // Result orientation:
+    //   - row-vec base → row (preserves)
+    //   - col-vec base → col (preserves)
+    //   - matrix base  → row (linear-indexed `a:b` is itself a row,
+    //                     and the index orientation wins for a
+    //                     matrix base; matches numbl).
+    if (isRowVec(baseTy)) {
+      resultRows = "1";
+      resultCols = "_mtoc_n";
+    } else if (isColVec(baseTy)) {
+      resultRows = "_mtoc_n";
+      resultCols = "1";
+    } else {
+      resultRows = "1";
+      resultCols = "_mtoc_n";
+    }
+    // Range arithmetic involves floor() — make sure <math.h> is in.
+    state.needMath.value = true;
+  }
+
+  pushStmt(
+    state,
+    level + 1,
+    `mtoc_tensor_t _mtoc_t = ${allocHelper}(${resultRows}, ${resultCols});`
+  );
+  pushStmt(
+    state,
+    level + 1,
+    `for (long _mtoc_k = 0; _mtoc_k < ${count}; _mtoc_k++) {`
+  );
+  const srcIdx = srcIndexFor("_mtoc_k");
+  if (isComplex) {
+    pushStmt(
+      state,
+      level + 2,
+      `_mtoc_t.real[_mtoc_k] = ${base.cName}.real[${srcIdx}];`
+    );
+    pushStmt(
+      state,
+      level + 2,
+      `_mtoc_t.imag[_mtoc_k] = ${base.cName}.imag[${srcIdx}];`
+    );
+  } else {
+    pushStmt(
+      state,
+      level + 2,
+      `_mtoc_t.real[_mtoc_k] = ${base.cName}.real[${srcIdx}];`
+    );
+  }
+  pushStmt(state, level + 1, `}`);
   pushStmt(state, level + 1, `mtoc_tensor_assign(&${target}, _mtoc_t);`);
   pushStmt(state, level, `}`);
 }

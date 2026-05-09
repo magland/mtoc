@@ -803,17 +803,20 @@ export class Lowerer {
  * - `tensor-lit`: every TensorLit allocates a fresh tensor.
  * - `string-concat`: a string-typed `Binary` (`+`) calls
  *   `mtoc_string_concat`, which returns an owned handle.
+ * - `index-slice`: an `IndexSlice` (range/colon read) allocates a
+ *   fresh tensor sized by the index range.
  *
  * `Var` is never an owned-allocating expression — it just reads an
  * already-owned heap value; the read doesn't transfer ownership.
  * Similarly `StringLit` points at `.rodata` (zero allocation) and
  * is fine anywhere.
  */
-type OwnedExprKind = "tensor-lit" | "string-concat";
+type OwnedExprKind = "tensor-lit" | "string-concat" | "index-slice";
 
 function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
   if (e.kind === "TensorLit") return "tensor-lit";
   if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
+  if (e.kind === "IndexSlice") return "index-slice";
   return null;
 }
 
@@ -829,6 +832,12 @@ function ownedExprMessage(kind: OwnedExprKind): string {
         "string concatenation (`+`) is only supported as the top-level " +
         "right-hand side of an assignment; assign intermediate " +
         "concatenations to a variable first"
+      );
+    case "index-slice":
+      return (
+        "range/colon indexing is only supported as the top-level " +
+        "right-hand side of an assignment; assign the slice to a " +
+        "variable first"
       );
   }
 }
@@ -887,6 +896,16 @@ function validateStmt(s: IRStmt): void {
       const b = s.rhs as Extract<IRExpr, { kind: "Binary" }>;
       rejectNestedOwnedExpr(b.left);
       rejectNestedOwnedExpr(b.right);
+    } else if (top === "index-slice") {
+      // Recurse into the slice's index components — a nested
+      // owned producer in `start` / `step` / `end` would leak. The
+      // base is a Var read (never an owned producer) so it's safe.
+      const slice = s.rhs as Extract<IRExpr, { kind: "IndexSlice" }>;
+      if (slice.index.kind === "Range") {
+        rejectNestedOwnedExpr(slice.index.start);
+        rejectNestedOwnedExpr(slice.index.step);
+        rejectNestedOwnedExpr(slice.index.end);
+      }
     } else {
       rejectNestedOwnedExpr(s.rhs);
       if (isMultiElement(s.rhs.ty)) {

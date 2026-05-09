@@ -128,6 +128,29 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Range / colon read of a multi-element value, producing a
+       *  fresh tensor: `v(a:b)`, `v(a:s:b)`, `v(:)`. Today only one
+       *  index slot is supported (linear indexing into a vector or
+       *  matrix); 2D mixed scalar/range indices arrive in a later
+       *  commit.
+       *
+       *  Result-shape rules (matching numbl):
+       *    - `Range` slot, base is row-vec  → row-vec (preserves)
+       *    - `Range` slot, base is col-vec  → col-vec (preserves)
+       *    - `Range` slot, base is matrix   → col-vec (linearized)
+       *    - `Colon` slot                    → col-vec (always
+       *                                        linearizes to column)
+       *
+       *  Like `TensorLit`, an `IndexSlice` is an owned-allocating
+       *  producer — it can only appear at the top level of
+       *  `Assign.rhs`. Nested uses are rejected by `validateIR`. */
+      kind: "IndexSlice";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      index: IndexSliceArg;
+      ty: MType;
+      span: Span;
+    }
+  | {
       /** Reference to the `end` keyword inside an index expression.
        *  Resolved at lowering time to the relevant axis size of the
        *  enclosing index's base. The result is a nonneg long-valued
@@ -160,6 +183,20 @@ export type IRExpr =
 export type CallTarget =
   | { kind: "builtin"; sig: BuiltinSig }
   | { kind: "userFunc"; mangled: string };
+
+/** One slot of an `IndexSlice` index. `Range` carries the lowered
+ *  start / step / end IRExprs (`step` is always populated — the
+ *  lowerer fills in a literal `1` when the source was `a:b`).
+ *  `Colon` has no sub-expressions; it represents the bare `:`. */
+export type IndexSliceArg =
+  | {
+      kind: "Range";
+      start: IRExpr;
+      step: IRExpr;
+      end: IRExpr;
+      span: Span;
+    }
+  | { kind: "Colon"; span: Span };
 
 export type IRStmt =
   | {

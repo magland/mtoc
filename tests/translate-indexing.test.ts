@@ -168,3 +168,130 @@ describe("indexing — scalar reads", () => {
     expect(c).not.toMatch(/pick__[0-9a-f]+\(2\.0\)/);
   });
 });
+
+describe("indexing — range and colon reads", () => {
+  it("emits an alloc + counted loop for v(a:b)", () => {
+    const c = translate("v = [10 20 30 40];\nw = v(2:3);\ndisp(w);\n");
+    // Allocation sized by the iteration-count formula; row-vec base
+    // → row result (1 × _mtoc_n).
+    expect(c).toContain(
+      "mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc(1, _mtoc_n)"
+    );
+    // The loop body reads from the base.
+    expect(c).toMatch(
+      /_mtoc_t\.real\[_mtoc_k\] = v\.real\[\(long\)\(_mtoc_start \+ 1\.0 \* \(double\)_mtoc_k\) - 1L\]/
+    );
+    // Final consume-replace into the LHS variable.
+    expect(c).toContain("mtoc_tensor_assign(&w, _mtoc_t);");
+  });
+
+  it("v(:) emits a column-allocating linearization", () => {
+    const c = translate("v = [10 20 30];\nw = v(:);\ndisp(w);\n");
+    // Colon: count = base.rows * base.cols, result is column.
+    expect(c).toContain("long _mtoc_n = v.rows * v.cols;");
+    expect(c).toContain(
+      "mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc(_mtoc_n, 1)"
+    );
+    // Per-iteration read uses k directly (no MATLAB→C conversion).
+    expect(c).toMatch(/_mtoc_t\.real\[_mtoc_k\] = v\.real\[_mtoc_k\];/);
+  });
+
+  it("preserves column orientation for c(2:3) on a column base", () => {
+    const c = translate("c = [10; 20; 30; 40];\nw = c(2:3);\ndisp(w);\n");
+    expect(c).toContain(
+      "mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc(_mtoc_n, 1)"
+    );
+  });
+
+  it("uses the index orientation (row) for a matrix range slice", () => {
+    const c = translate("M = [1 2; 3 4];\nw = M(2:3);\ndisp(w);\n");
+    // Matrix base under linear range → row result, matching numbl.
+    expect(c).toContain(
+      "mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc(1, _mtoc_n)"
+    );
+  });
+
+  it("end inside a 1-slot range resolves to numel via rows*cols", () => {
+    const c = translate("v = [1 2 3 4 5];\nw = v(2:end);\ndisp(w);\n");
+    // The range's end is `end` → renders as `(v.rows * v.cols)`.
+    expect(c).toContain("double _mtoc_end = (v.rows * v.cols);");
+  });
+
+  it("emits both real and imag fills for a complex range slice", () => {
+    const c = translate("z = [1+2i, 3+4i, 5+6i];\nw = z(1:2);\ndisp(w);\n");
+    expect(c).toContain("mtoc_tensor_alloc_complex(1, _mtoc_n)");
+    expect(c).toMatch(/_mtoc_t\.real\[_mtoc_k\] = z\.real\[/);
+    expect(c).toMatch(/_mtoc_t\.imag\[_mtoc_k\] = z\.imag\[/);
+  });
+
+  it("rejects a range slice nested inside a larger expression", () => {
+    // Indexing produces a fresh tensor — only legal at the top of
+    // Assign.rhs. The lowering-pass validator catches a nested use.
+    let err: unknown;
+    try {
+      translate("v = [1 2 3];\nw = v(1:2) + v(2:3);\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/range\/colon/i);
+  });
+
+  it("rejects a range slice as a disp arg with a clear message", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3];\ndisp(v(1:2));\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+  });
+
+  it("rejects a non-literal step", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3 4];\ns = 2;\nw = v(1:s:4);\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/numeric literal/i);
+  });
+
+  it("rejects char-tensor range indexing (deferred)", () => {
+    let err: unknown;
+    try {
+      translate("s = 'abcdef';\nw = s(2:4);\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/char tensor/i);
+  });
+
+  it("rejects multi-slot range indexing (deferred)", () => {
+    let err: unknown;
+    try {
+      translate("M = [1 2; 3 4];\nw = M(:, 1);\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/multi-slot/i);
+  });
+});

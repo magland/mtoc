@@ -160,6 +160,16 @@ export function emitExpr(
           "rejected at lowering"
       );
 
+    case "IndexSlice":
+      // Range/colon indexing produces a fresh tensor — same legal
+      // position as TensorLit (top of Assign.rhs). The dedicated
+      // emitter `emitIndexSliceAssign` handles it; arriving here is
+      // a lowerer escape.
+      throw new Error(
+        "codegen internal: IndexSlice reached emitExpr; should have been " +
+          "rejected at lowering"
+      );
+
     case "Call": {
       // User-function calls render as `mangled(args)`. Builtins delegate
       // to the registry's `emit` closure, which renders the C call and

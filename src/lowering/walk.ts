@@ -63,6 +63,16 @@ export function forEachSubExpr(
       forEachSubExpr(e.base, visit);
       for (const idx of e.indices) forEachSubExpr(idx, visit);
       return;
+    case "IndexSlice":
+      // Visit the base Var first, then any sub-expressions inside
+      // the index slot. `Colon` has no sub-exprs — it's a leaf.
+      forEachSubExpr(e.base, visit);
+      if (e.index.kind === "Range") {
+        forEachSubExpr(e.index.start, visit);
+        forEachSubExpr(e.index.step, visit);
+        forEachSubExpr(e.index.end, visit);
+      }
+      return;
   }
 }
 

@@ -88,12 +88,18 @@ The subset is growing iteratively. Roughly:
   copy-on-arg-pass — the body can reassign them freely
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
-- Scalar index reads on any multi-element tensor (real / complex /
-  char): `v(i)`, `M(i, j)`, `v(end)`, `M(end, end)`. The `end`
-  keyword resolves to the relevant axis size at the index site
-  (numel for one-index, rows / cols for two-index). Range / colon
-  indices (`v(2:5)`, `M(:, j)`) and indexed writes (`v(i) = x`) are
-  still deferred.
+- Index reads:
+  - **Scalar** on any multi-element tensor (real / complex / char):
+    `v(i)`, `M(i, j)`, `v(end)`, `M(end, end)`. The `end` keyword
+    resolves to the relevant axis size at the index site (numel for
+    one-index, rows / cols for two-index).
+  - **Range / colon** on a real-or-complex double tensor (single
+    slot): `v(a:b)`, `v(a:s:b)`, `v(2:end)`, `v(:)`, `M(:)`,
+    `M(2:5)`. `Range` preserves orientation for vectors and produces
+    a row for matrix linear indexing; `Colon` always linearizes to a
+    column. The step must be a numeric literal.
+  - Multi-slot range/colon (`M(:, j)`, `M(a:b, c:d)`), char-tensor
+    range reads, and indexed writes (`v(i) = x`) are still deferred.
 - Complex numbers (scalar and tensor): literals (`1i`, `2.5i`,
   `3+4i`, `[1+2i, 3+4i]`), unary `+`/`-`, arithmetic (`+ - * /`),
   comparisons + logicals (numbl semantics: ordering on real part,
