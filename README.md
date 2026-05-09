@@ -16,6 +16,36 @@ npx tsx src/cli.ts translate input.m --no-runtime  # skip runtime helpers
 npx tsx src/cli.ts run       input.m            # translate + compile + run
 ```
 
+### Web IDE
+
+A browser-based IDE for editing numbl projects with live C-output preview:
+
+```bash
+npm install
+npm run dev                # start the Vite dev server
+npm run build && npm run preview   # production build smoke test
+```
+
+Editor on the left, generated C on the right (read-only Monaco), console
+output below the editor. Projects and files persist to IndexedDB; share links
+pack a whole project into the URL hash (pako-deflated, base64url).
+
+To actually run the generated C, the IDE talks to a small local server (the
+browser can't shell out to `cc`). Start it from a second terminal:
+
+```bash
+npm run serve -- --passkey <key>          # passkey shown in the IDE's settings dialog
+# or directly:
+npx tsx src/cli.ts serve --passkey <key> [--port 3002] [--host 127.0.0.1]
+```
+
+The IDE's Run button POSTs the project's `.m` source files (not the C) to
+`POST /run`; the server runs the same translator the IDE uses, compiles the
+result with `cc` (override via `CC`), runs the binary, and streams
+stdout/stderr back as Server-Sent Events. Default bind is `127.0.0.1`.
+Sending source rather than C means only mtoc-generated C ever reaches the
+compiler. See [`docs/web.md`](docs/web.md) for protocol and architecture.
+
 `run` translates to a temporary directory, compiles with `cc` (override via the
 `CC` env var), and runs the resulting binary, streaming stdout/stderr through.
 

@@ -8,13 +8,9 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
-import { parseMFile } from "./parser/index.js";
-import { Workspace } from "./workspace/workspace.js";
-import { lower } from "./lowering/lower.js";
-import { emitC } from "./codegen/emit.js";
-import { UnsupportedConstruct, TypeError } from "./lowering/errors.js";
-import { SyntaxError as ParseSyntaxError } from "./parser/errors.js";
+import { translateProject, type TranslateError } from "./translate.js";
 import { offsetToLine } from "./parser/sourceLoc.js";
+import { startServer } from "../server/execution-service.js";
 
 function usage(): never {
   process.stderr.write(
@@ -22,6 +18,7 @@ function usage(): never {
       "Usage:",
       "  mtoc translate <input.m> [output.c] [--no-runtime]",
       "  mtoc run <input.m>",
+      "  mtoc serve --passkey <key> [--port N] [--host HOST]",
       "",
       "Options:",
       "  --no-runtime    Skip the runtime-helper bodies (mtoc_format_double,",
@@ -31,25 +28,14 @@ function usage(): never {
       "",
       "When <output.c> is omitted, the translated C is written to stdout.",
       "",
+      "`serve` starts a local HTTP server that compiles and runs C source",
+      "submitted by the web IDE. Requires a passkey (the IDE's settings",
+      "dialog generates one and shows you the command to paste). Default",
+      "port is 3002 and the server binds to 127.0.0.1 by default.",
+      "",
     ].join("\n")
   );
   process.exit(2);
-}
-
-interface CompileOptions {
-  includeRuntime: boolean;
-}
-
-function compileMtoCSource(
-  source: string,
-  inputName: string,
-  opts: CompileOptions
-): string {
-  const ast = parseMFile(source, inputName);
-  const workspace = new Workspace(inputName);
-  workspace.addFile({ name: inputName, source, ast });
-  const ir = lower(ast, workspace);
-  return emitC(ir, { includeRuntime: opts.includeRuntime });
 }
 
 interface ParsedArgs {
@@ -73,17 +59,34 @@ function parseArgs(args: string[]): ParsedArgs {
   return { positional, noRuntime };
 }
 
-function reportError(e: unknown, inputPath: string, source: string): never {
-  if (e instanceof UnsupportedConstruct || e instanceof TypeError) {
-    const where = e.span ? `:${offsetToLine(source, e.span.start)}` : "";
-    process.stderr.write(`${inputPath}${where}: ${e.name}: ${e.message}\n`);
+function reportError(
+  err: TranslateError,
+  inputPath: string,
+  source: string
+): never {
+  if (err.kind === "SyntaxError") {
+    process.stderr.write(`${inputPath}: SyntaxError: ${err.message}\n`);
     process.exit(1);
   }
-  if (e instanceof ParseSyntaxError) {
-    process.stderr.write(`${inputPath}: SyntaxError: ${e.message}\n`);
-    process.exit(1);
-  }
-  throw e;
+  const where =
+    err.startOffset !== undefined
+      ? `:${offsetToLine(source, err.startOffset)}`
+      : "";
+  process.stderr.write(`${inputPath}${where}: ${err.kind}: ${err.message}\n`);
+  process.exit(1);
+}
+
+function compile(
+  source: string,
+  inputName: string,
+  includeRuntime: boolean,
+  inputPath: string
+): string {
+  const result = translateProject([{ name: inputName, source }], inputName, {
+    includeRuntime,
+  });
+  if (result.error) reportError(result.error, inputPath, source);
+  return result.c!;
 }
 
 function cmdTranslate(args: string[]): void {
@@ -91,14 +94,7 @@ function cmdTranslate(args: string[]): void {
   if (positional.length < 1 || positional.length > 2) usage();
   const [inputPath, outputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
-  let cSource: string;
-  try {
-    cSource = compileMtoCSource(source, basename(inputPath), {
-      includeRuntime: !noRuntime,
-    });
-  } catch (e) {
-    reportError(e, inputPath, source);
-  }
+  const cSource = compile(source, basename(inputPath), !noRuntime, inputPath);
   if (outputPath === undefined) {
     process.stdout.write(cSource);
     return;
@@ -119,14 +115,7 @@ function cmdRun(args: string[]): void {
   }
   const [inputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
-  let cSource: string;
-  try {
-    cSource = compileMtoCSource(source, basename(inputPath), {
-      includeRuntime: true,
-    });
-  } catch (e) {
-    reportError(e, inputPath, source);
-  }
+  const cSource = compile(source, basename(inputPath), true, inputPath);
 
   const dir = mkdtempSync(join(tmpdir(), "mtoc-"));
   const cFile = join(dir, "out.c");
@@ -151,6 +140,36 @@ function cmdRun(args: string[]): void {
   }
 }
 
+function cmdServe(args: string[]): void {
+  let passkey: string | undefined;
+  let port = parseInt(process.env.MTOC_SERVE_PORT || "") || 3002;
+  let host = process.env.MTOC_SERVE_HOST || "127.0.0.1";
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--passkey") {
+      passkey = args[++i];
+    } else if (a === "--port") {
+      port = parseInt(args[++i], 10);
+      if (!Number.isFinite(port)) {
+        process.stderr.write("mtoc: --port must be a number\n");
+        process.exit(2);
+      }
+    } else if (a === "--host") {
+      host = args[++i];
+    } else {
+      process.stderr.write(`mtoc: unknown serve option '${a}'\n`);
+      usage();
+    }
+  }
+  if (!passkey) {
+    process.stderr.write(
+      "mtoc: --passkey is required. The web IDE's execution-settings dialog generates one and shows you the full command to copy.\n"
+    );
+    process.exit(2);
+  }
+  startServer({ port, host, passkey });
+}
+
 function main(): void {
   const argv = process.argv.slice(2);
   if (argv.length === 0) usage();
@@ -160,6 +179,8 @@ function main(): void {
       return cmdTranslate(rest);
     case "run":
       return cmdRun(rest);
+    case "serve":
+      return cmdServe(rest);
     case "-h":
     case "--help":
       return usage();

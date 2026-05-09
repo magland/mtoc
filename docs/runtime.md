@@ -6,6 +6,12 @@ output on demand. The TypeScript loader (`src/codegen/runtime.ts`) parses
 each file, separates `#include` directives from the body, and resolves a
 dependency graph so emitted output stays well-ordered.
 
+The `.h` bodies are inlined into `src/codegen/runtime/snippets.gen.ts` by
+`scripts/build_runtime_snippets.ts` and read from there at module load —
+this keeps the translator browser-bundlable (no `fs.readFileSync` at import
+time). Re-run `npm run build:snippets` after editing or adding any `.h` file;
+CI runs `npm run build:snippets:check` to catch drift.
+
 ## Why .h files
 
 - Edit with normal C tooling — clangd / syntax highlighting / formatters.

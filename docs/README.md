@@ -23,6 +23,8 @@ _concepts and roles_ so they stay accurate as files move around.
 - [limitations.md](limitations.md) — known sharp edges and the rationale for
   current restrictions (kept here so users / agents don't waste cycles
   rediscovering them).
+- [web.md](web.md) — the web IDE: routes, layout, persistence, sharing, and
+  the build-time snippet inlining that lets the translator run in a browser.
 
 ## Project conventions
 

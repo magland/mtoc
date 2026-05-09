@@ -141,9 +141,19 @@ deduplicates them, and resolves a small dependency graph
 (`mtoc_disp_tensor` depends on `mtoc_format_double` and `mtoc_tensor_t`, etc.).
 Helpers are activated on-demand; only what's used appears in the output.
 
+### Top-level entry (`src/translate.ts`)
+
+`translateProject(files, activeName, opts?)` is the single composed entry
+point used by both the CLI and the web IDE. It accepts a multi-file project
+(though only the active file is lowered today; cross-file resolution isn't
+wired) and returns `{c} | {error}` — never throws on user-program errors.
+Errors from all three stages (`SyntaxError`, `UnsupportedConstruct`,
+`TypeError`) are normalized into one `TranslateError` shape with optional
+`{startOffset, endOffset, fileName}` for editor-marker placement.
+
 ### CLI (`src/cli.ts`)
 
-Two subcommands:
+A thin shell over `translateProject`. Two subcommands:
 
 - `translate <in.m> <out.c>` — write the C file.
 - `run <in.m>` — translate to a temp directory, invoke `cc` (or `$CC`), exec

@@ -5,8 +5,6 @@
  * site gets the most-precise return type.
  */
 
-import { createHash } from "node:crypto";
-
 import type { Expr, Span } from "../parser/index.js";
 import { offsetToLine } from "../parser/sourceLoc.js";
 import {
@@ -306,8 +304,24 @@ export function lowerUserCall(
  */
 function mangleSpecName(matlabName: string, argTypes: MType[]): string {
   const canonical = JSON.stringify(argTypes.map(canonicalizeType));
-  const hash = createHash("sha256").update(canonical).digest("hex").slice(0, 8);
-  return `${matlabName}__${hash}`;
+  return `${matlabName}__${fnv1a32Hex(canonical)}`;
+}
+
+/** FNV-1a 32-bit hash of a UTF-16 string, returned as zero-padded 8-hex.
+ *  Browser-safe replacement for the previous SHA-256-truncated-to-8-hex
+ *  scheme; identical entropy (32 bits) and identical mangle width. */
+function fnv1a32Hex(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i) & 0xff;
+    h = Math.imul(h, 0x01000193);
+    const upper = s.charCodeAt(i) >>> 8;
+    if (upper) {
+      h ^= upper;
+      h = Math.imul(h, 0x01000193);
+    }
+  }
+  return (h >>> 0).toString(16).padStart(8, "0");
 }
 
 /** Lower a function body for a specific argument-type signature.

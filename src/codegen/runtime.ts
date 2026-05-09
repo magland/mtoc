@@ -3,22 +3,18 @@
  * source on demand.
  *
  * Each helper lives in its own .h file under `runtime/` so it can be
- * edited with normal C tooling (clangd, syntax highlighting). At module
- * load we read the file, parse out its `#include <...>` and `#include
- * "..."` lines, and split body from headers. emit.ts then merges every
- * helper's headers into one deduplicated set at the top of the output.
+ * edited with normal C tooling (clangd, syntax highlighting). The .h
+ * sources are inlined into `runtime/snippets.gen.ts` by
+ * `scripts/build_runtime_snippets.ts`; this module reads them from there
+ * (rather than the filesystem at load time) so the translator can be
+ * bundled into a browser build.
  *
  * Each helper is referenced by a stable name (e.g. "mtoc_disp_double")
  * so emit.ts can dedupe and order them. Snippets can declare other
  * snippets they depend on; the activator pulls dependencies in first.
  */
 
-import { readFileSync } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
-
-const HERE = dirname(fileURLToPath(import.meta.url));
-const RUNTIME_DIR = join(HERE, "runtime");
+import { SNIPPETS } from "./runtime/snippets.gen.js";
 
 export interface RuntimeSnippet {
   /** Standard-library headers parsed out of the source file. */
@@ -35,7 +31,13 @@ function loadSnippet(
   filename: string,
   deps: ReadonlyArray<string> = []
 ): RuntimeSnippet {
-  const raw = readFileSync(join(RUNTIME_DIR, filename), "utf8");
+  const raw = SNIPPETS[filename];
+  if (raw === undefined) {
+    throw new Error(
+      `runtime snippet '${filename}' not found in snippets.gen.ts; ` +
+        `re-run 'npm run build:snippets' after adding the .h file`
+    );
+  }
   const headers: string[] = [];
   const bodyLines: string[] = [];
   for (const line of raw.split(/\r?\n/)) {
