@@ -11,7 +11,7 @@
  */
 
 import type { Expr, BinaryOperation as BinOp } from "../parser/index.js";
-import { UnsupportedConstruct } from "./errors.js";
+import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
   arithResult,
@@ -19,8 +19,10 @@ import {
   isScalarComplex,
   isScalarReal,
   isNumeric,
+  isString,
   scalarComplex,
   scalarDouble,
+  STRING,
   type MType,
   typeToString,
 } from "./types.js";
@@ -104,6 +106,37 @@ export function lowerBinary(
       kind: "ImagLit",
       value: left.value,
       ty: scalarComplex(),
+      span: e.span,
+    };
+  }
+  // String concatenation: `+` on two strings is the only string-typed
+  // binary op mtoc supports today. numbl also coerces string + number
+  // / string + bool / etc., but mtoc requires both operands to be
+  // strings to keep the codegen path concretely typed; mismatches
+  // surface as a `TypeError` so the user can wrap the other side
+  // explicitly (today: just use a string variable). Any non-Add op on
+  // a string operand is rejected.
+  if (isString(left.ty) || isString(right.ty)) {
+    if (e.op !== "Add") {
+      throw new UnsupportedConstruct(
+        `binary ${e.op} on string operands is not supported ` +
+          `(only \`+\` is defined; numbl uses it for concatenation)`,
+        e.span
+      );
+    }
+    if (!isString(left.ty) || !isString(right.ty)) {
+      throw new TypeError(
+        `binary + requires both operands to be strings ` +
+          `(got ${typeToString(left.ty)} and ${typeToString(right.ty)})`,
+        e.span
+      );
+    }
+    return {
+      kind: "Binary",
+      op: e.op,
+      left,
+      right,
+      ty: STRING,
       span: e.span,
     };
   }

@@ -66,10 +66,12 @@ several entries share a non-trivial closure shape.
 
 - **`expr` builtins** lower to `IRExpr.Call` and end up in the value position
   of an expression. The vast majority.
-- **`stmt` builtins** are accepted at statement position only. Today only
-  `disp` is in this group. Lowering routes `ExprStmt(disp(x))` into
-  `IRStmt.Disp` directly; the registry entry exists so `Workspace.resolve`
-  has a single lookup path.
+- **`stmt` builtins** are accepted at statement position only. Today
+  `disp` and `error` are in this group. Lowering routes
+  `ExprStmt(disp(x))` into `IRStmt.Disp` and `ExprStmt(error(s))` into
+  `IRStmt.Error` directly; the registry entries exist so
+  `Workspace.resolve` has a single lookup path and value-position uses
+  reject with a clear message.
 
 ## Codegen interaction
 
@@ -100,6 +102,22 @@ The common path:
 
 That's it — the registry is the single source of truth for builtin behavior.
 The lowerer and codegen consume it generically.
+
+## String-aware builtins
+
+`disp(s)` accepts a string `Var` or `StringLit` directly and routes
+into `IRStmt.Disp`; codegen picks `mtoc_disp_string` based on the
+arg's `MType`. `error("...")` is the parallel `IRStmt.Error`.
+
+`length(s)` and `numel(s)` are special-cased in `lowerFuncCall`: when
+the argument is a string, both fold to a `NumLit(1)` at lowering
+(numbl semantics for the scalar string handle). Tensor / numeric
+arguments still flow through the regular `reduceTensor` / `reduceVector`
+factory entries.
+
+String concat (`+` on two strings) is handled in the binary lowering
+path, not as a builtin; it produces a `Binary(Add, …)` IR node typed
+as `STRING` and codegen emits `mtoc_string_concat(...)`.
 
 ## Caveats
 

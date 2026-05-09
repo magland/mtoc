@@ -87,6 +87,7 @@ export function collectTensorVarsInExpr(e: IRExpr, out: Set<string>): void {
       return;
     case "NumLit":
     case "ImagLit":
+    case "StringLit":
       return;
   }
 }
@@ -106,6 +107,9 @@ export function topLevelTensorUses(s: IRStmt): Set<string> {
       collectTensorVarsInExpr(s.expr, out);
       return out;
     case "Disp":
+      collectTensorVarsInExpr(s.arg, out);
+      return out;
+    case "Error":
       collectTensorVarsInExpr(s.arg, out);
       return out;
     case "If":
@@ -174,7 +178,8 @@ function touchStmt(
   switch (s.kind) {
     case "Assign":
     case "ExprStmt":
-    case "Disp": {
+    case "Disp":
+    case "Error": {
       const out = new Set(futureAfter);
       unionInto(out, topLevelTensorUses(s));
       unionInto(out, topLevelTensorDefs(s));

@@ -218,6 +218,80 @@ registered as the `mtoc_check_shape` snippet, and depends on
 Scalars do **not** use the struct. Real scalars are bare `double`; complex
 scalars are `double _Complex` (C99).
 
+## String representation
+
+Strings (numbl `string`, scalar only) have their own small struct, separate
+from the tensor representation:
+
+```
+typedef struct {
+  const char *data;
+  long len;
+  int owned;
+} mtoc_string_t;
+```
+
+- `data` — pointer to the byte sequence. NULL on an empty handle
+  (`mtoc_string_empty()`).
+- `len` — length in **bytes**, not code points. Encoding is UTF-8 by
+  convention; the runtime never inspects code points.
+- `owned` — `1` iff `data` was malloc'd by an mtoc helper and must be
+  freed on disposal. `0` for handles pointing at a C string literal in
+  `.rodata` (the common case for `mtoc_string_from_literal`); freeing
+  those is undefined behavior, so the free helper checks the flag.
+
+The owned-flag design keeps literals zero-allocation while concat
+results are heap-allocated, and gives every code path a single uniform
+free / assign API regardless of where the buffer came from.
+
+### String lifecycle helpers
+
+Every string variable predeclares to `mtoc_string_empty()` and goes
+through the same lifecycle pair as tensors:
+
+- `mtoc_string_empty()` — `{NULL, 0, 0}`. Predeclaration default.
+- `mtoc_string_from_literal(src, len)` — non-owning handle pointing
+  straight at a C string literal (`owned=0`, no allocation). Codegen
+  emits this for every `StringLit` IR node.
+- `mtoc_string_copy(s)` — deep-copy into a fresh heap buffer (`owned=1`).
+  Used at the `c = a;` assignment path so the source remains usable.
+- `mtoc_string_concat(a, b)` — concat into a fresh heap buffer
+  (`owned=1`). Reads both inputs as views; their owned flags are
+  irrelevant here. Backs the `+` operator on string operands.
+- `mtoc_string_free(&s)` — releases the backing buffer iff `owned`,
+  then resets the struct to the empty shape. Idempotent on a zeroed
+  struct, so the scope-exit safety net is sound across branch merges.
+- `mtoc_string_assign(&lhs, rhs)` — consume-and-replace. Frees `*lhs`
+  (no-op if not owned), moves `rhs` into place. Codegen emits this on
+  every string `Assign`.
+- `mtoc_disp_string(s)` — prints the bytes through `stdout` followed
+  by a newline. Empty handles print just the newline.
+- `mtoc_error_string(s)` — backs the statement-only `error("...")`
+  builtin. Writes the message to stderr, then `exit(1)`.
+
+Strings have no early-free liveness pass today — they just sit in the
+scope-exit free walk. `mtoc_string_free` is idempotent, and the owned
+flag means literal handles cost nothing to "free", so the conservative
+release is correct and cheap.
+
+### String memory model
+
+- **Literals don't allocate.** A `StringLit` lowers to a non-owning
+  handle pointing at the C string constant in `.rodata`.
+- **Every manipulation that needs a fresh buffer takes ownership.**
+  `mtoc_string_copy` and `mtoc_string_concat` are the only producers of
+  owned buffers; both return a struct the caller must hand to
+  `mtoc_string_assign` or `mtoc_string_free`.
+- **String concat is allowed only at the top of `Assign.rhs`.** A
+  nested string `Binary` (e.g. `(a + b) + c`) would leak the inner
+  owned buffer because nothing installs it. The lowering-pass
+  validator rejects with a span; the workaround is to assign each
+  intermediate to a name first.
+- **Encoding is UTF-8 by convention.** The runtime treats `data` as
+  opaque bytes. `length(s)` always returns `1` (numbl semantics for
+  scalar string), so byte-vs-code-point ambiguity never surfaces in
+  computed lengths.
+
 ## Adding a helper
 
 1. Create `src/codegen/runtime/foo.h` with the standard shape:

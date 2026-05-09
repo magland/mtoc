@@ -21,7 +21,9 @@ import {
   isScalar,
   isScalarReal,
   isNumeric,
+  isString,
   isVector,
+  scalarDouble,
   signIsNonneg,
   signIsPositive,
   type MType,
@@ -46,11 +48,10 @@ export function lowerFuncCall(
   if (target.kind === "userFunction") {
     return lowerUserCall.call(this, e.name, e.args, e.span);
   }
-  // Statement-only builtins (today: `disp`) cannot appear at expression
-  // position. Lowering of `ExprStmt(disp(...))` short-circuits in
-  // lower.ts before reaching here; any other position is rejected with
-  // a span. Routing through the unified registry means new stmt-only
-  // builtins (error, assert, …) get this rejection for free.
+  // Statement-only builtins (today: `disp`, `error`) cannot appear at
+  // expression position. Lowering of `ExprStmt(disp(...))` /
+  // `ExprStmt(error(...))` short-circuits in lower.ts before reaching
+  // here; any other position is rejected with a span.
   const builtin = getBuiltin(e.name);
   if (builtin && builtin.category === "stmt") {
     throw new UnsupportedConstruct(
@@ -58,6 +59,22 @@ export function lowerFuncCall(
         `value-producing call`,
       e.span
     );
+  }
+  // String fast-paths: `length(s) == 1`, `numel(s) == 1` per numbl
+  // semantics (a numbl `string` is a scalar handle, not a char
+  // vector). Fold to a NumLit at lowering — no runtime helper needed.
+  if ((e.name === "length" || e.name === "numel") && e.args.length === 1) {
+    const arg = this.lowerExpr(e.args[0]);
+    if (isString(arg.ty)) {
+      return {
+        kind: "NumLit",
+        value: 1,
+        ty: scalarDouble("positive"),
+        span: e.span,
+      };
+    }
+    // Fall through to the regular builtin path with the lowered arg.
+    return lowerBuiltinCall.call(this, e.name, e.args, e.span);
   }
   return lowerBuiltinCall.call(this, e.name, e.args, e.span);
 }

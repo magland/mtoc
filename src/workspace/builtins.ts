@@ -383,6 +383,33 @@ const BUILTINS: BuiltinSig[] = [
     },
   },
 
+  // `error(s)` is a statement-only builtin that raises a numbl
+  // RuntimeError. The lowering path mirrors `disp`: a special-case in
+  // `lowerStmt` for `ExprStmt(error(...))` produces an `IRStmt.Error`
+  // node and codegen emits `mtoc_error_string(arg);`. The registry
+  // entry exists so `Workspace.resolve("error")` returns from the
+  // unified path (and value-position uses are rejected with a clear
+  // message). Today only the single-string-argument form is accepted;
+  // `error(id, fmt, …)` shapes are deferred.
+  {
+    name: "error",
+    category: "stmt",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => ({ kind: "Void" }),
+    emit: () => {
+      throw new Error(
+        "internal: BuiltinSig 'error'.emit should not be called — error lowers to IRStmt.Error"
+      );
+    },
+  },
+
   // ── 1-arg libm — real-only legacy ────────────────────────────────────
   // `mod`/`rem` are real-only by numbl semantics (their sign-of-divisor
   // / truncate-to-zero rules don't have a sensible complex extension).

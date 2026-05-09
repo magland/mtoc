@@ -20,6 +20,7 @@ import {
   isScalarComplex,
   isScalarReal,
   isNumeric,
+  isString,
   typeToString,
   type NumericType,
 } from "../lowering/types.js";
@@ -27,6 +28,7 @@ import type { BuiltinEmitState } from "../workspace/builtins.js";
 import {
   MTOC_DISP_COMPLEX,
   MTOC_DISP_DOUBLE,
+  MTOC_STRING_STRUCT,
   MTOC_TENSOR_STRUCT,
   RUNTIME_HELPERS,
   type RuntimeSnippet,
@@ -45,6 +47,72 @@ import {
 // names synthesized here are scope-local helpers (`_mtoc_i`,
 // `_mtoc_n`, `_mtoc_t`, etc.) for loop counters and elementwise
 // staging temporaries.
+
+/** Render a numbl string-literal value as a C string-literal token,
+ *  including the surrounding double quotes. UTF-8 bytes pass through;
+ *  the C-side escape rules are minimal — the code units that need
+ *  escaping in a C string are `"`, `\`, and the non-printable controls
+ *  (`\n`, `\r`, `\t`, plus everything `< 0x20`). Anything ≥ 0x80 is
+ *  emitted verbatim (assuming UTF-8 source); the C compiler accepts
+ *  arbitrary bytes inside string literals. */
+function formatStringLit(value: string): string {
+  let out = '"';
+  for (let i = 0; i < value.length; i++) {
+    const ch = value.charCodeAt(i);
+    if (ch === 0x22) {
+      out += '\\"';
+    } else if (ch === 0x5c) {
+      out += "\\\\";
+    } else if (ch === 0x0a) {
+      out += "\\n";
+    } else if (ch === 0x0d) {
+      out += "\\r";
+    } else if (ch === 0x09) {
+      out += "\\t";
+    } else if (ch < 0x20 || ch === 0x7f) {
+      // Octal escape so the next character is unambiguous (a hex
+      // escape would chain into a following hex digit).
+      out += `\\${(ch >>> 6).toString(8)}${((ch >>> 3) & 7).toString(8)}${(
+        ch & 7
+      ).toString(8)}`;
+    } else {
+      // Pass-through. JS strings are UTF-16; for code points >= 0x80
+      // we emit each UTF-16 code unit's bytes via the source-level
+      // encoding the file has on disk. `value` came in as a JS string
+      // (UTF-16 code units), so charCodeAt(i) here is the actual code
+      // unit. For ASCII-clean strings (the common case) this is fine.
+      // Multi-byte UTF-8 inputs from the parser preserve their byte
+      // sequence as JS chars when the source was decoded as UTF-8.
+      out += value[i];
+    }
+  }
+  out += '"';
+  return out;
+}
+
+/** Byte length of a numbl string-literal value as it will end up at
+ *  runtime. The lowerer's `value` field already holds the decoded
+ *  string (quotes stripped, doubled-quote escapes collapsed). The
+ *  byte length is the UTF-8 byte count; we approximate by computing
+ *  the JS-side encoded byte count, which matches for well-formed
+ *  UTF-16. */
+function stringLitByteLen(value: string): number {
+  // TextEncoder is available in Node and the browser. Emitter runs
+  // in both via the bundled translator, so fall back to a manual
+  // computation if it's missing (unlikely).
+  try {
+    return new TextEncoder().encode(value).length;
+  } catch {
+    let n = 0;
+    for (let i = 0; i < value.length; i++) {
+      const ch = value.charCodeAt(i);
+      if (ch < 0x80) n += 1;
+      else if (ch < 0x800) n += 2;
+      else n += 3;
+    }
+    return n;
+  }
+}
 
 function formatNumLit(n: number): string {
   if (Number.isNaN(n)) return "NAN";
@@ -199,6 +267,17 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
     case "NumLit":
       return formatNumLit(e.value);
 
+    case "StringLit": {
+      // Build a non-owning `mtoc_string_t` whose `data` field points
+      // straight at a C string literal in `.rodata`. Cheap — no
+      // allocation. Activates the typedef + the helper.
+      useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+      useRuntimeByName(state, "mtoc_string_from_literal");
+      const lit = formatStringLit(e.value);
+      const len = stringLitByteLen(e.value);
+      return `mtoc_string_from_literal(${lit}, ${len})`;
+    }
+
     case "ImagLit": {
       // Render as `<value> * I`. C99's `_Complex_I` macro expands to
       // a `const float _Complex` (or `const double _Complex`) value
@@ -270,6 +349,21 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
     }
 
     case "Binary": {
+      // String concatenation has its own helper; route there before
+      // the numeric-binary branches.
+      if (isString(e.ty)) {
+        if (e.op !== "Add") {
+          throw new Error(
+            `codegen internal: string Binary with non-Add op ${e.op}; ` +
+              `should have been rejected at lowering`
+          );
+        }
+        useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+        useRuntimeByName(state, "mtoc_string_concat");
+        const left = emitExpr(state, e.left, 0);
+        const right = emitExpr(state, e.right, 0);
+        return `mtoc_string_concat(${left}, ${right})`;
+      }
       // Comparison / logical ops with any complex operand take a
       // dedicated branch — C's bare `<`/`==`/`&&` operators don't
       // match numbl's complex semantics (real-part-only for ordering;
@@ -447,6 +541,12 @@ function analyzeExpr(state: EmitState, e: IRExpr): void {
       // INFINITY / NAN macros come from <math.h>.
       if (!Number.isFinite(e.value)) state.needMath.value = true;
       return;
+    case "StringLit":
+      // Renders to `mtoc_string_from_literal(...)` — no extra
+      // standard-library header beyond what the runtime snippet
+      // itself pulls in. The snippet activation happens at emit-time
+      // when the literal renders.
+      return;
     case "ImagLit":
       // The `I` macro and `double _Complex` type both come from
       // <complex.h>; the type-driven flag above handles activation.
@@ -495,6 +595,9 @@ function analyzeStmt(state: EmitState, s: IRStmt): void {
       analyzeExpr(state, s.expr);
       return;
     case "Disp":
+      analyzeExpr(state, s.arg);
+      return;
+    case "Error":
       analyzeExpr(state, s.arg);
       return;
     case "If":
@@ -596,6 +699,31 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
+      if (isString(s.ty)) {
+        // Every string assignment goes through `mtoc_string_assign`,
+        // which frees the prior owned buffer (or no-ops on a literal-
+        // pointing handle) and installs the new value in one step.
+        // The RHS shape we accept here mirrors what lowering admits:
+        //   - StringLit: literal handle (zero allocation).
+        //   - Var: deep-copy via `mtoc_string_copy` so the source
+        //     stays usable for later reads.
+        //   - Binary(Add, string, string): produces a fresh owned
+        //     handle via `mtoc_string_concat`.
+        useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+        useRuntimeByName(state, "mtoc_string_assign");
+        let rhsExpr: string;
+        if (s.rhs.kind === "Var") {
+          useRuntimeByName(state, "mtoc_string_copy");
+          rhsExpr = `mtoc_string_copy(${s.rhs.cName})`;
+        } else {
+          // StringLit and string Binary route through the standard
+          // emitExpr path; both produce a stand-alone `mtoc_string_t`
+          // value (literal handle or freshly-concat'd owned handle).
+          rhsExpr = emitExpr(state, s.rhs, 0);
+        }
+        pushStmt(state, level, `mtoc_string_assign(&${s.cName}, ${rhsExpr});`);
+        break;
+      }
       if (isNumeric(s.ty) && isMultiElement(s.ty) && s.ty.elem === "double") {
         // Tensor-by-name: `y = x;` collapses to a single helper call
         // pair — `mtoc_tensor_assign(&y, mtoc_tensor_copy(x));`. The
@@ -625,6 +753,20 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
 
     case "Disp": {
       const ty = s.arg.ty;
+      if (isString(ty)) {
+        // Handle is either `StringLit` (renders as
+        // `mtoc_string_from_literal(...)`) or `Var` (renders as the
+        // bare cName) — both produce an `mtoc_string_t` value to pass
+        // straight to the helper. No allocation for the literal path.
+        useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+        useRuntimeByName(state, "mtoc_disp_string");
+        pushStmt(
+          state,
+          level,
+          `mtoc_disp_string(${emitExpr(state, s.arg, 0)});`
+        );
+        break;
+      }
       if (isScalarReal(ty)) {
         useRuntime(state, "mtoc_disp_double", MTOC_DISP_DOUBLE);
         // Non-variadic call — `int` operands auto-promote to `double`,
@@ -734,6 +876,23 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       break;
     }
 
+    case "Error": {
+      // `error(s)` lowers to a direct call into the runtime helper.
+      // The helper prints to stderr and `exit(1)`s, so any code after
+      // this statement is unreachable at runtime. We don't try to
+      // free heap-owned tensors / strings before the call: the OS
+      // reclaims everything on `exit`, and matching numbl's behavior
+      // is what we care about for cross-runner parity.
+      useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+      useRuntimeByName(state, "mtoc_error_string");
+      pushStmt(
+        state,
+        level,
+        `mtoc_error_string(${emitExpr(state, s.arg, 0)});`
+      );
+      break;
+    }
+
     case "Break":
       pushStmt(state, level, `break;`);
       break;
@@ -840,6 +999,7 @@ function findShapeSourceVar(
       return null;
     case "NumLit":
     case "ImagLit":
+    case "StringLit":
     case "TensorLit":
       return null;
   }
@@ -873,6 +1033,7 @@ function collectMultiElementVarsByCName(
       return;
     case "NumLit":
     case "ImagLit":
+    case "StringLit":
     case "TensorLit":
       return;
   }
@@ -1172,6 +1333,16 @@ function emitDeclarations(
       pushStmt(state, level, `mtoc_tensor_t ${cName} = mtoc_tensor_empty();`);
       continue;
     }
+    if (isString(ty)) {
+      // String predecls mirror tensors: a known-empty handle that
+      // every assignment overwrites via `mtoc_string_assign`. Since
+      // `owned=0` on the empty handle, the scope-exit free / first
+      // reassignment's free is a safe no-op.
+      useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+      useRuntimeByName(state, "mtoc_string_empty");
+      pushStmt(state, level, `mtoc_string_t ${cName} = mtoc_string_empty();`);
+      continue;
+    }
     throw new Error(
       `codegen: unsupported declaration for '${cName}': ${typeToString(ty)}`
     );
@@ -1197,20 +1368,31 @@ function emitScopeExitFrees(
   alreadyFreed: Set<string>
 ): void {
   const cNames = [...vars.keys()].sort();
-  let activated = false;
+  let tensorActivated = false;
+  let stringActivated = false;
   for (const key of cNames) {
     const binding = vars.get(key)!;
     const { ty, cName } = binding;
-    if (!(isNumeric(ty) && isMultiElement(ty) && ty.elem === "double")) {
+    if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
+      if (alreadyFreed.has(cName)) continue;
+      if (!tensorActivated) {
+        useRuntimeByName(state, "mtoc_tensor_free");
+        tensorActivated = true;
+      }
+      pushStmt(state, level, `mtoc_tensor_free(&${cName});`);
+      alreadyFreed.add(cName);
       continue;
     }
-    if (alreadyFreed.has(cName)) continue;
-    if (!activated) {
-      useRuntimeByName(state, "mtoc_tensor_free");
-      activated = true;
+    if (isString(ty)) {
+      if (alreadyFreed.has(cName)) continue;
+      if (!stringActivated) {
+        useRuntimeByName(state, "mtoc_string_free");
+        stringActivated = true;
+      }
+      pushStmt(state, level, `mtoc_string_free(&${cName});`);
+      alreadyFreed.add(cName);
+      continue;
     }
-    pushStmt(state, level, `mtoc_tensor_free(&${cName});`);
-    alreadyFreed.add(cName);
   }
 }
 

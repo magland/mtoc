@@ -35,10 +35,12 @@ import {
   isMultiElement,
   isScalar,
   isScalarReal,
+  isString,
   MType,
   scalarComplex,
   scalarDouble,
   signFromValue,
+  STRING,
   typeToString,
   unify,
 } from "./types.js";
@@ -212,6 +214,11 @@ export class Lowerer {
    *  the type; tensor reassignments at the same coarse shape free and
    *  realloc the backing buffer at runtime. */
   private static canShareStorage(prev: MType, next: MType): boolean {
+    // Two strings always share a single `mtoc_string_t` slot —
+    // reassignment goes through `mtoc_string_assign` which frees the
+    // prior buffer (or no-ops on a literal-pointing handle) and
+    // installs the new one.
+    if (prev.kind === "String" && next.kind === "String") return true;
     if (prev.kind !== "Numeric" || next.kind !== "Numeric") return false;
     if (prev.elem !== next.elem) return false;
     if (prev.isComplex !== next.isComplex) return false;
@@ -453,7 +460,50 @@ export class Lowerer {
               s.expr.args[0].span
             );
           }
+          // Same restriction for strings: a bare concat expression has
+          // no named buffer to hand to the runtime helper, and the
+          // owned result would leak. Allow `StringLit` (cheap, points
+          // at .rodata) and `Var`; reject otherwise.
+          if (
+            isString(arg.ty) &&
+            arg.kind !== "Var" &&
+            arg.kind !== "StringLit"
+          ) {
+            throw new UnsupportedConstruct(
+              `'disp' of a string expression is only supported for string ` +
+                `literals or variables; assign the value to a name first`,
+              s.expr.args[0].span
+            );
+          }
           return { kind: "Disp", arg, span: s.span };
+        }
+        // Special-case `error(arg)` at statement level. `error` is a
+        // statement-only builtin that never returns; we lower it to a
+        // dedicated IRStmt so codegen can emit a direct
+        // `mtoc_error_string(arg);` call. Only single-arg string form
+        // is supported today; numbl's `error(id, fmt, ...)` shapes are
+        // deferred.
+        if (
+          s.expr.type === "FuncCall" &&
+          s.expr.name === "error" &&
+          s.expr.args.length === 1
+        ) {
+          const arg = this.lowerExpr(s.expr.args[0]);
+          if (!isString(arg.ty)) {
+            throw new UnsupportedConstruct(
+              `'error' currently requires a single string argument ` +
+                `(got ${typeToString(arg.ty)})`,
+              s.expr.args[0].span
+            );
+          }
+          if (arg.kind !== "Var" && arg.kind !== "StringLit") {
+            throw new UnsupportedConstruct(
+              `'error' of a string expression is only supported for string ` +
+                `literals or variables; assign the value to a name first`,
+              s.expr.args[0].span
+            );
+          }
+          return { kind: "Error", arg, span: s.span };
         }
         const expr = this.lowerExpr(s.expr);
         // A bare tensor-valued expression at statement scope can't be
@@ -462,6 +512,17 @@ export class Lowerer {
         if (isMultiElement(expr.ty)) {
           throw new UnsupportedConstruct(
             `tensor-valued expression at statement scope is not yet ` +
+              `supported (assign it to a variable first)`,
+            s.span
+          );
+        }
+        // String-valued bare expressions at statement scope have the
+        // same problem — the owned result has no name to be released
+        // through. Reject with a span; the user can drop the value
+        // into a variable to take ownership.
+        if (isString(expr.ty)) {
+          throw new UnsupportedConstruct(
+            `string-valued expression at statement scope is not yet ` +
               `supported (assign it to a variable first)`,
             s.span
           );
@@ -524,6 +585,41 @@ export class Lowerer {
           ty: scalarDouble(signFromValue(n)),
           span: e.span,
         };
+      }
+
+      case "String": {
+        // Double-quoted string literal `"..."`. The lexer's lexeme
+        // includes the surrounding quotes; numbl's escape rule for
+        // double-quoted strings is doubled `""` → a single `"`.
+        // Anything else (backslash escapes, etc.) is left as-is to
+        // match numbl's permissive lexer behavior.
+        const raw = e.value;
+        if (raw.length < 2 || raw[0] !== '"' || raw[raw.length - 1] !== '"') {
+          throw new UnsupportedConstruct(
+            `internal: malformed string literal lexeme '${raw}'`,
+            e.span
+          );
+        }
+        const inner = raw.slice(1, -1).replace(/""/g, '"');
+        return {
+          kind: "StringLit",
+          value: inner,
+          ty: STRING,
+          span: e.span,
+        };
+      }
+
+      case "Char": {
+        // numbl's char (single-quoted) is a row-vector of code units —
+        // semantics diverge from `string` (e.g. `length('hi') == 2`
+        // vs `length("hi") == 1`, `'a' + 1 == 98` vs `"a" + 1 == "a1"`).
+        // mtoc doesn't yet have a char codegen path; defer with a
+        // clear error pointing the user at double-quoted strings.
+        throw new UnsupportedConstruct(
+          `char literals (single-quoted) are not yet supported; ` +
+            `use a double-quoted string ("...") instead`,
+          e.span
+        );
       }
 
       case "ImagUnit": {
@@ -600,6 +696,7 @@ function rejectNestedTensorLit(e: IRExpr): void {
       );
     case "NumLit":
     case "ImagLit":
+    case "StringLit":
     case "Var":
       return;
     case "Binary":
@@ -611,6 +708,49 @@ function rejectNestedTensorLit(e: IRExpr): void {
       return;
     case "Call":
       for (const a of e.args) rejectNestedTensorLit(a);
+      return;
+  }
+}
+
+/**
+ * Reject any string-typed `Binary` (concat) buried inside another
+ * expression. Concat allocates a fresh owned `mtoc_string_t`; without
+ * a containing `Assign` to install it via `mtoc_string_assign`, the
+ * buffer would leak. The rule mirrors the TensorLit-at-top rule:
+ * a string concat is legal as the top-level RHS of an `Assign`, but
+ * not nested inside another `Binary` / `Call` / `Unary`.
+ *
+ * StringLit is fine anywhere (it points at `.rodata`, no allocation).
+ * String `Var` is fine (no allocation either).
+ */
+function rejectNestedStringBinary(e: IRExpr): void {
+  switch (e.kind) {
+    case "Binary":
+      if (isString(e.ty)) {
+        throw new UnsupportedConstruct(
+          `string concatenation (\`+\`) is only supported as the top-level ` +
+            `right-hand side of an assignment; assign intermediate ` +
+            `concatenations to a variable first`,
+          e.span
+        );
+      }
+      rejectNestedStringBinary(e.left);
+      rejectNestedStringBinary(e.right);
+      return;
+    case "Unary":
+      rejectNestedStringBinary(e.operand);
+      return;
+    case "Call":
+      for (const a of e.args) rejectNestedStringBinary(a);
+      return;
+    case "TensorLit":
+      for (const row of e.elements)
+        for (const c of row) rejectNestedStringBinary(c);
+      return;
+    case "NumLit":
+    case "ImagLit":
+    case "StringLit":
+    case "Var":
       return;
   }
 }
@@ -665,31 +805,53 @@ function validateStmt(s: IRStmt): void {
         if (isMultiElement(s.rhs.ty)) {
           rejectCallInTensorContext(s.rhs);
         }
+        // String concat at the top of `Assign.rhs` is the one
+        // supported position; deeper nesting would leak the inner
+        // owned buffer. Reject a string `Binary` anywhere inside,
+        // recursing into operands.
+        if (s.rhs.kind === "Binary") {
+          rejectNestedStringBinary(s.rhs.left);
+          rejectNestedStringBinary(s.rhs.right);
+        } else {
+          rejectNestedStringBinary(s.rhs);
+        }
       }
       return;
     case "ExprStmt":
       rejectNestedTensorLit(s.expr);
+      rejectNestedStringBinary(s.expr);
       return;
     case "Disp":
       rejectNestedTensorLit(s.arg);
+      rejectNestedStringBinary(s.arg);
+      return;
+    case "Error":
+      rejectNestedTensorLit(s.arg);
+      rejectNestedStringBinary(s.arg);
       return;
     case "If":
       rejectNestedTensorLit(s.cond);
+      rejectNestedStringBinary(s.cond);
       validateStmts(s.thenBody);
       for (const eif of s.elseifs) {
         rejectNestedTensorLit(eif.cond);
+        rejectNestedStringBinary(eif.cond);
         validateStmts(eif.body);
       }
       if (s.elseBody) validateStmts(s.elseBody);
       return;
     case "While":
       rejectNestedTensorLit(s.cond);
+      rejectNestedStringBinary(s.cond);
       validateStmts(s.body);
       return;
     case "For":
       rejectNestedTensorLit(s.start);
       rejectNestedTensorLit(s.step);
       rejectNestedTensorLit(s.end);
+      rejectNestedStringBinary(s.start);
+      rejectNestedStringBinary(s.step);
+      rejectNestedStringBinary(s.end);
       validateStmts(s.body);
       return;
     case "Break":

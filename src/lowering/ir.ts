@@ -26,6 +26,20 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Double-quoted string literal `"..."`. `value` is the decoded
+       *  string contents (quotes stripped, doubled-quote escapes
+       *  collapsed). Codegen lowers this to
+       *  `mtoc_string_from_literal("...", N)` — a non-owning handle
+       *  pointing at the C string constant in `.rodata` (cheap; no
+       *  allocation). The owned-flag mtoc_string_t convention means
+       *  passing literals through builtins like `disp` doesn't need
+       *  freeing. `ty` is always `STRING`. */
+      kind: "StringLit";
+      value: string;
+      ty: MType;
+      span: Span;
+    }
+  | {
       kind: "Var";
       /** MATLAB name (for diagnostics and assignedVars lookups). */
       name: string;
@@ -108,6 +122,17 @@ export type IRStmt =
     }
   | { kind: "ExprStmt"; expr: IRExpr; span: Span }
   | { kind: "Disp"; arg: IRExpr; span: Span }
+  | {
+      /** `error(s)` — raises a runtime error with the given string
+       *  message. Statement-only (numbl's `error` never returns).
+       *  Codegen emits `mtoc_error_string(<arg>);` which prints
+       *  to stderr and aborts. Lowering accepts a `StringLit` or
+       *  string `Var` as the argument; nested string expressions
+       *  must be assigned to a name first. */
+      kind: "Error";
+      arg: IRExpr;
+      span: Span;
+    }
   | {
       kind: "If";
       cond: IRExpr;

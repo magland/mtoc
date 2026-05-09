@@ -81,8 +81,27 @@ workaround or a roadmap note.
   complex `min`/`max` over tensors (only scalars today) are not yet
   supported. `floor`/`ceil`/`round`/`fix` would need a componentwise
   runtime helper; `mod`/`rem` are real-only by numbl semantics.
-- **No char / string.** `'hello'` and `"hello"` raise
-  `UnsupportedConstruct: Char` / `String`.
+- **Strings are partial; char is not yet supported.** Double-quoted
+  scalar strings (`"hello"`) work for `disp`, `error("...")`, `+`
+  concatenation between two strings, and `length(s)` / `numel(s)`
+  (folded to `1`). What's deferred:
+  - **Char (single-quoted `'...'`) is rejected** with a span pointing
+    the user at double-quoted strings. numbl's char (a row-vector of
+    code units) has incompatible semantics — `length('hi') == 2` vs
+    `length("hi") == 1`, `'a' + 1 == 98` vs `"a" + 1 == "a1"` — and
+    sharing one C representation would force runtime tagging.
+  - **String arrays** (`["a", "b"]`, `string(...)`) — strings are
+    scalar-only today.
+  - **Indexing** (`s(1)`, `s(2:3)`).
+  - **Most string builtins**: `sprintf`, `strcat`, `num2str`,
+    `strsplit`, `strrep`, `strtrim`, `upper`, `lower`, etc.
+  - **String + numeric coercion.** numbl converts e.g. `"v=" + 1`
+    to `"v=1"`; mtoc rejects with a `TypeError` requiring both
+    operands of `+` to be strings.
+  - **Nested string concat** (`(a + b) + c`). Allowed only as the
+    top-level RHS of an assignment; intermediates need a name.
+  - **String returns from user functions.** Function returns are
+    still scalar-numeric only.
 - **No cell arrays, structs, classes.**
 - **No `fprintf`** beyond the `disp` runtime helper.
 

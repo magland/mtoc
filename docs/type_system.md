@@ -11,17 +11,20 @@ The top-level type carrier:
 ```
 MType =
   | NumericType
+  | StringType
   | { kind: "Unknown" }
   | { kind: "Void" }
 ```
 
-Every value mtoc currently reasons about is a `NumericType` — scalar or
-tensor, real or complex. `Unknown` shows up at type-check failures; `Void`
-is reserved for statement-only constructs (e.g. `disp` returns nothing).
+`NumericType` covers every numeric value mtoc reasons about — scalar or
+tensor, real or complex. `StringType` is the first non-numeric variant: a
+scalar handle to a UTF-8 buffer (numbl's `string`, distinct from numbl's
+`char`). `Unknown` shows up at type-check failures; `Void` is reserved for
+statement-only constructs (e.g. `disp` returns nothing).
 
-When non-numeric kinds (Logical/Char/Cell/Struct/Handle) get added, they
-land as new top-level variants — the discriminator is already there. Numeric
-code paths keep narrowing to `NumericType` without touching them.
+When further non-numeric kinds (Logical/Char/Cell/Struct/Handle) get added,
+they land as new top-level variants — the discriminator is already there.
+Numeric code paths keep narrowing to `NumericType` without touching them.
 
 ## NumericType
 
@@ -87,6 +90,37 @@ argument-type tuple (`one × notOne` row vector) and so share a single
 emitted `total__<hash>` function body. The runtime size flows through
 the `mtoc_tensor_t` struct.
 
+## StringType
+
+```
+StringType { kind: "String" }
+```
+
+A scalar handle to a UTF-8 byte buffer. There are no shape fields — mtoc
+treats string as scalar-only; arrays of strings (numbl's `["a", "b"]` form)
+are deferred. The `STRING` constant is the singleton instance every string
+expression carries.
+
+Codegen picks `mtoc_string_t` for any `StringType` (see `cTypeFor`). The
+struct is `{ const char *data; long len; int owned; }`: literals point at
+`.rodata` with `owned=0`, while concat / copy results allocate a fresh
+buffer with `owned=1`. The free helper consults the flag, so passing a
+literal handle through `mtoc_string_assign` (or letting it fall out of
+scope) is a safe no-op.
+
+Two strings unify to a string; a string vs anything else collapses to
+`Unknown`, which `recordAssignment` turns into a top-level split (or a
+clear error inside control flow). `canonicalizeType` produces
+`{ kind: "String" }`, so a function that takes a string parameter
+specializes on a single key.
+
+Today only one binary op is defined for strings: `+` is concatenation
+(numbl's `"a" + "b" == "ab"`). Mixed string + numeric `+` is rejected with a
+`TypeError` ("both operands to be strings"); other arithmetic / comparison
+ops on strings raise `UnsupportedConstruct`. The introspection builtins
+`length(s)` and `numel(s)` are folded to the constant `1` at lowering (numbl
+semantics — a numbl `string` is a scalar handle, not a char vector).
+
 ## Sign
 
 ```
@@ -113,9 +147,10 @@ A handful of _structural_ refinements live alongside the lattice:
 
 - **`unify(a, b)`** — least upper bound. Used at control-flow merges and at
   `assignedVars` accumulation (which type does a single C variable need to
-  hold across all assignments). Returns `Unknown` only when `elem` differs or
-  one side is `Unknown`/`Void`; that's the trigger for the
-  "this variable can't share one C storage location" error.
+  hold across all assignments). Returns `Unknown` when `elem` differs, when
+  one side is `Unknown`/`Void`, or when `String` is unified with a non-String
+  type — that's the trigger for the "this variable can't share one C storage
+  location" error.
 - **`arithResult(op, a, b)`** — result of `+ - * /` (and elementwise
   variants). Handles scalar⊙scalar, scalar↔tensor broadcast, and tensor⊙tensor
   with pointwise dim-compatible inputs. Categorical mismatches (e.g. rowVec +

@@ -11,6 +11,8 @@ import { lower } from "../src/lowering/lower.js";
 import { emitC } from "../src/codegen/emit.js";
 import {
   canonicalizeType,
+  isString,
+  STRING,
   unify,
   type NumericType,
 } from "../src/lowering/types.js";
@@ -59,11 +61,23 @@ describe("translate scalar example", () => {
     expect(c).toMatch(/^\s*x = x \+ 1\.0;/m);
   });
 
-  it("rejects unsupported constructs (string literal)", () => {
-    // Char/string literals aren't yet lowerable.
-    expect(() => translate("s = 'hi';")).toThrow(
-      /unsupported expression: Char/
-    );
+  it("rejects char literals with a clear pointer to use double-quoted strings", () => {
+    // Single-quoted char literals are deferred — numbl semantics for
+    // char (a row-vector of code units) diverge from string (a scalar
+    // handle), so the lowerer rejects with a span and points the user
+    // at the supported `"..."` form.
+    let err: unknown;
+    try {
+      translate("s = 'hi';");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/char/i);
+    expect(e.message).toMatch(/double-quoted/);
   });
 
   it("accepts a row-vector literal (dynamic-shape allocation)", () => {
@@ -710,5 +724,134 @@ describe("type system invariants", () => {
       expect(merged.isComplex).toBe(true);
       expect(merged.sign).toBe("unknown");
     }
+  });
+
+  it("isString narrows MType to StringType", () => {
+    const s = STRING;
+    expect(isString(s)).toBe(true);
+    expect(isString({ kind: "Unknown" })).toBe(false);
+    expect(isString(complexScalar("unknown"))).toBe(false);
+  });
+
+  it("unify of two strings is a string; string vs numeric collapses to Unknown", () => {
+    expect(unify(STRING, STRING)).toEqual(STRING);
+    expect(unify(STRING, complexScalar("unknown")).kind).toBe("Unknown");
+    expect(unify(complexScalar("unknown"), STRING).kind).toBe("Unknown");
+  });
+
+  it("canonicalizeType picks a stable hash entry for strings", () => {
+    expect(canonicalizeType(STRING)).toEqual({ kind: "String" });
+  });
+});
+
+describe("strings", () => {
+  it("emits an mtoc_string_t predeclaration + literal handle on assignment", () => {
+    const c = translate('s = "hi";\ndisp(s);\n');
+    expect(c).toContain("mtoc_string_t s = mtoc_string_empty();");
+    expect(c).toMatch(
+      /mtoc_string_assign\(&s, mtoc_string_from_literal\("hi", 2\)\);/
+    );
+    expect(c).toContain("mtoc_disp_string(s);");
+    // Scope-exit free.
+    expect(c).toContain("mtoc_string_free(&s);");
+  });
+
+  it("emits mtoc_string_concat for `+` on two strings", () => {
+    const c = translate('a = "x";\nb = "y";\nc = a + b;\ndisp(c);\n');
+    expect(c).toMatch(/mtoc_string_assign\(&c, mtoc_string_concat\(a, b\)\);/);
+  });
+
+  it("rejects nested string concat (would leak the inner buffer)", () => {
+    let err: unknown;
+    try {
+      translate('a = "x";\nb = "y";\nc = "z";\nd = a + b + c;\n');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/string concatenation/i);
+  });
+
+  it("rejects non-Add binary ops on strings", () => {
+    let err: unknown;
+    try {
+      translate('a = "x";\nb = "y";\nc = a * b;\n');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/string operands/);
+  });
+
+  it("rejects mixed string + numeric `+` with a TypeError", () => {
+    let err: unknown;
+    try {
+      translate('a = "x";\nb = a + 1;\n');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("TypeError");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/both operands to be strings/);
+  });
+
+  it("folds length(s) and numel(s) to the constant 1 (numbl semantics)", () => {
+    const c = translate('s = "hello";\ndisp(length(s));\ndisp(numel(s));\n');
+    // The numbl rule is `length(string) == numel(string) == 1`. Both
+    // calls should be folded at lowering — no runtime helper needed.
+    expect(c).not.toContain("mtoc_length");
+    expect(c).not.toContain("mtoc_numel");
+    expect(c).toContain("mtoc_disp_double(1.0);");
+  });
+
+  it("error(s) lowers to IRStmt.Error (statement-only path)", () => {
+    const source = 'error("boom");\n';
+    const ast = parseMFile(source, "test.m");
+    const ws = new Workspace("test.m");
+    ws.addFile({ name: "test.m", source, ast });
+    const ir = lower(ast, ws);
+    const errorStmts = ir.stmts.filter(s => s.kind === "Error");
+    expect(errorStmts.length).toBe(1);
+  });
+
+  it("error(s) emits the runtime helper call", () => {
+    const c = translate('error("boom");\n');
+    expect(c).toMatch(
+      /mtoc_error_string\(mtoc_string_from_literal\("boom", 4\)\);/
+    );
+  });
+
+  it("disp of a string concat expression is rejected with a clear message", () => {
+    let err: unknown;
+    try {
+      translate('a = "x";\nb = "y";\ndisp(a + b);\n');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    // The nested-binary rule fires first, since the disp arg is the
+    // outer Binary and its left/right are scanned for nested string
+    // Binary nodes.
+    expect(e.message).toMatch(/string/i);
+  });
+
+  it("splits a string -> numeric top-level reassignment via a fresh binding", () => {
+    // String and number can't share one C representation (the slot is
+    // either `mtoc_string_t` or `double`). At top level the lowerer
+    // splits into a fresh `_mtoc_x__v<N>` binding rather than throwing.
+    const c = translate('x = "hi";\ndisp(x);\nx = 42;\ndisp(x);\n');
+    expect(c).toContain("mtoc_string_t x = mtoc_string_empty();");
+    expect(c).toMatch(/double _mtoc_x__v\d+ = 0\.0;/);
   });
 });

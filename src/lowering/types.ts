@@ -1,14 +1,15 @@
 /**
  * mtoc type system (seed).
  *
- * The numeric tower is `NumericType` — every value mtoc currently
- * tracks is in it: scalar or tensor, real or complex, with shape
- * carried alongside element kind. Scalars are 1×1 numerics (no
- * separate "Scalar" variant). The `kind` discriminator is reserved
- * to grow sibling variants for non-numeric values (Logical, Char,
- * Cell, Struct, Handle) — those land when there's a concrete need;
- * keeping the discriminator means adding them won't ripple through
- * numeric-only code paths.
+ * The numeric tower is `NumericType` — every numeric value mtoc tracks
+ * is in it: scalar or tensor, real or complex, with shape carried
+ * alongside element kind. Scalars are 1×1 numerics (no separate
+ * "Scalar" variant). The first non-numeric sibling, `StringType`,
+ * lives alongside it for double-quoted scalar string handles. The
+ * `kind` discriminator is reserved to grow further variants (Logical,
+ * Char, Cell, Struct, Handle) — those land when there's a concrete
+ * need; keeping the discriminator means adding them won't ripple
+ * through numeric-only code paths.
  */
 
 export type ElemKind = "double";
@@ -83,7 +84,30 @@ function normalizeComplexSign(t: NumericType): NumericType {
   return t.isComplex && t.sign !== "unknown" ? { ...t, sign: "unknown" } : t;
 }
 
-export type MType = NumericType | { kind: "Unknown" } | { kind: "Void" };
+/**
+ * Scalar string handle. mtoc supports the numbl "string" type
+ * (double-quoted literals: `"hello"`) only as a scalar — no string
+ * arrays. Char (single-quoted literals) is intentionally rejected at
+ * lowering as a separate follow-up.
+ *
+ * The C representation is `mtoc_string_t` (see `runtime/string.h`):
+ * a small struct carrying a `data` pointer, a byte length, and an
+ * `owned` flag distinguishing literal-pointing-at-rodata from
+ * heap-allocated-from-concat. Encoding is UTF-8 by convention; the
+ * runtime never inspects code points (concat is byte-level
+ * memcpy and `length` returns 1 per numbl semantics).
+ */
+export interface StringType {
+  kind: "String";
+}
+
+export const STRING: StringType = { kind: "String" };
+
+export type MType =
+  | NumericType
+  | StringType
+  | { kind: "Unknown" }
+  | { kind: "Void" };
 
 export const SCALAR_DOUBLE: NumericType = {
   kind: "Numeric",
@@ -165,6 +189,12 @@ export function isNumeric(t: MType): t is NumericType {
   return t.kind === "Numeric";
 }
 
+/** True when `t` is the scalar `string` type. mtoc treats string as
+ *  scalar-only; arrays of strings are deferred. */
+export function isString(t: MType): t is StringType {
+  return t.kind === "String";
+}
+
 /** Statically known to be exactly 1 — i.e. broadcastable in this axis. */
 export function dimIsOne(d: DimInfo): boolean {
   return d.kind === "one";
@@ -240,6 +270,7 @@ export function staticNumElements(t: MType): number | null {
  *  complex question on the C side. Returns null for types codegen does
  *  not yet handle (Unknown, Void, non-double elem). */
 export function cTypeFor(t: MType): string | null {
+  if (t.kind === "String") return "mtoc_string_t";
   if (t.kind !== "Numeric") return null;
   if (t.elem !== "double") return null;
   if (isScalar(t)) return t.isComplex ? "double _Complex" : "double";
@@ -461,6 +492,16 @@ const NUMERIC_FIELDS: ReadonlyArray<TensorFieldEntry> = [
 export function unify(a: MType, b: MType): MType {
   if (a.kind === "Unknown" || b.kind === "Unknown") return { kind: "Unknown" };
   if (a.kind === "Void" || b.kind === "Void") return { kind: "Unknown" };
+  // String is a sibling top-level variant. Two strings unify to a
+  // string; string vs anything else (numeric / unrelated) collapses
+  // to Unknown — codegen can't share one C representation across
+  // categories, and `recordAssignment` will pick that up at the
+  // first such reassignment.
+  if (a.kind === "String" || b.kind === "String") {
+    return a.kind === "String" && b.kind === "String"
+      ? STRING
+      : { kind: "Unknown" };
+  }
   // Walk the field template, building a fresh NumericType in the
   // canonical field order (kind, then NUMERIC_FIELDS in array order).
   // Insertion order matters because canonicalizeType normalizes by
@@ -603,6 +644,7 @@ export const arithResultScalar = arithResult;
 export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Unknown") return { kind: "Unknown" };
   if (t.kind === "Void") return { kind: "Void" };
+  if (t.kind === "String") return { kind: "String" };
   // Normalize before serializing so two complex types differing only
   // in a leftover `sign` field hash to the same specialization key.
   const normalized = normalizeComplexSign(t);
@@ -622,6 +664,7 @@ function dimToString(d: DimInfo): string {
 export function typeToString(t: MType): string {
   if (t.kind === "Unknown") return "Unknown";
   if (t.kind === "Void") return "Void";
+  if (t.kind === "String") return "String";
   const cat = shapeCategory(t);
   // Dims are rendered into the framing prefix — they're a paired
   // rows+cols read, which doesn't fit the per-field iteration model.

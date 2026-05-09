@@ -89,6 +89,15 @@ The subset is growing iteratively. Roughly:
   `sum` (vector reduction). `length`/`numel` accept any tensor.
   `floor`/`ceil`/`round`/`fix`, `mod`/`rem`, and `^` stay real-only
   for now (numbl-semantics or pending implementation work).
+- Strings (numbl `string`, scalar only): double-quoted literals
+  (`"hello"`), concatenation via `+` (`"a" + "b" == "ab"`), `disp`,
+  `error("msg")`, and the introspection builtins `length(s)` and
+  `numel(s)` (both folded to `1` per numbl semantics). Stored as a
+  small `mtoc_string_t` struct (data pointer + byte length + owned
+  flag); literals point at `.rodata` while concat results allocate
+  a fresh buffer. Char (single-quoted `'...'`), string arrays,
+  string indexing, `sprintf`/`strcat`/`num2str`, and string + numeric
+  coercion are deferred and rejected with a span.
 
 Anything outside the supported subset raises `UnsupportedConstruct` with a
 source span pointing to the offending line.

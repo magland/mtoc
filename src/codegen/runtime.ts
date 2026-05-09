@@ -74,6 +74,14 @@ export const MTOC_DISP_COMPLEX = loadSnippet("disp_complex.h", [
 export const MTOC_TENSOR_STRUCT = loadSnippet("tensor.h");
 
 /**
+ * String struct typedef. Like the tensor struct, no function body —
+ * it's the seed every string runtime helper depends on. Activated
+ * automatically wherever a string lives in the emitted program (at
+ * predeclarations, at literals, at assigns, at disp / error).
+ */
+export const MTOC_STRING_STRUCT = loadSnippet("string.h");
+
+/**
  * Heap allocation helper. Tensor storage is uniformly mallocked from
  * the heap (so the codegen path is exercised by every test, not just
  * large ones); this wrapper aborts with a clear diagnostic on
@@ -177,4 +185,35 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_min_complex", loadSnippet("min_complex.h")],
   ["mtoc_max_complex", loadSnippet("max_complex.h")],
   ["mtoc_angle_real", loadSnippet("angle_real.h")],
+  // String runtime helpers. The struct typedef seeds the dependency
+  // graph; literal / copy / concat / free / assign / disp / error all
+  // pull it in. `mtoc_string_alloc_bytes` is the char-buffer
+  // allocator (siblng to `mtoc_alloc` for tensor data); copy and
+  // concat depend on it. `error` calls `exit(1)` after writing the
+  // message to stderr.
+  ["mtoc_string_t", MTOC_STRING_STRUCT],
+  ["mtoc_string_empty", loadSnippet("string_empty.h", ["mtoc_string_t"])],
+  [
+    "mtoc_string_from_literal",
+    loadSnippet("string_from_literal.h", ["mtoc_string_t"]),
+  ],
+  ["mtoc_string_alloc_bytes", loadSnippet("string_alloc_bytes.h")],
+  [
+    "mtoc_string_copy",
+    loadSnippet("string_copy.h", ["mtoc_string_t", "mtoc_string_alloc_bytes"]),
+  ],
+  [
+    "mtoc_string_concat",
+    loadSnippet("string_concat.h", [
+      "mtoc_string_t",
+      "mtoc_string_alloc_bytes",
+    ]),
+  ],
+  ["mtoc_string_free", loadSnippet("string_free.h", ["mtoc_string_t"])],
+  [
+    "mtoc_string_assign",
+    loadSnippet("string_assign.h", ["mtoc_string_t", "mtoc_string_free"]),
+  ],
+  ["mtoc_disp_string", loadSnippet("disp_string.h", ["mtoc_string_t"])],
+  ["mtoc_error_string", loadSnippet("error_string.h", ["mtoc_string_t"])],
 ]);
