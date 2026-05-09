@@ -71,15 +71,18 @@ static double square_then_double__1c53c2ec(double x) { ... }
 ```
 
 Useful both for human readers and for any tooling that wants to map mangled
-names back to source.
+names back to source. The same comment shape applies to tensor parameters —
+`typeToString` renders e.g. `Numeric<rowVec(1x5), real>` and the emitted C
+signature uses `mtoc_tensor_t v` for that param (borrowed by value).
 
 ## Limitations
 
 - Single output per function. Multi-output (`[a, b] = f(x)`) is not yet
   supported — when added, the C path will likely use output pointers.
-- All scalar-typed today; tensor-valued parameters are accepted by the type
-  system but the function-arg codegen path only handles scalars. (Tensor
-  function args is a near-term extension; the IR shape is already there.)
+- Tensor-valued parameters are now supported (real or complex; borrowed by
+  value as `mtoc_tensor_t`). Tensor params cannot be reassigned in the body
+  — introduce a fresh local instead. Tensor-valued returns are still
+  rejected at lowering; sret arrives in a later stage.
 - Local functions only — function files (one function per `.m` file) and
   workspace-wide dispatch from numbl's `functionResolve.ts` aren't yet
   inherited beyond the local-function case.

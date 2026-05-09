@@ -241,6 +241,64 @@ describe("translate scalar example", () => {
     expect(e.span).toBeTruthy();
     expect(e.message).toMatch(/disp/i);
   });
+
+  it("emits `mtoc_tensor_t v` for a tensor function parameter", () => {
+    // Lifting the "real-scalar arguments only" restriction: the avg
+    // example specializes on a row-vector arg, so the C signature
+    // should carry the borrowed-by-value `mtoc_tensor_t` struct
+    // (NOT a bare `double`).
+    const c = translate(
+      "function s = avg(v)\n" +
+        "  s = sum(v) / length(v);\n" +
+        "end\n" +
+        "x = [1.0 2.0 3.0 4.0 5.0];\n" +
+        "m = avg(x);\n" +
+        "disp(m);\n"
+    );
+    expect(c).toMatch(/static double avg__[0-9a-f]+\(mtoc_tensor_t v\)/);
+    expect(c).not.toMatch(/static double avg__[0-9a-f]+\(double v\)/);
+  });
+
+  it("rejects tensor-parameter reassignment with a span'd error", () => {
+    let err: unknown;
+    try {
+      translate(
+        "x = [1 2 3];\n" +
+          "disp(foo(x));\n" +
+          "function y = foo(v)\n" +
+          "  v = v .* 2;\n" +
+          "  y = sum(v);\n" +
+          "end\n"
+      );
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/tensor parameter/i);
+    expect(e.message).toContain("'v'");
+  });
+
+  it("emits two distinct specializations when called with two shapes", () => {
+    // Same function called with a 1x3 and a 1x4 arg — each shape lands
+    // on its own mangled hash and so produces a separate static
+    // function body in the emitted C.
+    const c = translate(
+      "function s = total(v)\n" +
+        "  s = sum(v);\n" +
+        "end\n" +
+        "a = [1 2 3];\n" +
+        "b = [10 20 30 40];\n" +
+        "disp(total(a));\n" +
+        "disp(total(b));\n"
+    );
+    const sigRe = /static double total__([0-9a-f]+)\(mtoc_tensor_t v\)/g;
+    const hashes = new Set<string>();
+    for (const m of c.matchAll(sigRe)) hashes.add(m[1]);
+    expect(hashes.size).toBe(2);
+  });
 });
 
 describe("CLI translate + run", () => {

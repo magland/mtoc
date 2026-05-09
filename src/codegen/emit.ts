@@ -15,6 +15,7 @@ import type {
   VarBinding,
 } from "../lowering/ir.js";
 import {
+  cTypeFor,
   isMultiElement,
   isScalarComplex,
   isScalarReal,
@@ -949,13 +950,50 @@ function functionHeaderComment(fn: IRFunction): string[] {
 }
 
 function emitFunction(state: EmitState, fn: IRFunction): string[] {
-  if (!isScalarReal(fn.returnTy)) {
+  // Lowering rejects tensor returns (sret is a future stage); any
+  // shape other than a scalar reaching here is a lowerer escape.
+  // Scalar real → `double`; scalar complex → `double _Complex` (the
+  // existing complex-scalar codegen path handles return-by-value via
+  // C99's native complex ABI).
+  const returnCTy = cTypeFor(fn.returnTy);
+  if (returnCTy === null || isMultiElement(fn.returnTy)) {
     throw new Error(
-      `codegen: function '${fn.matlabName}' has unsupported return type ${fn.returnTy.kind}`
+      `codegen: function '${fn.matlabName}' has unsupported return type ` +
+        `${typeToString(fn.returnTy)}`
     );
   }
-  const paramList = fn.params.map(p => `double ${p.cName}`).join(", ");
-  const sig = `static double ${fn.mangledName}(${paramList || "void"}) {`;
+  if (isNumeric(fn.returnTy) && fn.returnTy.isComplex) {
+    state.needComplex.value = true;
+  }
+  // Per param: `cTypeFor` picks the C representation — `double` for
+  // real scalars, `double _Complex` for complex scalars, and the
+  // `mtoc_tensor_t` struct for any multi-element tensor (real or
+  // complex; the struct's `imag` buffer carries the complex half).
+  // Tensor params are borrowed by value: the struct fields (real /
+  // imag pointers + dims) are copied into the callee's frame, but the
+  // buffers themselves are shared with the caller. The lowerer rejects
+  // any reassignment of a tensor param so the body can never write
+  // through the borrowed buffer; params are not in `assignedVars` so
+  // the scope-exit free walk skips them.
+  const paramParts: string[] = [];
+  let needsTensorTypedef = false;
+  for (const p of fn.params) {
+    const cTy = cTypeFor(p.ty);
+    if (cTy === null) {
+      throw new Error(
+        `codegen: function '${fn.matlabName}' parameter '${p.name}' has ` +
+          `unsupported type ${typeToString(p.ty)}`
+      );
+    }
+    if (isMultiElement(p.ty)) needsTensorTypedef = true;
+    if (isNumeric(p.ty) && p.ty.isComplex) state.needComplex.value = true;
+    paramParts.push(`${cTy} ${p.cName}`);
+  }
+  if (needsTensorTypedef) {
+    useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
+  }
+  const paramList = paramParts.join(", ");
+  const sig = `static ${returnCTy} ${fn.mangledName}(${paramList || "void"}) {`;
   const { lines } = emitFunctionBody(state, fn);
   return [...functionHeaderComment(fn), sig, ...lines, "}"];
 }

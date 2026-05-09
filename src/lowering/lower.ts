@@ -152,6 +152,11 @@ export class Lowerer {
   private splitCounter = 0;
   /** Names of params for the current scope (function scope only). */
   private params: ReadonlySet<string>;
+  /** Original (call-site) param types — kept distinct from `env` so the
+   *  param-reassignment guard can inspect the param's borrowed type
+   *  even AFTER `env` has been overwritten by the assignment we're
+   *  about to reject. Function scope only; empty at script scope. */
+  private paramTypes: ReadonlyMap<string, MType>;
   /** Output variable for the current function scope, or null at script
    *  scope. Used to lower MATLAB `return` into `return <outputCName>;`. */
   private outputVar: string | null;
@@ -173,6 +178,7 @@ export class Lowerer {
   ) {
     this.shared = shared;
     this.params = new Set(paramBindings.map(p => p.name));
+    this.paramTypes = new Map(paramBindings.map(p => [p.name, p.ty]));
     for (const p of paramBindings) {
       this.env.set(p.name, p.ty);
       this.currentBindingCName.set(p.name, p.cName);
@@ -253,8 +259,23 @@ export class Lowerer {
     this.env.set(name, ty);
 
     if (this.params.has(name)) {
-      // Params keep their fixed cName (declared by the C function
-      // signature). Phase 1 doesn't split params.
+      // Tensor params are borrowed by value and the body must never
+      // write through them — the buffer is shared with the caller.
+      // Reject the reassignment with a span pointing at the offending
+      // statement; the user can introduce a fresh local instead.
+      // (We consult `paramTypes` rather than `env` because `env` was
+      // already overwritten with the new RHS type two lines above.)
+      const paramTy = this.paramTypes.get(name);
+      if (paramTy && isMultiElement(paramTy)) {
+        throw new UnsupportedConstruct(
+          `tensor parameter '${name}' cannot be reassigned in the function ` +
+            `body; introduce a fresh local instead ` +
+            `(e.g. \`w = ${name} ...; ... = w;\`)`,
+          span
+        );
+      }
+      // Scalar params keep their fixed cName (declared by the C
+      // function signature). Phase 1 doesn't split params.
       return this.currentBindingCName.get(name) ?? cNameFor(name);
     }
 

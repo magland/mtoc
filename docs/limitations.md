@@ -38,10 +38,12 @@ M)` with runtime `N`/`M` doesn't yet (the lowering surfaces a clear error).
   (likely calling into a BLAS-shaped helper).
 - **No tensor comparisons.** `a == b` requires both to be scalars. Elementwise
   comparison on tensors will land alongside auto-materialization.
-- **Tensor-valued function arguments aren't supported yet.** The type system
-  represents them, but the function-arg codegen path only handles scalars.
-  Single-output, scalar-argument functions are the only specialization shape
-  today.
+- **Tensor-valued function returns aren't supported yet.** Functions accept
+  tensor arguments (real or complex), but the return type must be a scalar
+  (real or complex). Returning a tensor needs an sret-style codegen path
+  that's still pending. Tensor params are also borrowed by value: the body
+  cannot reassign one (the lowerer rejects it with a span pointing at the
+  offending statement) — introduce a fresh local instead.
 - **`sum` on a matrix isn't supported.** Vector sum returns scalar; matrix sum
   in numbl returns a row vector of column sums, which needs a tensor-returning
   builtin path.

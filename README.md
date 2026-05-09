@@ -41,8 +41,10 @@ The subset is growing iteratively. Roughly:
   `atan2`, `hypot`, `power`
 - Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`
   (full registry: [`src/workspace/builtins.ts`](src/workspace/builtins.ts))
-- User-defined scalar functions (single output), with one specialization per
-  unique call-site argument-type tuple
+- User-defined functions (single output, scalar input or tensor input,
+  scalar return for now), with one specialization per unique call-site
+  argument-type tuple. Tensor params are borrowed by value — the body
+  cannot reassign one (introduce a fresh local instead)
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
 - Complex numbers (scalar and tensor): literals (`1i`, `2.5i`,

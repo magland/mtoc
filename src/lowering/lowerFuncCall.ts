@@ -264,9 +264,9 @@ export function lowerUserCall(
   }
   const args = argExprs.map(a => this.lowerExpr(a));
   for (const a of args) {
-    if (!isScalarReal(a.ty)) {
+    if (!isNumeric(a.ty)) {
       throw new UnsupportedConstruct(
-        `function '${name}' currently only accepts real-scalar arguments ` +
+        `function '${name}' only accepts numeric arguments ` +
           `(got ${typeToString(a.ty)})`,
         a.span
       );
@@ -346,10 +346,10 @@ function specialize(
         fnAst.span
       );
     }
-    if (!isScalarReal(returnTy)) {
+    if (!isScalar(returnTy)) {
       throw new UnsupportedConstruct(
-        `function '${matlabName}' must return a real scalar ` +
-          `(got ${typeToString(returnTy)})`,
+        `function '${matlabName}' must return a scalar — ` +
+          `tensor returns are not yet supported (got ${typeToString(returnTy)})`,
         fnAst.span
       );
     }
