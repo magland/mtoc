@@ -137,6 +137,8 @@ export function renderStmt(s: IRStmt): string | null {
       return `disp(${renderExpr(s.arg, 0)})`;
     case "Error":
       return `error(${renderExpr(s.arg, 0)})`;
+    case "Assert":
+      return `assert(${renderExpr(s.cond, 0)})`;
     case "If":
       return `if ${renderExpr(s.cond, 0)}`;
     case "While":

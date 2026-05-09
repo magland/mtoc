@@ -82,6 +82,9 @@ The subset is growing iteratively. Roughly:
   `atan2`, `hypot`, `power`
 - Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`
   (full registry: [`src/workspace/builtins.ts`](src/workspace/builtins.ts))
+- Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`
+  (`assert` accepts a scalar real condition today — the 2-arg
+  `assert(cond, msg)` and tensor-condition forms are deferred)
 - User-defined functions with 0, 1, or N≥2 scalar outputs (input may
   be scalar or tensor; outputs must be scalars today). One
   specialization per unique call-site argument-type tuple. The C ABI
@@ -165,6 +168,20 @@ Two tracks:
 
 - **Unit tests** (`vitest`): assertions about emitted C, error attribution,
   type-system invariants. Run with `npx vitest run`.
+
+- **numbl corpus subset** (`scripts/run_numbl_tests.ts`): a curated list of
+  numbl's own test scripts that mtoc can already run end-to-end. Paths are
+  in [`numbl_tests.txt`](numbl_tests.txt), relative to
+  `../numbl/numbl_test_scripts/`. Each script is run through mtoc and must
+  print `SUCCESS` as its final stdout line (numbl tests use `assert` and
+  print `SUCCESS` on the way out; a failed `assert` aborts before that
+  line is reached). Most numbl tests don't pass yet — the list grows as
+  mtoc's surface area does.
+
+  ```bash
+  npm run test:numbl                                   # all listed
+  npx tsx scripts/run_numbl_tests.ts foo.m bar.m       # listed subset
+  ```
 
 When adding a feature, drop a `.m` file into the appropriate
 `test_scripts/<category>/` subdirectory (the runner picks it up automatically)

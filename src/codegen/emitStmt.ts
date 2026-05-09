@@ -440,6 +440,22 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       break;
     }
 
+    case "Assert": {
+      // `assert(cond)` lowers to a runtime helper that prints
+      // "Assertion failed" to stderr and exit(1)s when the scalar
+      // `cond` is zero or NaN. On success the helper is a no-op so
+      // anything after this statement runs normally — unlike Error,
+      // we still need to free dead-after vars on the success path.
+      useRuntimeByName(state, "mtoc_assert_double");
+      pushStmt(
+        state,
+        level,
+        `mtoc_assert_double(${emitExpr(state, s.cond, 0)});`
+      );
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
+    }
+
     case "Break":
       pushStmt(state, level, `break;`);
       break;

@@ -14,6 +14,7 @@
     "serve": "tsx src/cli.ts serve",
     "test": "vitest run",
     "test:scripts": "tsx scripts/run_test_scripts.ts",
+    "test:numbl": "tsx scripts/run_numbl_tests.ts",
     "typecheck": "tsc -b",
     "format": "prettier --write .",
     "format:check": "prettier --check .",

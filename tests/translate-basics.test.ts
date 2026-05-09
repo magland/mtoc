@@ -301,6 +301,48 @@ describe("translate scalar example", () => {
     expect(c).toContain("mtoc_tensor_assign(&b, mtoc_tensor_copy(a));");
   });
 
+  it("assert(cond) lowers to IRStmt.Assert (statement-only path)", () => {
+    const source = "assert(1 + 1 == 2);\n";
+    const ast = parseMFile(source, "test.m");
+    const ws = new Workspace("test.m");
+    ws.addFile({ name: "test.m", source, ast });
+    const ir = lower(ast, ws);
+    const asserts = ir.stmts.filter(s => s.kind === "Assert");
+    expect(asserts.length).toBe(1);
+  });
+
+  it("assert(cond) emits the runtime helper call", () => {
+    const c = translate("assert(1 + 1 == 2);\n");
+    expect(c).toContain("mtoc_assert_double(");
+    expect(c).toMatch(/static void mtoc_assert_double\(double cond\)/);
+  });
+
+  it("assert rejects a 2-arg form with a clear message", () => {
+    let err: unknown;
+    try {
+      translate('assert(1 == 1, "msg");\n');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.message).toMatch(/2-arg/);
+  });
+
+  it("assert rejects a non-scalar-real argument with a clear message", () => {
+    let err: unknown;
+    try {
+      translate('assert("hi");\n');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.message).toMatch(/scalar real/);
+  });
+
   it("emits a single specialization for two row-vector shapes", () => {
     // After the dim coarsening, calls with a 1x3 and a 1x4 row-vector
     // arg both canonicalize to `cols: notOne` — the specific size is

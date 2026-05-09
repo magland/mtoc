@@ -276,6 +276,19 @@ export type IRStmt =
       span: Span;
     }
   | {
+      /** `assert(cond)` — aborts with "Assertion failed" on stderr if
+       *  `cond` evaluates to a falsy or NaN scalar; otherwise a no-op.
+       *  Statement-only (numbl's `assert` returns nothing on success
+       *  and throws on failure). Codegen emits a `mtoc_assert_double`
+       *  call that does the runtime check. Lowering today accepts a
+       *  scalar real argument; the multi-element tensor form (numbl
+       *  fails if any element is zero/NaN) and the 2-arg `assert(cond,
+       *  msg)` form are deferred. */
+      kind: "Assert";
+      cond: IRExpr;
+      span: Span;
+    }
+  | {
       kind: "If";
       cond: IRExpr;
       thenBody: IRStmt[];

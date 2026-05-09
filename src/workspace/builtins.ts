@@ -21,6 +21,7 @@ import {
   isCharArray,
   isMultiElement,
   isNumeric,
+  isScalarReal,
   isString,
   scalarComplex,
   scalarDouble,
@@ -467,6 +468,50 @@ const BUILTINS: BuiltinSig[] = [
         );
       }
       return { kind: "Disp", arg, span };
+    },
+  },
+
+  // `assert(cond)` — verify a scalar real condition at runtime.
+  // numbl's `assert` throws on a falsy or NaN value; mtoc lowers it
+  // to `IRStmt.Assert`, which codegen emits as a call into the
+  // `mtoc_assert_double` runtime helper (prints "Assertion failed"
+  // to stderr and exit(1)s on failure, no-op on success). The
+  // 2-arg `assert(cond, msg)` and tensor-condition forms are
+  // deferred — rejected at lowering with a span.
+  {
+    name: "assert",
+    category: "stmt",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => ({ kind: "Void" }),
+    emit: () => {
+      throw new Error(
+        "internal: BuiltinSig 'assert'.emit should not be called — assert lowers to IRStmt.Assert"
+      );
+    },
+    lowerStmt: (ctx, args, span) => {
+      if (args.length !== 1) {
+        throw new UnsupportedConstruct(
+          `'assert' currently requires exactly one argument ` +
+            `(2-arg 'assert(cond, msg)' is not yet supported)`,
+          span
+        );
+      }
+      const cond = ctx.lowerExpr(args[0]);
+      if (!isScalarReal(cond.ty)) {
+        throw new UnsupportedConstruct(
+          `'assert' currently requires a scalar real condition ` +
+            `(got ${typeToString(cond.ty)})`,
+          args[0].span
+        );
+      }
+      return { kind: "Assert", cond, span };
     },
   },
 

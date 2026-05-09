@@ -67,11 +67,12 @@ several entries share a non-trivial closure shape.
 - **`expr` builtins** lower to `IRExpr.Call` and end up in the value position
   of an expression. The vast majority.
 - **`stmt` builtins** are accepted at statement position only. Today
-  `disp` and `error` are in this group. Lowering routes
-  `ExprStmt(disp(x))` into `IRStmt.Disp` and `ExprStmt(error(s))` into
-  `IRStmt.Error` directly; the registry entries exist so
-  `Workspace.resolve` has a single lookup path and value-position uses
-  reject with a clear message.
+  `disp`, `error`, and `assert` are in this group. Lowering routes
+  `ExprStmt(disp(x))` into `IRStmt.Disp`, `ExprStmt(error(s))` into
+  `IRStmt.Error`, and `ExprStmt(assert(c))` into `IRStmt.Assert`
+  directly; the registry entries exist so `Workspace.resolve` has a
+  single lookup path and value-position uses reject with a clear
+  message.
 
 ## Codegen interaction
 
@@ -131,6 +132,12 @@ in the registry instead of accumulating special cases in `lower.ts`.
 `IRStmt.Disp` via its `lowerStmt` hook; codegen picks
 `mtoc_disp_string` based on the arg's `MType`. `error("...")` is the
 parallel `IRStmt.Error`, also produced by a `lowerStmt` hook.
+`assert(cond)` produces `IRStmt.Assert` via its `lowerStmt` hook;
+codegen emits `mtoc_assert_double(<cond>);` (a runtime helper that
+prints `Assertion failed` to stderr and `exit(1)`s on a zero or NaN
+scalar, no-op otherwise). The 2-arg `assert(cond, msg)` form and the
+tensor-condition form (numbl fails if any element is zero/NaN) are
+deferred — both raise `UnsupportedConstruct` with a span at lowering.
 
 `length(s)` and `numel(s)` use their `lowerExpr` hook to handle
 non-tensor arguments. When the argument is a string, both fold to a

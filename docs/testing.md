@@ -76,6 +76,30 @@ Avoid putting per-script comparison tests in vitest — the parallel
 cross-runner already covers that and is much faster. Vitest is for
 unit-level checks.
 
+## numbl-corpus subset — `scripts/run_numbl_tests.ts`
+
+A curated list of numbl's own tests that mtoc can already run end-to-end.
+Distinct from the cross-runner: there is no byte-for-byte comparison —
+each script just has to print `SUCCESS` as its final stdout line. (numbl's
+test scripts are written in the "lots of `assert`s, then `disp('SUCCESS')`
+at the end" style; a failed `assert` aborts before the SUCCESS line is
+reached, so the check is a reliable smoke test.)
+
+The list lives at [`numbl_tests.txt`](../numbl_tests.txt), with paths
+relative to `../numbl/numbl_test_scripts/`. Most numbl tests do **not**
+pass yet — the file grows as mtoc's surface area does. When a feature
+lands that brings new numbl tests into the passing set, add them.
+
+```bash
+npm run test:numbl                                  # all listed
+npx tsx scripts/run_numbl_tests.ts foo.m bar.m      # listed subset
+MTOC_TEST_CONCURRENCY=4 npm run test:numbl
+```
+
+This runner is not part of the "definition of done" gate — it's a
+forward-progress signal. The cross-runner over `test_scripts/` and the
+vitest suite remain the binding regression checks.
+
 ## Adding a new feature: the typical loop
 
 1. Write a small `.m` test script under the relevant `test_scripts/<category>/`

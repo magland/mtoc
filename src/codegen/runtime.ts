@@ -247,4 +247,9 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     "mtoc_disp_char_tensor",
     loadSnippet("disp_char_tensor.h", ["mtoc_char_tensor_t"]),
   ],
+  // `assert(cond)` runtime helper. Reads a real-scalar `cond` and
+  // exits non-zero on failure, no-op on success. Has no struct
+  // dependencies — the only headers it pulls are <math.h> for
+  // `isnan`, plus stdio/stdlib for the abort path.
+  ["mtoc_assert_double", loadSnippet("assert_double.h")],
 ]);
