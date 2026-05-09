@@ -40,7 +40,7 @@ rule for `.m` files). `arith_basic.m`, `for_step.m`, `tensor_lit_disp.m`, etc.
 - If the divergence is a deliberate semantic difference → the script doesn't
   belong in the cross-runner. Consider an mtoc-only assertion in vitest.
 
-## Vitest — `tests/translate.test.ts`
+## Vitest — `tests/translate-*.test.ts`
 
 Unit tests for things the cross-runner can't observe directly:
 
@@ -50,13 +50,25 @@ Unit tests for things the cross-runner can't observe directly:
   `TypeError` whose message mentions `sign='negative'`")
 - Type-system invariants
 
+The vitest suite is split topically — each file targets one feature
+area (basics, functions, tensors, strings, chars, complex, types,
+codegen options, CLI). Shared scaffolding (the `translate(source)`
+helper plus `cliPath` / `example1Path`) lives in
+[`tests/_helpers.ts`](../tests/_helpers.ts); each test file imports
+what it needs from there.
+
 ```bash
-npx vitest run                    # all
-npx vitest run tests/translate.test.ts
+npx vitest run                                    # all
+npx vitest run tests/translate-strings.test.ts    # one topic
 ```
 
-Avoid putting per-script comparison tests in vitest — the parallel cross-runner
-already covers that and is much faster. Vitest is for unit-level checks.
+When adding a test, drop it into the matching `translate-*.test.ts`;
+new topic? Add `tests/translate-<topic>.test.ts` with a one-line
+import from `_helpers.ts` and one or more `describe` blocks.
+
+Avoid putting per-script comparison tests in vitest — the parallel
+cross-runner already covers that and is much faster. Vitest is for
+unit-level checks.
 
 ## Adding a new feature: the typical loop
 
