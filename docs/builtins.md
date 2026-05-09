@@ -132,12 +132,28 @@ in the registry instead of accumulating special cases in `lower.ts`.
 `IRStmt.Disp` via its `lowerStmt` hook; codegen picks
 `mtoc_disp_string` based on the arg's `MType`. `error("...")` is the
 parallel `IRStmt.Error`, also produced by a `lowerStmt` hook.
-`assert(cond)` produces `IRStmt.Assert` via its `lowerStmt` hook;
-codegen emits `mtoc_assert_double(<cond>);` (a runtime helper that
-prints `Assertion failed` to stderr and `exit(1)`s on a zero or NaN
-scalar, no-op otherwise). The 2-arg `assert(cond, msg)` form and the
-tensor-condition form (numbl fails if any element is zero/NaN) are
-deferred — both raise `UnsupportedConstruct` with a span at lowering.
+`assert(cond)` and `assert(cond, msg)` produce `IRStmt.Assert` via
+their `lowerStmt` hook; codegen dispatches across three runtime
+helpers: `mtoc_assert_double` (no message), `mtoc_assert_double_msg`
+(string message), and `mtoc_assert_double_msg_char` (char-array
+message). All three fail on a zero or NaN cond and are no-ops
+otherwise. The msg arg must be a string `Var`/`StringLit` or a
+char-array `Var`/`CharLit`; nested string/char expressions must be
+assigned to a name first. The tensor-condition form (numbl fails if
+any element is zero/NaN) is deferred — raises `UnsupportedConstruct`.
+
+`strcmp(a, b)` accepts char arrays and strings in any combination.
+Both arms get normalized to a `(data, len)` view inside their helper:
+char-tensor × char-tensor uses `mtoc_strcmp_char_tensor`, anything
+involving a string uses `mtoc_strcmp_string` (the char-array side
+gets bridged through `mtoc_string_from_literal(.data, .cols)`).
+Returns a real scalar (1.0 / 0.0).
+
+Numeric predicates `isnan(x)` / `isinf(x)` / `isfinite(x)` and the
+`logical(x)` coercion are inlined as expression-level emits — no
+runtime helper, just a `(double)isnan(x)` / `(x != 0.0 ? 1.0 : 0.0)`
+shape. They follow numbl's logical-as-double convention so the
+result threads cleanly into arithmetic / `assert` / `disp`.
 
 `length(s)` and `numel(s)` use their `lowerExpr` hook to handle
 non-tensor arguments. When the argument is a string, both fold to a

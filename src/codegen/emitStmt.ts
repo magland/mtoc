@@ -22,6 +22,7 @@
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
   cTypeFor,
+  isCharArray,
   isCharScalar,
   isColVec,
   isMultiElement,
@@ -441,17 +442,42 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
     }
 
     case "Assert": {
-      // `assert(cond)` lowers to a runtime helper that prints
-      // "Assertion failed" to stderr and exit(1)s when the scalar
-      // `cond` is zero or NaN. On success the helper is a no-op so
-      // anything after this statement runs normally — unlike Error,
-      // we still need to free dead-after vars on the success path.
-      useRuntimeByName(state, "mtoc_assert_double");
-      pushStmt(
-        state,
-        level,
-        `mtoc_assert_double(${emitExpr(state, s.cond, 0)});`
-      );
+      // `assert(cond)` and `assert(cond, msg)` lower to runtime
+      // helpers that print on stderr and exit(1) when `cond` is zero
+      // or NaN. On success the helper is a no-op so anything after
+      // this stmt runs normally — unlike Error, we still need to
+      // free dead-after vars on the success path. The 2-arg form
+      // routes to a sibling helper that takes an mtoc_string_t and
+      // prints the user-supplied message instead of "Assertion
+      // failed".
+      if (s.msg === null) {
+        useRuntimeByName(state, "mtoc_assert_double");
+        pushStmt(
+          state,
+          level,
+          `mtoc_assert_double(${emitExpr(state, s.cond, 0)});`
+        );
+      } else {
+        const condC = emitExpr(state, s.cond, 0);
+        const msgTy = s.msg.ty;
+        if (isCharArray(msgTy)) {
+          useRuntimeByName(state, "mtoc_char_tensor_t");
+          useRuntimeByName(state, "mtoc_assert_double_msg_char");
+          pushStmt(
+            state,
+            level,
+            `mtoc_assert_double_msg_char(${condC}, ${emitExpr(state, s.msg, 0)});`
+          );
+        } else {
+          useRuntimeByName(state, "mtoc_string_t");
+          useRuntimeByName(state, "mtoc_assert_double_msg");
+          pushStmt(
+            state,
+            level,
+            `mtoc_assert_double_msg(${condC}, ${emitExpr(state, s.msg, 0)});`
+          );
+        }
+      }
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
       break;
     }

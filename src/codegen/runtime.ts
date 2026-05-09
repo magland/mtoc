@@ -252,4 +252,21 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   // dependencies — the only headers it pulls are <math.h> for
   // `isnan`, plus stdio/stdlib for the abort path.
   ["mtoc_assert_double", loadSnippet("assert_double.h")],
+  [
+    "mtoc_assert_double_msg",
+    loadSnippet("assert_double_msg.h", ["mtoc_string_t"]),
+  ],
+  [
+    "mtoc_assert_double_msg_char",
+    loadSnippet("assert_double_msg_char.h", ["mtoc_char_tensor_t"]),
+  ],
+  // String / char-array equality. Both helpers return a real scalar
+  // (1.0 / 0.0); the BuiltinSig dispatches between them based on the
+  // arg types and bridges char-array × string mixes via
+  // `mtoc_string_from_literal` over the char-tensor's data buffer.
+  ["mtoc_strcmp_string", loadSnippet("strcmp_string.h", ["mtoc_string_t"])],
+  [
+    "mtoc_strcmp_char_tensor",
+    loadSnippet("strcmp_char_tensor.h", ["mtoc_char_tensor_t"]),
+  ],
 ]);

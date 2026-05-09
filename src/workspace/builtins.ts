@@ -496,10 +496,9 @@ const BUILTINS: BuiltinSig[] = [
       );
     },
     lowerStmt: (ctx, args, span) => {
-      if (args.length !== 1) {
+      if (args.length !== 1 && args.length !== 2) {
         throw new UnsupportedConstruct(
-          `'assert' currently requires exactly one argument ` +
-            `(2-arg 'assert(cond, msg)' is not yet supported)`,
+          `'assert' takes 1 or 2 arguments (got ${args.length})`,
           span
         );
       }
@@ -511,7 +510,30 @@ const BUILTINS: BuiltinSig[] = [
           args[0].span
         );
       }
-      return { kind: "Assert", cond, span };
+      let msg: IRExpr | null = null;
+      if (args.length === 2) {
+        msg = ctx.lowerExpr(args[1]);
+        const isText = isString(msg.ty) || isCharArray(msg.ty);
+        if (!isText) {
+          throw new UnsupportedConstruct(
+            `'assert' message must be a string or char array ` +
+              `(got ${typeToString(msg.ty)})`,
+            args[1].span
+          );
+        }
+        const isStr = isString(msg.ty);
+        const allowedKinds = isStr
+          ? new Set(["Var", "StringLit"])
+          : new Set(["Var", "CharLit"]);
+        if (!allowedKinds.has(msg.kind)) {
+          throw new UnsupportedConstruct(
+            `'assert' message must be a literal or variable; ` +
+              `assign the value to a name first`,
+            args[1].span
+          );
+        }
+      }
+      return { kind: "Assert", cond, msg, span };
     },
   },
 
@@ -566,6 +588,116 @@ const BUILTINS: BuiltinSig[] = [
   libm("ceil", 1, "ceil", "unknown"),
   libm("round", 1, "round", "unknown"),
   libm("fix", 1, "trunc", "unknown"),
+
+  // ── String / char comparison ─────────────────────────────────────────
+  // `strcmp(a, b)` returns 1.0 if the two text values match
+  // byte-for-byte, 0.0 otherwise. Accepts (char-array, char-array),
+  // (string, string), or any mix of the two — both arms get
+  // normalized to a (data*, len) view inside their helper. Scalar
+  // chars (bare `char`) are still rejected today since the test
+  // corpus doesn't need them; numbl returns 0 for type-mismatched
+  // inputs (e.g. number vs string), but we'd rather raise a span at
+  // lowering than silently always-return-0.
+  {
+    name: "strcmp",
+    category: "expr",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => scalarDouble("nonnegative"),
+    emit: (args, argTys, state) => {
+      const aS = isString(argTys[0]);
+      const bS = isString(argTys[1]);
+      const aC = isCharArray(argTys[0]);
+      const bC = isCharArray(argTys[1]);
+      if (aS && bS) {
+        state.useRuntime("mtoc_strcmp_string");
+        return `mtoc_strcmp_string(${args[0]}, ${args[1]})`;
+      }
+      if (aC && bC) {
+        state.useRuntime("mtoc_strcmp_char_tensor");
+        return `mtoc_strcmp_char_tensor(${args[0]}, ${args[1]})`;
+      }
+      // Mixed char-array × string — promote the char-array view into
+      // the string helper's (data, len, owned=0) shape inline.
+      state.useRuntime("mtoc_strcmp_string");
+      const aExpr = aS
+        ? args[0]
+        : `mtoc_string_from_literal(${args[0]}.data, ${args[0]}.cols)`;
+      const bExpr = bS
+        ? args[1]
+        : `mtoc_string_from_literal(${args[1]}.data, ${args[1]}.cols)`;
+      if (!aS) state.useRuntime("mtoc_string_from_literal");
+      if (!bS) state.useRuntime("mtoc_string_from_literal");
+      return `mtoc_strcmp_string(${aExpr}, ${bExpr})`;
+    },
+    lowerExpr: (_ctx, args, span) => {
+      if (args.length !== 2) return null;
+      const a = args[0].ty;
+      const b = args[1].ty;
+      const okA = isString(a) || isCharArray(a);
+      const okB = isString(b) || isCharArray(b);
+      if (!okA || !okB) {
+        throw new UnsupportedConstruct(
+          `'strcmp' currently requires both arguments to be ` +
+            `char arrays or strings (got ${typeToString(a)} ` +
+            `and ${typeToString(b)})`,
+          span
+        );
+      }
+      return null;
+    },
+  },
+
+  // ── 1-arg numeric predicates — return 0.0/1.0 ────────────────────────
+  // `isnan` / `isinf` / `isfinite` map to C99 macros (in <math.h>)
+  // which return int; an explicit `(double)` cast makes the result
+  // type unambiguous at every call site. Real-only for now; numbl's
+  // complex semantics (true if EITHER lane satisfies the predicate
+  // for `isnan`/`isinf`, BOTH lanes for `isfinite`) needs a small
+  // runtime helper that we'll add when complex coverage matters.
+  // `logical(x)` is the numeric→logical coercion: nonzero → 1.0,
+  // else 0.0. Matches numbl's `toBool` (`x !== 0`), so NaN and ±Inf
+  // both round to 1.0 (NaN ≠ 0 is true in IEEE 754).
+  {
+    name: "isnan",
+    category: "expr",
+    params: scalarParams(1),
+    result: () => scalarDouble("nonnegative"),
+    emit: args => `((double)(isnan(${args[0]}) ? 1 : 0))`,
+  },
+  {
+    name: "isinf",
+    category: "expr",
+    params: scalarParams(1),
+    result: () => scalarDouble("nonnegative"),
+    emit: args => `((double)(isinf(${args[0]}) ? 1 : 0))`,
+  },
+  {
+    name: "isfinite",
+    category: "expr",
+    params: scalarParams(1),
+    result: () => scalarDouble("nonnegative"),
+    emit: args => `((double)(isfinite(${args[0]}) ? 1 : 0))`,
+  },
+  {
+    name: "logical",
+    category: "expr",
+    params: scalarParams(1),
+    result: () => scalarDouble("nonnegative"),
+    emit: args => `(((${args[0]}) != 0.0) ? 1.0 : 0.0)`,
+  },
 
   // ── 1-arg libm — real-or-complex propagating ─────────────────────────
   // For builtins with a complex sibling, the real-side domain check

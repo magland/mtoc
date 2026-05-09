@@ -129,6 +129,7 @@ export function forEachTopLevelExpr(s: IRStmt, fn: (e: IRExpr) => void): void {
       return;
     case "Assert":
       fn(s.cond);
+      if (s.msg !== null) fn(s.msg);
       return;
     case "If":
       fn(s.cond);

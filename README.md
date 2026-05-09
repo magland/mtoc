@@ -80,11 +80,14 @@ The subset is growing iteratively. Roughly:
   `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`,
   `cosh`, `tanh`, `floor`, `ceil`, `round`, `fix`, `rem`, `min`, `max`,
   `atan2`, `hypot`, `power`
-- Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`
+- Numeric predicates: `isnan`, `isinf`, `isfinite`, `logical` (all
+  scalar; return 0.0/1.0 to match numbl's logical-as-double convention)
+- Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`,
+  `strcmp` (char-array, string, or any mix; scalar 0/1 result)
   (full registry: [`src/workspace/builtins.ts`](src/workspace/builtins.ts))
-- Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`
-  (`assert` accepts a scalar real condition today — the 2-arg
-  `assert(cond, msg)` and tensor-condition forms are deferred)
+- Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`,
+  `assert(cond, msg)` (msg may be a string or char-array literal /
+  variable; tensor-condition form is deferred)
 - User-defined functions with 0, 1, or N≥2 scalar outputs (input may
   be scalar or tensor; outputs must be scalars today). One
   specialization per unique call-site argument-type tuple. The C ABI

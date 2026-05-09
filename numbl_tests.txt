@@ -12,8 +12,14 @@
 arithmetic/basic_ops.m
 arithmetic/fortran_exponent_literal.m
 arrays/end_range_debug_.m
+builtins/test_angle_nan.m
+builtins/test_block_comment_syntax.m
 builtins/test_realmin.m
 control_flow/break_continue.m
+control_flow/if_else.m
+control_flow/test_for_loop_var_value.m
 control_flow/while_loops.m
 functions/prototype_name_functions.m
 math/rounding.m
+math/test_mod_inf_large.m
+variables/assignment.m

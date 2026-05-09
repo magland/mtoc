@@ -276,16 +276,19 @@ export type IRStmt =
       span: Span;
     }
   | {
-      /** `assert(cond)` — aborts with "Assertion failed" on stderr if
-       *  `cond` evaluates to a falsy or NaN scalar; otherwise a no-op.
-       *  Statement-only (numbl's `assert` returns nothing on success
-       *  and throws on failure). Codegen emits a `mtoc_assert_double`
-       *  call that does the runtime check. Lowering today accepts a
-       *  scalar real argument; the multi-element tensor form (numbl
-       *  fails if any element is zero/NaN) and the 2-arg `assert(cond,
-       *  msg)` form are deferred. */
+      /** `assert(cond)` / `assert(cond, msg)` — aborts on stderr when
+       *  `cond` is a falsy or NaN scalar; otherwise a no-op. Statement-
+       *  only (numbl's `assert` returns nothing on success and throws
+       *  on failure). Codegen emits `mtoc_assert_double` (1-arg form,
+       *  prints "Assertion failed") or `mtoc_assert_double_msg`
+       *  (2-arg form, prints the user-supplied message). Lowering
+       *  today accepts a scalar real `cond`; the multi-element tensor
+       *  form is deferred. The optional `msg` must be a string `Var`
+       *  or `StringLit` (mirroring the `error` rule — nested string
+       *  expressions have no name to be released through). */
       kind: "Assert";
       cond: IRExpr;
+      msg: IRExpr | null;
       span: Span;
     }
   | {

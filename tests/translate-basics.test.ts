@@ -317,17 +317,42 @@ describe("translate scalar example", () => {
     expect(c).toMatch(/static void mtoc_assert_double\(double cond\)/);
   });
 
-  it("assert rejects a 2-arg form with a clear message", () => {
+  it("assert(cond, msg) lowers to mtoc_assert_double_msg", () => {
+    const c = translate('assert(1 == 1, "boom");\n');
+    expect(c).toMatch(
+      /mtoc_assert_double_msg\(1\.0 == 1\.0, mtoc_string_from_literal\("boom", 4\)\);/
+    );
+  });
+
+  it("assert(cond, msg) accepts a string variable", () => {
+    const c = translate('m = "boom";\nassert(0, m);\n');
+    expect(c).toContain("mtoc_assert_double_msg(0.0, m);");
+  });
+
+  it("assert rejects a non-string msg with a clear message", () => {
     let err: unknown;
     try {
-      translate('assert(1 == 1, "msg");\n');
+      translate("assert(0, 42);\n");
     } catch (e) {
       err = e;
     }
     expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
+    const e = err as { name: string; message: string };
     expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.message).toMatch(/2-arg/);
+    expect(e.message).toMatch(/message must be a string/);
+  });
+
+  it("assert rejects a nested-string msg expression", () => {
+    let err: unknown;
+    try {
+      translate('a = "x";\nb = "y";\nassert(0, a + b);\n');
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.message).toMatch(/literal or variable/);
   });
 
   it("assert rejects a non-scalar-real argument with a clear message", () => {

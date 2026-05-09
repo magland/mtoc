@@ -91,6 +91,37 @@ describe("strings", () => {
     );
   });
 
+  it("strcmp(string, string) emits the string helper", () => {
+    const c = translate('a = "x";\nb = "y";\ndisp(strcmp(a, b));\n');
+    expect(c).toContain("mtoc_strcmp_string(a, b)");
+    expect(c).toContain("static double mtoc_strcmp_string");
+  });
+
+  it("strcmp(char_array, char_array) emits the char-tensor helper", () => {
+    const c = translate("a = 'hello';\ndisp(strcmp(a, 'hello'));\n");
+    expect(c).toContain("mtoc_strcmp_char_tensor(a, ");
+    expect(c).toContain("static double mtoc_strcmp_char_tensor");
+  });
+
+  it("strcmp on mixed char-array × string bridges via from_literal", () => {
+    const c = translate("a = 'hi';\ndisp(strcmp(a, \"hi\"));\n");
+    expect(c).toContain("mtoc_strcmp_string(");
+    expect(c).toMatch(/mtoc_string_from_literal\(a\.data, a\.cols\)/);
+  });
+
+  it("strcmp rejects non-text arguments with a clear message", () => {
+    let err: unknown;
+    try {
+      translate("disp(strcmp(1, 2));\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.message).toMatch(/char arrays or strings/);
+  });
+
   it("disp of a string concat expression is rejected with a clear message", () => {
     let err: unknown;
     try {
