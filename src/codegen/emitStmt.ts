@@ -46,6 +46,7 @@ import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 import { emitScopeExitFrees } from "./emitOwned.js";
 import { analyzeExpr, emitExpr, wrapOwnedArgCopy } from "./emitExpr.js";
 import { formatNumLit } from "./emitFormat.js";
+import { renderStmt, sanitizeForBlockComment } from "./irRender.js";
 
 /**
  * Statement-level companion to `analyzeExpr`. Visits every stmt in the
@@ -131,6 +132,15 @@ function emitEarlyFrees(
 }
 
 export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
+  // Drop a numbl-style comment above each emitted statement so a
+  // reader of the generated C can follow the original program shape
+  // without bouncing back to the `.m` source. `renderStmt` returns
+  // null for kinds where the C line is already identical to the numbl
+  // form (`break`, `continue`).
+  const srcLine = renderStmt(s);
+  if (srcLine !== null) {
+    pushStmt(state, level, `/* ${sanitizeForBlockComment(srcLine)} */`);
+  }
   switch (s.kind) {
     case "Assign": {
       // `state.needMath` and runtime activations were set up by the

@@ -150,6 +150,11 @@ modules:
 - `ownedKinds.ts` — registry mapping each owned MType (string, char
   array, real-or-complex tensor) to its C helper names. New owned
   kinds plug in by adding one entry.
+- `irRender.ts` — `renderStmt` / `renderExpr`: best-effort numbl
+  pretty-printer for IR nodes. `emitStmt` drops the rendered string
+  as a `/* ... */` comment above each emitted statement so a reader
+  of the generated C can follow the original program shape without
+  going back to the `.m` source.
 
 `emit.ts` walks an `IRProgram` and produces a single C source string.
 Responsibilities:

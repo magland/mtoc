@@ -107,7 +107,7 @@ describe("early tensor frees", () => {
     // The free is right after `r = mtoc_sum(v);`, BEFORE the
     // remaining if-block.
     expect(c).toMatch(
-      /r = mtoc_sum\(v\);\s*\n\s*mtoc_tensor_free\(&v\);\s*\n\s*if/
+      /r = mtoc_sum\(v\);\s*\n\s*mtoc_tensor_free\(&v\);\s*\n(\s*\/\*[^\n]*\*\/\s*\n)?\s*if/
     );
   });
 
