@@ -28,6 +28,7 @@ import {
   typeToString,
 } from "./types.js";
 import { Lowerer, assertNotMtocReserved, cNameFor } from "./lower.js";
+import { lowerIndexLoad } from "./lowerIndexLoad.js";
 
 /** Top-level dispatcher for `name(args)` syntax. Splits out the
  *  reserved `disp` (only valid as a stmt) and routes user functions
@@ -36,6 +37,12 @@ export function lowerFuncCall(
   this: Lowerer,
   e: Extract<Expr, { type: "FuncCall" }>
 ): IRExpr {
+  // MATLAB rule: a name that resolves to an in-scope variable shadows
+  // any function with the same name. The parser produces `FuncCall`
+  // for both `f(x)` (call) and `v(i)` (index); we disambiguate here.
+  if (this.envLookup(e.name) !== undefined) {
+    return lowerIndexLoad.call(this, e.name, e.args, e.span);
+  }
   const target = this.shared.workspace.resolve(e.name);
   if (!target) {
     throw new UnsupportedConstruct(

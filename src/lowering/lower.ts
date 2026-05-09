@@ -185,6 +185,19 @@ export class Lowerer {
    *  bindings across arms / iterations, which Phase 1 doesn't attempt. */
   controlDepth = 0;
 
+  /** Stack of contexts for resolving the `end` keyword. Each entry
+   *  describes the indexing context an `end` token would refer to:
+   *  the base variable's C name + type plus the axis (`row`, `col`,
+   *  or `linear`). Pushed by `lowerIndexLoad` around each index slot
+   *  it lowers; consumed by the `EndKeyword` arm of `lowerExpr`.
+   *  Outside an index, the stack is empty and an `end` use raises
+   *  an `UnsupportedConstruct` with a span. */
+  endStack: Array<{
+    baseCName: string;
+    baseTy: MType;
+    axis: "row" | "col" | "linear";
+  }> = [];
+
   /** Function-specialization cache + workspace handle. Helpers in
    *  sibling files reach through this for user-call dispatch. */
   readonly shared: SharedSpecState;
@@ -697,6 +710,29 @@ export class Lowerer {
           sign: "unknown",
         };
         return { kind: "CharLit", value: inner, ty, span: e.span };
+      }
+
+      case "EndKeyword": {
+        // `end` is only meaningful inside an index expression. The
+        // `endStack` is pushed by `lowerIndexLoad` for each index
+        // slot it lowers; the top describes which axis of which base
+        // this `end` refers to. Outside an index the stack is empty
+        // and we reject with a span.
+        if (this.endStack.length === 0) {
+          throw new UnsupportedConstruct(
+            `'end' is only valid inside an index expression`,
+            e.span
+          );
+        }
+        const top = this.endStack[this.endStack.length - 1];
+        return {
+          kind: "EndRef",
+          baseCName: top.baseCName,
+          baseTy: top.baseTy,
+          axis: top.axis,
+          ty: scalarDouble("nonnegative"),
+          span: e.span,
+        };
       }
 
       case "ImagUnit": {

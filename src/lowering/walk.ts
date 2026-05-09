@@ -40,6 +40,7 @@ export function forEachSubExpr(
     case "StringLit":
     case "CharLit":
     case "Var":
+    case "EndRef":
       return;
     case "Binary":
       forEachSubExpr(e.left, visit);
@@ -54,6 +55,13 @@ export function forEachSubExpr(
     case "TensorLit":
       for (const row of e.elements)
         for (const cell of row) forEachSubExpr(cell, visit);
+      return;
+    case "IndexLoad":
+      // The base is modeled as a real `Var` IRExpr so liveness /
+      // owned-arg-copy / validators see the read naturally; visit it
+      // first to keep DFS order stable.
+      forEachSubExpr(e.base, visit);
+      for (const idx of e.indices) forEachSubExpr(idx, visit);
       return;
   }
 }

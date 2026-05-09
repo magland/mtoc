@@ -103,6 +103,53 @@ export type IRExpr =
       args: IRExpr[];
       ty: MType;
       span: Span;
+    }
+  | {
+      /** Scalar read of an indexed multi-element value: `v(i)`,
+       *  `M(i, j)`, or any expression where the indexed value
+       *  receives one or two scalar indices. The result type is
+       *  always a scalar of the base's element kind / complexity.
+       *  Range and colon indices (which produce a tensor slice)
+       *  belong on a future `IndexSlice` variant — not in this MVP.
+       *
+       *  `base` is the IRExpr.Var read of the variable being indexed
+       *  (modeling "read the tensor handle, then index into its
+       *  buffer"). Storing it as a real Var node lets every existing
+       *  walker (liveness, owned-arg-copy, validators) see the read
+       *  without special-casing. `indices` is one or two scalar
+       *  IRExprs (1-indexed in MATLAB; codegen emits `-1` conversions
+       *  to reach C's 0-indexed buffers). The number of indices
+       *  selects between linear (one) and 2D (two) addressing, with
+       *  the same shape interpretation MATLAB uses. */
+      kind: "IndexLoad";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      indices: IRExpr[];
+      ty: MType;
+      span: Span;
+    }
+  | {
+      /** Reference to the `end` keyword inside an index expression.
+       *  Resolved at lowering time to the relevant axis size of the
+       *  enclosing index's base. The result is a nonneg long-valued
+       *  expression (rendered as `<base>.rows`, `<base>.cols`, or
+       *  `(<base>.rows * <base>.cols)`); the IR type is
+       *  `scalarDouble("nonnegative")` so it composes cleanly with
+       *  the rest of the numeric arithmetic.
+       *
+       *  Out-of-context uses (`end` outside an index) are rejected at
+       *  lowering with a span. The lowerer maintains a per-scope
+       *  `endStack` and pops/pushes around each index slot. */
+      kind: "EndRef";
+      baseCName: string;
+      baseTy: MType;
+      /** Which axis of the base this `end` refers to:
+       *    - "row"    : 2D index, slot 0  → `<base>.rows`
+       *    - "col"    : 2D index, slot 1  → `<base>.cols`
+       *    - "linear" : 1D index over a multi-element tensor →
+       *                 `<base>.rows * <base>.cols`. */
+      axis: "row" | "col" | "linear";
+      ty: MType;
+      span: Span;
     };
 
 /** Discriminator on a `Call`'s C-side target. Codegen consumes this

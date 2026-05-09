@@ -45,6 +45,14 @@ workaround or a roadmap note.
   (likely calling into a BLAS-shaped helper).
 - **No tensor comparisons.** `a == b` requires both to be scalars. Elementwise
   comparison on tensors will land alongside auto-materialization.
+- **Indexing is scalar-read only today.** `v(i)` / `M(i, j)` / `v(end)` /
+  `M(end, end)` are supported for any multi-element tensor (real,
+  complex, or char), with `end` resolving to the relevant axis size
+  (numel for one-index, rows / cols for two-index). Range and colon
+  indices (`v(2:5)`, `v(:)`, `M(:, j)`) and indexed writes
+  (`v(i) = x`, `v(2:5) = w`) are not yet supported and raise
+  `UnsupportedConstruct` with a span. Indexing into a scalar
+  variable (`x(1)` returning `x`) is also deferred.
 - **Tensor-valued function returns aren't supported yet.** Functions accept
   tensor arguments (real or complex), but the return type must be a scalar
   (real or complex). Returning a tensor needs an sret-style codegen path

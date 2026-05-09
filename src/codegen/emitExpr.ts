@@ -228,6 +228,62 @@ export function emitExpr(
       );
     }
 
+    case "EndRef": {
+      // Resolve `end` to the relevant axis size of the base. All three
+      // forms render to a `long`-valued C expression that auto-promotes
+      // to `double` in arithmetic; the indexing site re-casts to long
+      // before forming the bracket index.
+      switch (e.axis) {
+        case "row":
+          return `${e.baseCName}.rows`;
+        case "col":
+          return `${e.baseCName}.cols`;
+        case "linear":
+          return `(${e.baseCName}.rows * ${e.baseCName}.cols)`;
+      }
+      // Exhaustiveness check.
+      throw new Error(
+        `codegen internal: unsupported EndRef axis ${(e as { axis: string }).axis}`
+      );
+    }
+
+    case "IndexLoad": {
+      // Compute the linear C buffer offset from the (1-indexed) MATLAB
+      // indices. Each index is a scalar IR expression that emitExpr
+      // renders as a `double`-valued C string; we cast to `long` and
+      // subtract 1 to reach the C 0-indexed slot. For 2D, codegen
+      // emits the column-major formula `i + j * rows` using the base's
+      // runtime `.rows` field.
+      //
+      // The base is always rendered as the bare cName here — the per-
+      // element iter rendering for multi-element Vars (`v.real[<iter>]`)
+      // is wrong for indexing; we want the struct itself so we can
+      // pick the right slot. So we look at `e.base.cName` directly
+      // rather than recursing through `emitExpr` on the base.
+      const baseCName = e.base.cName;
+      const baseTy = e.base.ty;
+      const offset =
+        e.indices.length === 1
+          ? `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L`
+          : `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L + ` +
+            `((long)(${emitExpr(state, e.indices[1], 0)}) - 1L) * ` +
+            `${baseCName}.rows`;
+      // Char tensor: read `.data[offset]` — yields a scalar `char`.
+      if (isNumeric(baseTy) && baseTy.elem === "char") {
+        return `${baseCName}.data[${offset}]`;
+      }
+      // Double tensor: complex composes `.real + .imag*I` into one
+      // `double _Complex` value so the result can flow into either
+      // real- or complex-typed contexts uniformly.
+      if (isNumeric(baseTy) && baseTy.isComplex) {
+        return (
+          `(${baseCName}.real[${offset}] + ` +
+          `${baseCName}.imag[${offset}] * I)`
+        );
+      }
+      return `${baseCName}.real[${offset}]`;
+    }
+
     case "Unary": {
       // Complex `~z` (Not) is the toBool negation: 1 iff re==0 && im==0.
       if (e.op === "Not" && isNumeric(e.operand.ty) && e.operand.ty.isComplex) {
