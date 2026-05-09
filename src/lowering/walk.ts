@@ -150,6 +150,15 @@ export function forEachTopLevelExpr(s: IRStmt, fn: (e: IRExpr) => void): void {
       for (const idx of s.indices) fn(idx);
       fn(s.rhs);
       return;
+    case "IndexSliceStore":
+      fn(s.base);
+      if (s.index.kind === "Range") {
+        fn(s.index.start);
+        fn(s.index.step);
+        fn(s.index.end);
+      }
+      fn(s.rhs);
+      return;
     case "Break":
     case "Continue":
     case "ReturnFromFunction":
@@ -185,6 +194,7 @@ export function forEachStmtInTree(
       case "Error":
       case "MultiAssignCall":
       case "IndexStore":
+      case "IndexSliceStore":
       case "Break":
       case "Continue":
       case "ReturnFromFunction":

@@ -28,6 +28,7 @@ import {
   isNumeric,
   isOwned,
   isRowVec,
+  isScalar,
   isScalarComplex,
   isScalarReal,
   typeToString,
@@ -215,6 +216,26 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
 
     case "ExprStmt": {
       pushStmt(state, level, `(void)(${emitExpr(state, s.expr, 0)});`);
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
+    }
+
+    case "IndexSliceStore": {
+      // `<base>(slice) = rhs;` — write multiple slots of the base's
+      // heap buffer in place. Lowering already validated:
+      //   - base is a multi-element double tensor (real or complex)
+      //   - the slice is a single-slot Range (literal step) or Colon
+      //   - the RHS is numeric; a complex RHS into a real base has
+      //     been rejected, so the only widening case is real RHS into
+      //     a complex base (zeros .imag per slot).
+      //
+      // The codegen runs a per-slot loop. For a tensor RHS, slot k
+      // reads `rhs.real[k]` (and `.imag[k]` when complex); a runtime
+      // count check protects against buffer overruns. For a scalar
+      // RHS, the value is broadcast — same expression evaluated per
+      // slot (or stashed into a temp if it's complex / could
+      // double-evaluate side effects).
+      emitIndexSliceStore(state, level, s);
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
       break;
     }
@@ -1029,4 +1050,192 @@ function emitIndexSliceAssign(
   pushStmt(state, level + 1, `}`);
   pushStmt(state, level + 1, `mtoc_tensor_assign(&${target}, _mtoc_t);`);
   pushStmt(state, level, `}`);
+}
+
+/** Emit a range/colon-indexed write: `<base>(slice) = rhs;`. The
+ *  base buffer is mutated in place; one slot per loop iteration is
+ *  overwritten. For a tensor RHS we emit a runtime count check so a
+ *  size mismatch fails loudly instead of silently scribbling past
+ *  the end of either buffer.
+ *
+ *  Layout (real base, tensor RHS):
+ *    {
+ *      long _mtoc_n   = <count(slice)>;
+ *      long _mtoc_rhs_n = rhs.rows * rhs.cols;
+ *      if (_mtoc_n != _mtoc_rhs_n) abort(...);
+ *      for (long _mtoc_k = 0; _mtoc_k < _mtoc_n; _mtoc_k++) {
+ *        long _mtoc_dst = <dst-offset for k>;
+ *        base.real[_mtoc_dst] = rhs.real[_mtoc_k];
+ *      }
+ *    }
+ *
+ *  Complex bases write both .real and .imag; a real RHS into a
+ *  complex base zeros .imag per slot. A scalar RHS broadcasts.
+ *  See the lowering pass for type-rule pre-checks. */
+function emitIndexSliceStore(
+  state: EmitState,
+  level: number,
+  s: Extract<IRStmt, { kind: "IndexSliceStore" }>
+): void {
+  const baseCName = s.base.cName;
+  const baseTy = s.base.ty as NumericType;
+  const baseIsComplex = baseTy.isComplex;
+  const rhsIsScalar = isNumeric(s.rhs.ty) && isScalar(s.rhs.ty);
+  const rhsIsComplex = isNumeric(s.rhs.ty) && s.rhs.ty.isComplex;
+
+  pushStmt(state, level, `{`);
+
+  // Slice count + per-iteration dst offset.
+  let dstOffsetFor: (kVar: string) => string;
+  if (s.index.kind === "Colon") {
+    pushStmt(
+      state,
+      level + 1,
+      `long _mtoc_n = ${baseCName}.rows * ${baseCName}.cols;`
+    );
+    dstOffsetFor = k => k;
+  } else {
+    if (s.index.step.kind !== "NumLit") {
+      throw new Error(
+        "codegen internal: IndexSliceStore range step must be a NumLit; " +
+          "should have been caught at lowering"
+      );
+    }
+    const startStr = emitExpr(state, s.index.start, 0);
+    const endStr = emitExpr(state, s.index.end, 0);
+    const stepStr = formatNumLit(s.index.step.value);
+    pushStmt(state, level + 1, `double _mtoc_start = ${startStr};`);
+    pushStmt(state, level + 1, `double _mtoc_end = ${endStr};`);
+    pushStmt(
+      state,
+      level + 1,
+      `long _mtoc_n = (long)floor((_mtoc_end - _mtoc_start) / ${stepStr}) + 1;`
+    );
+    pushStmt(state, level + 1, `if (_mtoc_n < 0) _mtoc_n = 0;`);
+    dstOffsetFor = k => `(long)(_mtoc_start + ${stepStr} * (double)${k}) - 1L`;
+    state.needMath.value = true;
+  }
+
+  // Tensor RHS: runtime count check + per-slot read from rhs's buffer.
+  // Scalar RHS: emit the rhs expression once and broadcast (the
+  // expression is constant across iterations; `(double _Complex)`
+  // stashing handles complex without double-evaluating).
+  if (rhsIsScalar) {
+    const rhsExpr = emitExpr(state, s.rhs, 0);
+    if (baseIsComplex && rhsIsComplex) {
+      // Complex scalar RHS into complex base: stash to avoid
+      // re-evaluating creal/cimag every slot.
+      pushStmt(state, level + 1, `double _Complex _mtoc_rhs = ${rhsExpr};`);
+      pushStmt(state, level + 1, `double _mtoc_rhs_re = creal(_mtoc_rhs);`);
+      pushStmt(state, level + 1, `double _mtoc_rhs_im = cimag(_mtoc_rhs);`);
+      pushStmt(
+        state,
+        level + 1,
+        `for (long _mtoc_k = 0; _mtoc_k < _mtoc_n; _mtoc_k++) {`
+      );
+      pushStmt(
+        state,
+        level + 2,
+        `long _mtoc_dst = ${dstOffsetFor("_mtoc_k")};`
+      );
+      pushStmt(
+        state,
+        level + 2,
+        `${baseCName}.real[_mtoc_dst] = _mtoc_rhs_re;`
+      );
+      pushStmt(
+        state,
+        level + 2,
+        `${baseCName}.imag[_mtoc_dst] = _mtoc_rhs_im;`
+      );
+      pushStmt(state, level + 1, `}`);
+    } else {
+      // Real scalar RHS — same value broadcast. The `rhsExpr` is
+      // evaluated once into a temp so a Call-bearing rhs doesn't
+      // re-run per slot.
+      pushStmt(state, level + 1, `double _mtoc_rhs = ${rhsExpr};`);
+      pushStmt(
+        state,
+        level + 1,
+        `for (long _mtoc_k = 0; _mtoc_k < _mtoc_n; _mtoc_k++) {`
+      );
+      pushStmt(
+        state,
+        level + 2,
+        `long _mtoc_dst = ${dstOffsetFor("_mtoc_k")};`
+      );
+      pushStmt(state, level + 2, `${baseCName}.real[_mtoc_dst] = _mtoc_rhs;`);
+      if (baseIsComplex) {
+        pushStmt(state, level + 2, `${baseCName}.imag[_mtoc_dst] = 0.0;`);
+      }
+      pushStmt(state, level + 1, `}`);
+    }
+    pushStmt(state, level, `}`);
+    return;
+  }
+
+  // Tensor RHS — must already be a Var (lowering doesn't accept a
+  // bare TensorLit / IndexSlice in this position; the validator's
+  // rejectNestedOwnedExpr ensures only a Var or scalar reaches us).
+  if (s.rhs.kind !== "Var") {
+    throw new Error(
+      `codegen internal: IndexSliceStore RHS must be a scalar or a Var ` +
+        `(got ${s.rhs.kind}); should have been caught at lowering / ` +
+        `validateIR`
+    );
+  }
+  const rhsCName = s.rhs.cName;
+  // Runtime count check — guards against buffer overruns. The
+  // diagnostic message matches the style of mtoc_check_shape.
+  pushStmt(
+    state,
+    level + 1,
+    `long _mtoc_rhs_n = ${rhsCName}.rows * ${rhsCName}.cols;`
+  );
+  pushStmt(state, level + 1, `if (_mtoc_n != _mtoc_rhs_n) {`);
+  pushStmt(
+    state,
+    level + 2,
+    `fprintf(stderr, "mtoc: range-write count mismatch: lhs slice has %ld elements, rhs has %ld\\n", _mtoc_n, _mtoc_rhs_n);`
+  );
+  pushStmt(state, level + 2, `abort();`);
+  pushStmt(state, level + 1, `}`);
+  pushStmt(
+    state,
+    level + 1,
+    `for (long _mtoc_k = 0; _mtoc_k < _mtoc_n; _mtoc_k++) {`
+  );
+  pushStmt(state, level + 2, `long _mtoc_dst = ${dstOffsetFor("_mtoc_k")};`);
+  if (baseIsComplex && rhsIsComplex) {
+    pushStmt(
+      state,
+      level + 2,
+      `${baseCName}.real[_mtoc_dst] = ${rhsCName}.real[_mtoc_k];`
+    );
+    pushStmt(
+      state,
+      level + 2,
+      `${baseCName}.imag[_mtoc_dst] = ${rhsCName}.imag[_mtoc_k];`
+    );
+  } else if (baseIsComplex) {
+    // Real tensor RHS into complex base — write real, zero imag.
+    pushStmt(
+      state,
+      level + 2,
+      `${baseCName}.real[_mtoc_dst] = ${rhsCName}.real[_mtoc_k];`
+    );
+    pushStmt(state, level + 2, `${baseCName}.imag[_mtoc_dst] = 0.0;`);
+  } else {
+    pushStmt(
+      state,
+      level + 2,
+      `${baseCName}.real[_mtoc_dst] = ${rhsCName}.real[_mtoc_k];`
+    );
+  }
+  pushStmt(state, level + 1, `}`);
+  pushStmt(state, level, `}`);
+  // The fprintf + abort path uses <stdio.h> (always pulled in) and
+  // <stdlib.h> (transitively pulled in by every tensor-bearing
+  // program through the alloc helper, which any IndexSliceStore
+  // base must have triggered). No extra header activation needed.
 }

@@ -83,13 +83,14 @@ export function lowerIndexStore(
       span
     );
   }
-  // Reject range / colon slots — only scalar writes are supported in
-  // this commit. The "v(2:5) = w" path arrives later.
+  // Range/colon writes are dispatched to lowerIndexSliceStore by the
+  // caller (see lower.ts). If we ever reach here with a slice slot,
+  // the dispatcher logic is wrong — surface it as an internal error.
   for (const idx of lvalue.indices) {
     if (idx.type === "Range" || idx.type === "Colon") {
       throw new UnsupportedConstruct(
-        `range/colon indexed writes (e.g. \`v(2:5) = w\`) are not yet ` +
-          `supported`,
+        `internal: lowerIndexStore received a range/colon slot; ` +
+          `should have been routed to lowerIndexSliceStore`,
         idx.span
       );
     }

@@ -152,7 +152,8 @@ function touchStmt(
     case "Disp":
     case "Error":
     case "MultiAssignCall":
-    case "IndexStore": {
+    case "IndexStore":
+    case "IndexSliceStore": {
       const out = new Set(futureAfter);
       unionInto(out, topLevelOwnedUses(s));
       unionInto(out, topLevelOwnedDefs(s));

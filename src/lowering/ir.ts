@@ -220,6 +220,28 @@ export type IRStmt =
       span: Span;
     }
   | {
+      /** In-place range / colon write into a multi-element tensor:
+       *  `v(a:b) = w`, `v(:) = w`, `v(:) = scalar`. The base's heap
+       *  buffer is mutated in place (slots covered by the range are
+       *  overwritten). Today only single-slot range/colon writes are
+       *  supported, on real-or-complex double tensors.
+       *
+       *  RHS shapes:
+       *    - tensor RHS: a count match is enforced at runtime
+       *      (numel(rhs) must equal the slice's element count).
+       *    - scalar RHS: broadcast — same scalar written to every
+       *      slot in the slice.
+       *
+       *  Type rules mirror IndexStore: real RHS into a complex base
+       *  zeros the imag side per slot; complex RHS into a real base
+       *  is rejected at lowering. */
+      kind: "IndexSliceStore";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      index: IndexSliceArg;
+      rhs: IRExpr;
+      span: Span;
+    }
+  | {
       /** In-place scalar write at an index of a multi-element tensor:
        *  `v(i) = x`, `M(i, j) = x`. The base's heap allocation is
        *  reused — only one slot is mutated — so this is NOT an

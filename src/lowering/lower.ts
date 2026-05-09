@@ -58,6 +58,7 @@ import { lowerBinary } from "./lowerBinary.js";
 import { lowerUnary } from "./lowerUnary.js";
 import { lowerFuncCall, lowerMultiAssignCall } from "./lowerFuncCall.js";
 import { lowerIndexStore } from "./lowerIndexStore.js";
+import { lowerIndexSliceStore } from "./lowerIndexSliceStore.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
 import {
   forEachStmtInTree,
@@ -515,6 +516,13 @@ export class Lowerer {
             `assignment to a ${s.lvalue.type} lvalue is not yet supported`,
             s.span
           );
+        }
+        // Range/colon slot routes to the slice-write path; otherwise
+        // it's a scalar IndexStore.
+        const isSliceArg = (a: Expr): boolean =>
+          a.type === "Range" || a.type === "Colon";
+        if (s.lvalue.indices.some(isSliceArg)) {
+          return lowerIndexSliceStore.call(this, s.lvalue, s.expr, s.span);
         }
         return lowerIndexStore.call(this, s.lvalue, s.expr, s.span);
       }

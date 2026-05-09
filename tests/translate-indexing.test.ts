@@ -394,7 +394,11 @@ describe("indexing — scalar writes", () => {
     expect(e.message).toMatch(/char tensor/i);
   });
 
-  it("rejects a range indexed write with an UnsupportedConstruct (deferred)", () => {
+  it("rejects a TensorLit RHS in a range write (must be Var or scalar)", () => {
+    // Range writes with a Var RHS or a scalar RHS work; the user
+    // has to materialize a TensorLit into a name first so the
+    // intermediate's lifetime is observable. Earlier this whole
+    // form was rejected outright; now only the TensorLit RHS is.
     let err: unknown;
     try {
       translate("v = [1 2 3 4];\nv(2:3) = [99 88];\n");
@@ -405,7 +409,7 @@ describe("indexing — scalar writes", () => {
     const e = err as { name: string; message: string; span: unknown };
     expect(e.name).toBe("UnsupportedConstruct");
     expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/range\/colon indexed writes/i);
+    expect(e.message).toMatch(/named tensor variable/i);
   });
 
   it("rejects an indexed write into a scalar variable", () => {
@@ -419,5 +423,119 @@ describe("indexing — scalar writes", () => {
     const e = err as { name: string; message: string; span: unknown };
     expect(e.name).toBe("UnsupportedConstruct");
     expect(e.span).toBeTruthy();
+  });
+});
+
+describe("indexing — range and colon writes", () => {
+  it("emits a per-slot loop and runtime count check for v(a:b) = w", () => {
+    const c = translate(
+      "v = [1 2 3 4 5];\nw = [10 20];\nv(2:3) = w;\ndisp(v);\n"
+    );
+    // The codegen emits the count formula + a runtime check before
+    // the loop.
+    expect(c).toMatch(/long _mtoc_n = \(long\)floor\(/);
+    expect(c).toContain("long _mtoc_rhs_n = w.rows * w.cols;");
+    expect(c).toContain("if (_mtoc_n != _mtoc_rhs_n)");
+    expect(c).toContain("range-write count mismatch");
+    // Loop body writes into the base from rhs, with the dst offset
+    // from the range formula.
+    expect(c).toMatch(/v\.real\[_mtoc_dst\] = w\.real\[_mtoc_k\];/);
+  });
+
+  it("v(:) = w emits the column-flat copy without a range formula", () => {
+    const c = translate("v = [1 2 3];\nw = [9 8 7];\nv(:) = w;\ndisp(v);\n");
+    // Colon: count = base.rows * base.cols; dst offset is just k.
+    expect(c).toContain("long _mtoc_n = v.rows * v.cols;");
+    expect(c).toMatch(/long _mtoc_dst = _mtoc_k;/);
+    expect(c).toMatch(/v\.real\[_mtoc_dst\] = w\.real\[_mtoc_k\];/);
+  });
+
+  it("scalar RHS broadcasts via a stashed _mtoc_rhs", () => {
+    const c = translate("v = [1 2 3 4];\nv(2:3) = -1;\ndisp(v);\n");
+    // Stash + per-slot write of the same value.
+    expect(c).toMatch(/double _mtoc_rhs = -1\.0;/);
+    expect(c).toMatch(/v\.real\[_mtoc_dst\] = _mtoc_rhs;/);
+  });
+
+  it("real-tensor RHS into a complex base zeros the imag side per slot", () => {
+    const c = translate(
+      "z = [1+2i, 3+4i, 5+6i];\nw = [10 20];\nz(1:2) = w;\ndisp(z);\n"
+    );
+    expect(c).toMatch(/z\.real\[_mtoc_dst\] = w\.real\[_mtoc_k\];/);
+    expect(c).toMatch(/z\.imag\[_mtoc_dst\] = 0\.0;/);
+  });
+
+  it("complex-tensor RHS into a complex base copies both halves", () => {
+    const c = translate(
+      "z = [1+2i, 3+4i];\nw = [7+8i, 9+10i];\nz(:) = w;\ndisp(z);\n"
+    );
+    expect(c).toMatch(/z\.real\[_mtoc_dst\] = w\.real\[_mtoc_k\];/);
+    expect(c).toMatch(/z\.imag\[_mtoc_dst\] = w\.imag\[_mtoc_k\];/);
+  });
+
+  it("complex scalar broadcast stashes both halves once", () => {
+    const c = translate("z = [1+2i, 3+4i];\nz(:) = 1+1i;\ndisp(z);\n");
+    expect(c).toMatch(/double _Complex _mtoc_rhs = /);
+    expect(c).toMatch(/double _mtoc_rhs_re = creal\(_mtoc_rhs\);/);
+    expect(c).toMatch(/double _mtoc_rhs_im = cimag\(_mtoc_rhs\);/);
+    expect(c).toMatch(/z\.real\[_mtoc_dst\] = _mtoc_rhs_re;/);
+    expect(c).toMatch(/z\.imag\[_mtoc_dst\] = _mtoc_rhs_im;/);
+  });
+
+  it("rejects a non-Var tensor RHS in a range write", () => {
+    // The user must materialize a TensorLit RHS into a name first.
+    let err: unknown;
+    try {
+      translate("v = [1 2 3 4];\nv(2:3) = [99 98];\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/named tensor variable/i);
+  });
+
+  it("rejects a complex RHS into a real base", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3 4];\nw = [1+2i, 3+4i];\nv(2:3) = w;\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("TypeError");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/imaginary/i);
+  });
+
+  it("rejects char-tensor range writes", () => {
+    let err: unknown;
+    try {
+      translate("s = 'abc';\nw = [99 98];\ns(1:2) = w;\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/char tensor/i);
+  });
+
+  it("rejects a non-literal step in a range write", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3 4 5];\nw = [99 98];\ns = 2;\nv(1:s:5) = w;\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/numeric literal/i);
   });
 });
