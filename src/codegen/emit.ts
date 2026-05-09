@@ -37,6 +37,12 @@ import {
   topLevelOwnedUses,
   type FutureTouchMap,
 } from "./liveness.js";
+import {
+  findInExpr,
+  forEachStmtInTree,
+  forEachSubExpr,
+  forEachTopLevelExpr,
+} from "../lowering/walk.js";
 
 // Note: C-name mangling lives in lower.ts (`cNameFor`). Every IR.Var,
 // IR.Assign, IR.For, IR.ReturnFromFunction and IRFunction param /
@@ -615,113 +621,51 @@ function pushStmt(state: EmitState, level: number, s: string): void {
  * helpers do.
  */
 function analyzeExpr(state: EmitState, e: IRExpr): void {
-  // Any expression whose static type is complex forces <complex.h>:
-  // its rendering touches `I`, `creal`, `cimag`, or a `double _Complex`
-  // declaration somewhere downstream. Setting it on the way down keeps
-  // the header activation centralized.
-  if (isNumeric(e.ty) && e.ty.isComplex) {
-    state.needComplex.value = true;
-  }
-  switch (e.kind) {
-    case "NumLit":
-      // INFINITY / NAN macros come from <math.h>.
-      if (!Number.isFinite(e.value)) state.needMath.value = true;
-      return;
-    case "StringLit":
-      // Renders to `mtoc_string_from_literal(...)` — no extra
-      // standard-library header beyond what the runtime snippet
-      // itself pulls in. The snippet activation happens at emit-time
-      // when the literal renders.
-      return;
-    case "ImagLit":
-      // The `I` macro and `double _Complex` type both come from
-      // <complex.h>; the type-driven flag above handles activation.
-      if (!Number.isFinite(e.value)) state.needMath.value = true;
-      return;
-    case "Var":
-      return;
-    case "TensorLit":
-      for (const row of e.elements) for (const c of row) analyzeExpr(state, c);
-      return;
-    case "Call": {
-      // Every builtin we currently emit lives in <math.h> (libm + the
-      // mtoc runtime helpers all `#include <math.h>` themselves), so
-      // any Call forces <math.h>. Runtime-helper activation happens
-      // inside `BuiltinSig.emit` when the call renders — see emitExpr's
-      // Call case. We don't pre-walk for activation here because emit
-      // and analyze share the same traversal order, so the resulting
-      // helper-list ordering matches.
-      state.needMath.value = true;
-      for (const a of e.args) analyzeExpr(state, a);
+  // Per-node analysis: runs `forEachSubExpr` so the per-node
+  // recursion stays in one place. Each sub-expression flips the
+  // header flags it forces, regardless of nesting depth.
+  //   - Any complex-typed node forces <complex.h> (its rendering
+  //     touches `I` / `creal` / `cimag` / `double _Complex`).
+  //   - Non-finite NumLit / ImagLit forces <math.h> for INFINITY/NAN.
+  //   - Pow / ElemPow forces <math.h> (rendered as `pow(...)`).
+  //   - Any Call forces <math.h> (every builtin we currently emit
+  //     lives in <math.h>; runtime-helper activation happens inside
+  //     the closure when the call renders).
+  forEachSubExpr(e, sub => {
+    if (isNumeric(sub.ty) && sub.ty.isComplex) {
+      state.needComplex.value = true;
+    }
+    if (sub.kind === "NumLit" || sub.kind === "ImagLit") {
+      if (!Number.isFinite(sub.value)) state.needMath.value = true;
       return;
     }
-    case "Binary":
-      if (e.op === "Pow" || e.op === "ElemPow") state.needMath.value = true;
-      analyzeExpr(state, e.left);
-      analyzeExpr(state, e.right);
+    if (sub.kind === "Call") {
+      state.needMath.value = true;
       return;
-    case "Unary":
-      analyzeExpr(state, e.operand);
+    }
+    if (sub.kind === "Binary" && (sub.op === "Pow" || sub.op === "ElemPow")) {
+      state.needMath.value = true;
       return;
-  }
+    }
+  });
 }
 
 /**
- * Statement-level companion to `analyzeExpr`. Walks every expression
- * the statement transitively contains, plus sets `needMath` for stmts
- * whose codegen always emits a math.h call (currently only For — its
- * iteration-count formula uses floor()).
+ * Statement-level companion to `analyzeExpr`. Visits every stmt in the
+ * tree (parents before bodies via `forEachStmtInTree`), runs
+ * `analyzeExpr` over each stmt's directly-held expressions, and sets
+ * `needMath` for stmt kinds whose codegen always emits a math.h call:
+ *   - For: the iteration-count formula uses `floor()`.
+ *   - MultiAssignCall: mirrors the `Call` case in `analyzeExpr` —
+ *     every user-function call we currently emit pulls in <math.h>.
  */
-function analyzeStmt(state: EmitState, s: IRStmt): void {
-  switch (s.kind) {
-    case "Assign":
-      analyzeExpr(state, s.rhs);
-      return;
-    case "ExprStmt":
-      analyzeExpr(state, s.expr);
-      return;
-    case "Disp":
-      analyzeExpr(state, s.arg);
-      return;
-    case "Error":
-      analyzeExpr(state, s.arg);
-      return;
-    case "If":
-      analyzeExpr(state, s.cond);
-      for (const t of s.thenBody) analyzeStmt(state, t);
-      for (const eif of s.elseifs) {
-        analyzeExpr(state, eif.cond);
-        for (const t of eif.body) analyzeStmt(state, t);
-      }
-      if (s.elseBody) for (const t of s.elseBody) analyzeStmt(state, t);
-      return;
-    case "For":
-      // The emitted iteration-count formula calls floor(), so any For
-      // forces <math.h> regardless of what its bounds analyze to.
+function analyzeStmts(state: EmitState, stmts: ReadonlyArray<IRStmt>): void {
+  forEachStmtInTree(stmts, s => {
+    if (s.kind === "For" || s.kind === "MultiAssignCall") {
       state.needMath.value = true;
-      analyzeExpr(state, s.start);
-      analyzeExpr(state, s.step);
-      analyzeExpr(state, s.end);
-      for (const t of s.body) analyzeStmt(state, t);
-      return;
-    case "While":
-      analyzeExpr(state, s.cond);
-      for (const t of s.body) analyzeStmt(state, t);
-      return;
-    case "MultiAssignCall":
-      // Mirrors the `Call` case in `analyzeExpr`: a user-function
-      // call doesn't itself need <math.h>, but we set the flag for
-      // structural symmetry with the analyzer's Call handling — the
-      // arg pre-walk also activates any builtin runtime helpers a
-      // sub-expression depends on.
-      state.needMath.value = true;
-      for (const a of s.args) analyzeExpr(state, a);
-      return;
-    case "Break":
-    case "Continue":
-    case "ReturnFromFunction":
-      return;
-  }
+    }
+    forEachTopLevelExpr(s, e => analyzeExpr(state, e));
+  });
 }
 
 /** Owned C-names (tensors and strings) that should be freed
@@ -1193,29 +1137,11 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
 function findShapeSourceVar(
   e: IRExpr
 ): Extract<IRExpr, { kind: "Var" }> | null {
-  switch (e.kind) {
-    case "Var":
-      return isMultiElement(e.ty) ? e : null;
-    case "Binary": {
-      const left = findShapeSourceVar(e.left);
-      if (left) return left;
-      return findShapeSourceVar(e.right);
-    }
-    case "Unary":
-      return findShapeSourceVar(e.operand);
-    case "Call":
-      for (const a of e.args) {
-        const v = findShapeSourceVar(a);
-        if (v) return v;
-      }
-      return null;
-    case "CharLit":
-    case "NumLit":
-    case "ImagLit":
-    case "StringLit":
-    case "TensorLit":
-      return null;
-  }
+  return findInExpr(
+    e,
+    (sub): sub is Extract<IRExpr, { kind: "Var" }> =>
+      sub.kind === "Var" && isMultiElement(sub.ty)
+  );
 }
 
 /** Walk an IR expression and return the first multi-element CharLit
@@ -1226,29 +1152,11 @@ function findShapeSourceVar(
 function findCharLitShapeSource(
   e: IRExpr
 ): Extract<IRExpr, { kind: "CharLit" }> | null {
-  switch (e.kind) {
-    case "CharLit":
-      return isMultiElement(e.ty) ? e : null;
-    case "Binary": {
-      const left = findCharLitShapeSource(e.left);
-      if (left) return left;
-      return findCharLitShapeSource(e.right);
-    }
-    case "Unary":
-      return findCharLitShapeSource(e.operand);
-    case "Call":
-      for (const a of e.args) {
-        const v = findCharLitShapeSource(a);
-        if (v) return v;
-      }
-      return null;
-    case "Var":
-    case "NumLit":
-    case "ImagLit":
-    case "StringLit":
-    case "TensorLit":
-      return null;
-  }
+  return findInExpr(
+    e,
+    (sub): sub is Extract<IRExpr, { kind: "CharLit" }> =>
+      sub.kind === "CharLit" && isMultiElement(sub.ty)
+  );
 }
 
 /** Walk an IR expression and collect every distinct multi-element
@@ -1263,27 +1171,11 @@ function collectMultiElementVarsByCName(
   e: IRExpr,
   out: Map<string, Extract<IRExpr, { kind: "Var" }>>
 ): void {
-  switch (e.kind) {
-    case "Var":
-      if (isMultiElement(e.ty) && !out.has(e.cName)) out.set(e.cName, e);
-      return;
-    case "Binary":
-      collectMultiElementVarsByCName(e.left, out);
-      collectMultiElementVarsByCName(e.right, out);
-      return;
-    case "Unary":
-      collectMultiElementVarsByCName(e.operand, out);
-      return;
-    case "Call":
-      for (const a of e.args) collectMultiElementVarsByCName(a, out);
-      return;
-    case "CharLit":
-    case "NumLit":
-    case "ImagLit":
-    case "StringLit":
-    case "TensorLit":
-      return;
-  }
+  forEachSubExpr(e, sub => {
+    if (sub.kind === "Var" && isMultiElement(sub.ty) && !out.has(sub.cName)) {
+      out.set(sub.cName, sub);
+    }
+  });
 }
 
 /** Emit an Assign whose multi-element RHS is NOT a TensorLit and not
@@ -1862,10 +1754,8 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   // program (main + every function body) AND sets `state.needMath`
   // for every node that forces <math.h>. Walking everything before
   // emitting keeps the helper ordering stable.
-  for (const fn of prog.functions) {
-    for (const s of fn.body) analyzeStmt(state, s);
-  }
-  for (const s of prog.stmts) analyzeStmt(state, s);
+  for (const fn of prog.functions) analyzeStmts(state, fn.body);
+  analyzeStmts(state, prog.stmts);
 
   // Emit user-function bodies first into separate buffers; we paste
   // them into the output below, before main.

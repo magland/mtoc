@@ -57,6 +57,11 @@ import { lowerBinary } from "./lowerBinary.js";
 import { lowerUnary } from "./lowerUnary.js";
 import { lowerFuncCall, lowerMultiAssignCall } from "./lowerFuncCall.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
+import {
+  forEachStmtInTree,
+  forEachSubExpr,
+  forEachTopLevelExpr,
+} from "./walk.js";
 
 // Reserved C identifiers that need mangling. Mirrors numbl's
 // cJit/codegen.ts list. Centralized here so emit.ts never has to
@@ -858,37 +863,16 @@ function ownedExprMessage(kind: OwnedExprKind): string {
  * passed in is itself checked, so call sites that *do* permit a
  * top-level owned producer (the supported `Assign.rhs` shapes)
  * recurse into the operands directly instead of calling this helper
- * on the whole RHS. Recurses through every other expression kind.
+ * on the whole RHS. CharLit produces a non-owning handle (or a bare
+ * char literal) and is safe anywhere.
  */
 function rejectNestedOwnedExpr(e: IRExpr): void {
-  const kind = classifyOwnedExpr(e);
-  if (kind !== null) {
-    throw new UnsupportedConstruct(ownedExprMessage(kind), e.span);
-  }
-  switch (e.kind) {
-    case "Var":
-    case "NumLit":
-    case "ImagLit":
-    case "StringLit":
-    case "CharLit":
-      // CharLit produces a non-owning handle or a bare char literal —
-      // no heap allocation, so it's safe in any expression position.
-      return;
-    case "Binary":
-      rejectNestedOwnedExpr(e.left);
-      rejectNestedOwnedExpr(e.right);
-      return;
-    case "Unary":
-      rejectNestedOwnedExpr(e.operand);
-      return;
-    case "Call":
-      for (const a of e.args) rejectNestedOwnedExpr(a);
-      return;
-    case "TensorLit":
-      // Unreachable — `classifyOwnedExpr` already returned
-      // "tensor-lit" above and we threw. Kept for exhaustiveness.
-      return;
-  }
+  forEachSubExpr(e, sub => {
+    const kind = classifyOwnedExpr(sub);
+    if (kind !== null) {
+      throw new UnsupportedConstruct(ownedExprMessage(kind), sub.span);
+    }
+  });
 }
 
 /**
@@ -898,105 +882,49 @@ function rejectNestedOwnedExpr(e: IRExpr): void {
  * yet.
  */
 function rejectCallInTensorContext(e: IRExpr): void {
-  switch (e.kind) {
-    case "Call":
+  forEachSubExpr(e, sub => {
+    if (sub.kind === "Call") {
       throw new UnsupportedConstruct(
         `function calls inside a multi-element tensor expression are not ` +
           `yet supported (assign the call result to a name first)`,
-        e.span
+        sub.span
       );
-    case "NumLit":
-    case "ImagLit":
-    case "StringLit":
-    case "CharLit":
-    case "Var":
-    case "TensorLit":
-      // TensorLit has already been rejected by `rejectNestedTensorLit`
-      // before we get here; if it slipped through, the codegen-side
-      // assertion will fire.
-      return;
-    case "Binary":
-      rejectCallInTensorContext(e.left);
-      rejectCallInTensorContext(e.right);
-      return;
-    case "Unary":
-      rejectCallInTensorContext(e.operand);
-      return;
-  }
-}
-
-function validateStmts(stmts: ReadonlyArray<IRStmt>): void {
-  for (const s of stmts) validateStmt(s);
+    }
+  });
 }
 
 function validateStmt(s: IRStmt): void {
-  switch (s.kind) {
-    case "Assign": {
-      // `Assign.rhs` is the one position that *permits* a top-level
-      // owned producer (TensorLit / string concat). Recurse into the
-      // operands of that producer; everything else gets the whole
-      // expression checked.
-      const top = classifyOwnedExpr(s.rhs);
-      if (top === "tensor-lit") {
-        // TensorLit cells were required to be scalar-real at lowering;
-        // still check none of them is itself an owned producer.
-        const tl = s.rhs as Extract<IRExpr, { kind: "TensorLit" }>;
-        for (const row of tl.elements) {
-          for (const cell of row) rejectNestedOwnedExpr(cell);
-        }
-      } else if (top === "string-concat") {
-        const b = s.rhs as Extract<IRExpr, { kind: "Binary" }>;
-        rejectNestedOwnedExpr(b.left);
-        rejectNestedOwnedExpr(b.right);
-      } else {
-        rejectNestedOwnedExpr(s.rhs);
-        if (isMultiElement(s.rhs.ty)) {
-          rejectCallInTensorContext(s.rhs);
-        }
+  if (s.kind === "Assign") {
+    // `Assign.rhs` is the one position that *permits* a top-level
+    // owned producer (TensorLit / string concat). Recurse into the
+    // operands of that producer; everything else gets the whole
+    // expression checked.
+    const top = classifyOwnedExpr(s.rhs);
+    if (top === "tensor-lit") {
+      // TensorLit cells were required to be scalar-real at lowering;
+      // still check none of them is itself an owned producer.
+      const tl = s.rhs as Extract<IRExpr, { kind: "TensorLit" }>;
+      for (const row of tl.elements) {
+        for (const cell of row) rejectNestedOwnedExpr(cell);
       }
-      return;
+    } else if (top === "string-concat") {
+      const b = s.rhs as Extract<IRExpr, { kind: "Binary" }>;
+      rejectNestedOwnedExpr(b.left);
+      rejectNestedOwnedExpr(b.right);
+    } else {
+      rejectNestedOwnedExpr(s.rhs);
+      if (isMultiElement(s.rhs.ty)) {
+        rejectCallInTensorContext(s.rhs);
+      }
     }
-    case "ExprStmt":
-      rejectNestedOwnedExpr(s.expr);
-      return;
-    case "Disp":
-    case "Error":
-      rejectNestedOwnedExpr(s.arg);
-      return;
-    case "If":
-      rejectNestedOwnedExpr(s.cond);
-      validateStmts(s.thenBody);
-      for (const eif of s.elseifs) {
-        rejectNestedOwnedExpr(eif.cond);
-        validateStmts(eif.body);
-      }
-      if (s.elseBody) validateStmts(s.elseBody);
-      return;
-    case "While":
-      rejectNestedOwnedExpr(s.cond);
-      validateStmts(s.body);
-      return;
-    case "For":
-      rejectNestedOwnedExpr(s.start);
-      rejectNestedOwnedExpr(s.step);
-      rejectNestedOwnedExpr(s.end);
-      validateStmts(s.body);
-      return;
-    case "MultiAssignCall":
-      // Multi-output user-function calls accept the same arg shapes
-      // as a regular `Call` in expression position — every nested
-      // owned producer is rejected. (User-function signatures only
-      // accept numeric scalars/tensors today, so this loop never
-      // sees a string-concat or TensorLit at the top level — but
-      // run the check uniformly with `Assign.rhs` for the day a
-      // user-function arg admits a top-level owned producer.)
-      for (const a of s.args) rejectNestedOwnedExpr(a);
-      return;
-    case "Break":
-    case "Continue":
-    case "ReturnFromFunction":
-      return;
+    return;
   }
+  // Every other stmt accepts the same rule for each top-level
+  // expression it directly holds: no owned producers anywhere in the
+  // tree. Body recursion is handled by `forEachStmtInTree` at the
+  // `validateIR` driver — each body stmt becomes its own visit, so
+  // we don't need to descend manually here.
+  forEachTopLevelExpr(s, rejectNestedOwnedExpr);
 }
 
 /**
@@ -1007,8 +935,8 @@ function validateStmt(s: IRStmt): void {
  * trace.
  */
 function validateIR(prog: IRProgram): void {
-  for (const fn of prog.functions) validateStmts(fn.body);
-  validateStmts(prog.stmts);
+  for (const fn of prog.functions) forEachStmtInTree(fn.body, validateStmt);
+  forEachStmtInTree(prog.stmts, validateStmt);
 }
 
 export function lower(

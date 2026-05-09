@@ -93,6 +93,18 @@ Lowering does several jobs in one walk:
   invariants the codegen depends on (e.g., tensor literals only as `Assign`
   RHS) so codegen-time errors stay rare and "internal".
 
+### IR walkers (`src/lowering/walk.ts`)
+
+Generic visitors over the typed IR — `forEachSubExpr` (pre-order over
+every sub-expression of an `IRExpr`), `findInExpr` (first match),
+`forEachTopLevelExpr` (every expression a stmt directly holds), and
+`forEachStmtInTree` (every stmt in a body, parents before children).
+Every analysis or validation pass that used to roll its own
+exhaustive switch on `IRExpr.kind` / `IRStmt.kind` now expresses
+itself as a per-node visitor on top of these helpers — adding a new
+IR variant means updating one switch (the walker) plus any visitor
+that genuinely needs to look at the new kind.
+
 ### IR (`src/lowering/ir.ts`)
 
 A discriminated-union IR. Two trees:

@@ -43,6 +43,7 @@
 
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import { isOwned } from "../lowering/types.js";
+import { forEachSubExpr, forEachTopLevelExpr } from "../lowering/walk.js";
 
 /** Per-statement future-touch sets, keyed by the IRStmt object
  *  reference. Each entry holds the set of owned C-names that may be
@@ -67,83 +68,28 @@ interface TouchCtx {
 }
 
 /** Owned C-names referenced by an IR expression. Only owned `Var`
- *  nodes contribute; scalars and literals do not. */
+ *  nodes contribute; scalars and literals do not. CharLit is a
+ *  non-owning handle (.rodata or bare char) and contributes nothing. */
 export function collectOwnedVarsInExpr(e: IRExpr, out: Set<string>): void {
-  switch (e.kind) {
-    case "Var":
-      if (isOwned(e.ty)) out.add(e.cName);
-      return;
-    case "Binary":
-      collectOwnedVarsInExpr(e.left, out);
-      collectOwnedVarsInExpr(e.right, out);
-      return;
-    case "Unary":
-      collectOwnedVarsInExpr(e.operand, out);
-      return;
-    case "Call":
-      for (const a of e.args) collectOwnedVarsInExpr(a, out);
-      return;
-    case "TensorLit":
-      for (const row of e.elements)
-        for (const c of row) {
-          collectOwnedVarsInExpr(c, out);
-        }
-      return;
-    case "NumLit":
-    case "ImagLit":
-    case "StringLit":
-    case "CharLit":
-      // CharLit is a non-owning handle (points at .rodata or is a bare
-      // C char literal) — no heap allocation, so no owned var to track.
-      return;
-  }
+  forEachSubExpr(e, sub => {
+    if (sub.kind === "Var" && isOwned(sub.ty)) out.add(sub.cName);
+  });
 }
 
 /** Top-level owned uses for a statement — the owned vars read by the
  *  statement at its own level, NOT including its body (control-flow
  *  body uses are accounted for in the body's per-stmt future-touch
  *  results). Used by `emit.ts` to compute "free after this stmt"
- *  candidates as `(uses(s) ∪ defs(s)) - futureTouchOut(s)`. */
+ *  candidates as `(uses(s) ∪ defs(s)) - futureTouchOut(s)`.
+ *
+ *  `MultiAssignCall` args contribute the same way `Call` args do
+ *  through `Assign.rhs` — user-function calls copy each tensor/char
+ *  arg at the call site, but the read of the source still counts as
+ *  a touch for the future-touch dataflow. */
 export function topLevelOwnedUses(s: IRStmt): Set<string> {
   const out = new Set<string>();
-  switch (s.kind) {
-    case "Assign":
-      collectOwnedVarsInExpr(s.rhs, out);
-      return out;
-    case "ExprStmt":
-      collectOwnedVarsInExpr(s.expr, out);
-      return out;
-    case "Disp":
-      collectOwnedVarsInExpr(s.arg, out);
-      return out;
-    case "Error":
-      collectOwnedVarsInExpr(s.arg, out);
-      return out;
-    case "If":
-      collectOwnedVarsInExpr(s.cond, out);
-      for (const eif of s.elseifs) collectOwnedVarsInExpr(eif.cond, out);
-      return out;
-    case "While":
-      collectOwnedVarsInExpr(s.cond, out);
-      return out;
-    case "For":
-      collectOwnedVarsInExpr(s.start, out);
-      collectOwnedVarsInExpr(s.step, out);
-      collectOwnedVarsInExpr(s.end, out);
-      return out;
-    case "MultiAssignCall":
-      // Args contribute owned reads in the same shape as `Call`'s args
-      // contribute through `Assign.rhs`. (User-function calls today
-      // accept tensor/string/char args, all of which get copied at
-      // the call site — but the read of the source still counts as a
-      // touch for the future-touch dataflow.)
-      for (const a of s.args) collectOwnedVarsInExpr(a, out);
-      return out;
-    case "Break":
-    case "Continue":
-    case "ReturnFromFunction":
-      return out;
-  }
+  forEachTopLevelExpr(s, e => collectOwnedVarsInExpr(e, out));
+  return out;
 }
 
 /** Top-level owned defs for a statement — `Assign` to an owned-typed
