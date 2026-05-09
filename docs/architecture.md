@@ -125,6 +125,32 @@ re-mangle names — every `Var` / `Assign` / param has its `cName` baked in.
 
 ### Codegen (`src/codegen/`)
 
+The codegen is split across one orchestrator and several topical
+modules:
+
+- `emit.ts` — top-level `emitC(prog, opts)` driver. Builds the
+  `EmitState`, runs the analysis pre-walk, and assembles headers +
+  runtime snippets + function blocks + main into the final C string.
+- `emitState.ts` — `EmitState` interface plus the small helpers that
+  every other module needs (`useRuntime` / `useRuntimeByName` /
+  `pushStmt` / `indent` / `builtinEmitFacade`).
+- `emitFormat.ts` — pure formatters (`formatNumLit`,
+  `formatStringLit`, `formatCharLit`, op tables, precedence). No
+  state; no side effects.
+- `emitExpr.ts` — `emitExpr` (and its complex / arg-copy helpers)
+  plus `analyzeExpr` (the header-flag pre-walk).
+- `emitStmt.ts` — `emitStmt` (the per-IRStmt dispatch) plus
+  `analyzeStmts`, the elementwise-loop and tensor-literal Assign
+  emitters, the shape-source walkers, and the early-free emission.
+- `emitOwned.ts` — `emitDeclarations` / `emitScopeExitFrees` /
+  `functionFreeOnExitSet`. All three walk a `{cName → VarBinding}`
+  table and dispatch through the `ownedKinds` registry.
+- `emitFunction.ts` — `emitFunction` and `emitFunctionBody`, plus
+  the per-specialization header comment.
+- `ownedKinds.ts` — registry mapping each owned MType (string, char
+  array, real-or-complex tensor) to its C helper names. New owned
+  kinds plug in by adding one entry.
+
 `emit.ts` walks an `IRProgram` and produces a single C source string.
 Responsibilities:
 
