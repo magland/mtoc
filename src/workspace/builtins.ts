@@ -14,10 +14,17 @@
  * `reduceTensor`) keep the registry terse for the common cases.
  */
 
+import type { Expr, Span } from "../parser/index.js";
+import { UnsupportedConstruct } from "../lowering/errors.js";
+import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
+  isCharArray,
+  isMultiElement,
   isNumeric,
+  isString,
   scalarComplex,
   scalarDouble,
+  typeToString,
   type MType,
   type Sign,
 } from "../lowering/types.js";
@@ -108,6 +115,41 @@ export type BuiltinEmit = (
 ) => string;
 
 /**
+ * Surface of the lowerer that builtin lowering hooks need. Defined as
+ * an interface in this file (rather than importing the Lowerer class)
+ * so the registry stays free of a runtime dependency on lowering. The
+ * Lowerer class satisfies this structurally.
+ */
+export interface BuiltinLowerCtx {
+  /** Lower a parser-level expression to an IRExpr. */
+  lowerExpr(e: Expr): IRExpr;
+}
+
+/** Optional statement-position lowering for a builtin. Invoked from
+ *  the lowerer's `ExprStmt(name(args))` arm BEFORE the default
+ *  expression-call path. Return an `IRStmt` to use as the stmt's
+ *  lowered form, or `null` to defer back to the default. Receives raw
+ *  AST args so the hook can do its own shape validation alongside
+ *  lowering. */
+export type BuiltinLowerStmt = (
+  ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<Expr>,
+  span: Span
+) => IRStmt | null;
+
+/** Optional expression-position lowering override for a builtin.
+ *  Invoked from `lowerFuncCall` AFTER args are lowered but BEFORE the
+ *  default `IRExpr.Call` build, so the hook can inspect arg types
+ *  (e.g. `length(s)` constant-folds to 1 for a string arg) and
+ *  return a different IRExpr. Return `null` to defer back to the
+ *  default. */
+export type BuiltinLowerExpr = (
+  ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+) => IRExpr | null;
+
+/**
  * One MATLAB builtin's typed signature + codegen hook.
  *
  * The lowerer reads `params` for arg validation and calls `result`
@@ -134,6 +176,18 @@ export interface BuiltinSig {
    *  builtins (today only `disp`) provide an emit that throws — they
    *  never reach the value-producing emit path. */
   emit: BuiltinEmit;
+  /** Optional statement-position lowering. When present, the lowerer's
+   *  `ExprStmt(name(args))` arm consults this hook before the default
+   *  expression-call path. Statement-only builtins (`disp`, `error`)
+   *  use this to produce dedicated IR nodes (`IRStmt.Disp`,
+   *  `IRStmt.Error`). Returning `null` defers to the default. */
+  lowerStmt?: BuiltinLowerStmt;
+  /** Optional expression-position lowering override. Invoked after
+   *  args are lowered; lets a builtin constant-fold or rewrite the
+   *  call before the default `IRExpr.Call` build (e.g.
+   *  `length(string)` → `NumLit(1)`, `length(charArray)` → struct
+   *  field access). Returning `null` defers to the default. */
+  lowerExpr?: BuiltinLowerExpr;
 }
 
 // ── Factory helpers ─────────────────────────────────────────────────────
@@ -358,12 +412,14 @@ function reduceTensor(
 
 const BUILTINS: BuiltinSig[] = [
   // ── Statement-only ───────────────────────────────────────────────────
-  // `disp(x)` is special-cased at lowering: ExprStmt(disp(...)) routes
-  // into `IRStmt.Disp` and codegen picks `mtoc_disp_double` vs
-  // `mtoc_disp_tensor` at emit time. The registry entry exists so
-  // `Workspace.resolve("disp")` returns from the same path as every
-  // other builtin lookup; lowering rejects `disp(...)` at expression
-  // position via `category === "stmt"`.
+  // `disp(x)` and `error(s)` own their statement lowering via
+  // `lowerStmt`. The lowerer's `ExprStmt(name(...))` arm consults the
+  // hook before the default expression-call path; it produces a
+  // dedicated IR node (`IRStmt.Disp` / `IRStmt.Error`) that codegen
+  // recognizes for kind-specific output (e.g. `mtoc_disp_double`,
+  // `mtoc_disp_tensor`, `mtoc_error_string`). The expression-position
+  // emit closures throw — `category === "stmt"` ensures the lowerer
+  // never reaches them.
   {
     name: "disp",
     category: "stmt",
@@ -381,16 +437,42 @@ const BUILTINS: BuiltinSig[] = [
         "internal: BuiltinSig 'disp'.emit should not be called — disp lowers to IRStmt.Disp"
       );
     },
+    lowerStmt: (ctx, args, span) => {
+      if (args.length !== 1) return null;
+      const arg = ctx.lowerExpr(args[0]);
+      // Codegen can only print scalars or named tensor variables; a
+      // tensor expression has no addressable storage to hand to the
+      // runtime helper, so reject it with a span before codegen.
+      // Exception: CharLit (non-owning literal handle) is always OK.
+      if (
+        isMultiElement(arg.ty) &&
+        arg.kind !== "Var" &&
+        arg.kind !== "CharLit"
+      ) {
+        throw new UnsupportedConstruct(
+          `'disp' of a tensor expression is only supported for ` +
+            `variable references; assign the value to a name first`,
+          args[0].span
+        );
+      }
+      // Same restriction for strings: a bare concat expression has no
+      // named buffer to hand to the runtime helper, and the owned
+      // result would leak. Allow `StringLit` (cheap, points at .rodata)
+      // and `Var`; reject otherwise.
+      if (isString(arg.ty) && arg.kind !== "Var" && arg.kind !== "StringLit") {
+        throw new UnsupportedConstruct(
+          `'disp' of a string expression is only supported for string ` +
+            `literals or variables; assign the value to a name first`,
+          args[0].span
+        );
+      }
+      return { kind: "Disp", arg, span };
+    },
   },
 
-  // `error(s)` is a statement-only builtin that raises a numbl
-  // RuntimeError. The lowering path mirrors `disp`: a special-case in
-  // `lowerStmt` for `ExprStmt(error(...))` produces an `IRStmt.Error`
-  // node and codegen emits `mtoc_error_string(arg);`. The registry
-  // entry exists so `Workspace.resolve("error")` returns from the
-  // unified path (and value-position uses are rejected with a clear
-  // message). Today only the single-string-argument form is accepted;
-  // `error(id, fmt, …)` shapes are deferred.
+  // `error(s)` raises a numbl RuntimeError; codegen emits
+  // `mtoc_error_string(arg);`. Today only the single-string-argument
+  // form is accepted; `error(id, fmt, …)` shapes are deferred.
   {
     name: "error",
     category: "stmt",
@@ -407,6 +489,25 @@ const BUILTINS: BuiltinSig[] = [
       throw new Error(
         "internal: BuiltinSig 'error'.emit should not be called — error lowers to IRStmt.Error"
       );
+    },
+    lowerStmt: (ctx, args, span) => {
+      if (args.length !== 1) return null;
+      const arg = ctx.lowerExpr(args[0]);
+      if (!isString(arg.ty)) {
+        throw new UnsupportedConstruct(
+          `'error' currently requires a single string argument ` +
+            `(got ${typeToString(arg.ty)})`,
+          args[0].span
+        );
+      }
+      if (arg.kind !== "Var" && arg.kind !== "StringLit") {
+        throw new UnsupportedConstruct(
+          `'error' of a string expression is only supported for string ` +
+            `literals or variables; assign the value to a name first`,
+          args[0].span
+        );
+      }
+      return { kind: "Error", arg, span };
     },
   },
 
@@ -565,10 +666,80 @@ const BUILTINS: BuiltinSig[] = [
   }),
 
   // `length` and `numel` accept any non-scalar tensor and return a
-  // nonneg scalar (the count includes 0 for an empty tensor).
-  reduceTensor("length", "mtoc_length", "nonnegative"),
-  reduceTensor("numel", "mtoc_numel", "nonnegative"),
+  // nonneg scalar (the count includes 0 for an empty tensor). They
+  // also override `lowerExpr` to fold over a string handle (always 1
+  // per numbl semantics) and a char-array (CharLit folds to its
+  // static length; a `Var` reads `.cols` off the runtime struct via
+  // a synthetic single-use builtin sig). Other arg shapes fall
+  // through to the default `reduceTensor` path, which validates
+  // shape: "tensor" and routes through `mtoc_length` / `mtoc_numel`.
+  {
+    ...reduceTensor("length", "mtoc_length", "nonnegative"),
+    lowerExpr: lengthLikeLowerExpr("length"),
+  },
+  {
+    ...reduceTensor("numel", "mtoc_numel", "nonnegative"),
+    lowerExpr: lengthLikeLowerExpr("numel"),
+  },
 ];
+
+function lengthLikeLowerExpr(name: string): BuiltinLowerExpr {
+  return (_ctx, args, span) => {
+    if (args.length !== 1) return null;
+    const arg = args[0];
+    if (isString(arg.ty)) {
+      return {
+        kind: "NumLit",
+        value: 1,
+        ty: scalarDouble("positive"),
+        span,
+      };
+    }
+    if (isCharArray(arg.ty)) {
+      if (arg.kind === "CharLit") {
+        return {
+          kind: "NumLit",
+          value: arg.value.length,
+          ty: scalarDouble("positive"),
+          span,
+        };
+      }
+      if (arg.kind === "Var") {
+        // Synthesize a one-shot BuiltinSig whose emit closure renders
+        // the `<v>.cols` struct-field access. No runtime helper needed
+        // — `cols` is always present on `mtoc_char_tensor_t`.
+        const charLenSig: BuiltinSig = {
+          name,
+          category: "expr",
+          params: [
+            {
+              shape: "tensor",
+              domain: null,
+              elem: null,
+              complexDomain: "real-or-complex",
+            },
+          ],
+          result: () => scalarDouble("nonnegative"),
+          emit: argStrs => `${argStrs[0]}.cols`,
+        };
+        return {
+          kind: "Call",
+          name,
+          callee: { kind: "builtin", sig: charLenSig },
+          args: [arg],
+          ty: scalarDouble("nonnegative"),
+          span,
+        };
+      }
+      throw new UnsupportedConstruct(
+        `${name} on a char-array expression is not yet supported ` +
+          `(assign the char to a variable first)`,
+        span
+      );
+    }
+    return null;
+  };
+}
 
 const BY_NAME = new Map<string, BuiltinSig>(BUILTINS.map(b => [b.name, b]));
 

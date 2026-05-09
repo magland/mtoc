@@ -17,14 +17,11 @@ import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr, IRFunction } from "./ir.js";
 import {
   canonicalizeType,
-  isCharArray,
   isMultiElement,
   isScalar,
   isScalarReal,
   isNumeric,
-  isString,
   isVector,
-  scalarDouble,
   signIsNonneg,
   signIsPositive,
   type MType,
@@ -60,69 +57,6 @@ export function lowerFuncCall(
         `value-producing call`,
       e.span
     );
-  }
-  // String fast-paths: `length(s) == 1`, `numel(s) == 1` per numbl
-  // semantics (a numbl `string` is a scalar handle, not a char
-  // vector). Fold to a NumLit at lowering — no runtime helper needed.
-  // Lower the arg once and reuse it on the fall-through path so
-  // expression-level side effects (e.g. recording fresh assignments)
-  // aren't applied twice.
-  if ((e.name === "length" || e.name === "numel") && e.args.length === 1) {
-    const arg = this.lowerExpr(e.args[0]);
-    if (isString(arg.ty)) {
-      return {
-        kind: "NumLit",
-        value: 1,
-        ty: scalarDouble("positive"),
-        span: e.span,
-      };
-    }
-    // Char arrays: length = numel = cols (always 1×N). For a CharLit
-    // the size is statically known; fold directly to a NumLit so no
-    // runtime helper is needed. For a char-array Var, emit `.cols` via
-    // a synthetic Call whose emit closure accesses the struct field.
-    if (isCharArray(arg.ty)) {
-      if (arg.kind === "CharLit") {
-        return {
-          kind: "NumLit",
-          value: arg.value.length,
-          ty: scalarDouble("positive"),
-          span: e.span,
-        };
-      }
-      if (arg.kind === "Var") {
-        // Emit `cName.cols` — no runtime helper; the struct field is
-        // always present on `mtoc_char_tensor_t`.
-        const charLenSig = {
-          name: e.name,
-          category: "expr" as const,
-          params: [
-            {
-              shape: "tensor" as const,
-              domain: null,
-              elem: null as null,
-              complexDomain: "real-or-complex" as const,
-            },
-          ],
-          result: () => scalarDouble("nonnegative"),
-          emit: (argStrs: readonly string[]) => `${argStrs[0]}.cols`,
-        };
-        return {
-          kind: "Call",
-          name: e.name,
-          callee: { kind: "builtin", sig: charLenSig },
-          args: [arg],
-          ty: scalarDouble("nonnegative"),
-          span: e.span,
-        };
-      }
-      throw new UnsupportedConstruct(
-        `${e.name} on a char-array expression is not yet supported ` +
-          `(assign the char to a variable first)`,
-        e.span
-      );
-    }
-    return lowerBuiltinCallWithArgs.call(this, e.name, [arg], e.span);
   }
   return lowerBuiltinCall.call(this, e.name, e.args, e.span);
 }
@@ -167,6 +101,15 @@ export function lowerBuiltinCallWithArgs(
       `${name} expects ${builtin.params.length} argument(s), got ${args.length}`,
       span
     );
+  }
+  // Optional `lowerExpr` override: lets a builtin constant-fold or
+  // rewrite the call before standard validation runs (e.g.
+  // `length(string)` folds to `NumLit(1)` regardless of the registry's
+  // shape: "tensor" constraint, since strings aren't tensors). Returning
+  // null defers to the standard path below.
+  if (builtin.lowerExpr) {
+    const overridden = builtin.lowerExpr(this, args, span);
+    if (overridden !== null) return overridden;
   }
   // Per-arg shape + complex-domain + sign-domain validation, all driven
   // by ParamConstraint. Order matters: the complex-domain check runs

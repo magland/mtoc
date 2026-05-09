@@ -103,20 +103,43 @@ The common path:
 That's it — the registry is the single source of truth for builtin behavior.
 The lowerer and codegen consume it generically.
 
+## Statement-only and expression-override hooks
+
+`BuiltinSig` has two optional lowering hooks alongside `result` /
+`emit`:
+
+- **`lowerStmt(ctx, args, span)`** — invoked from the lowerer's
+  `ExprStmt(name(args))` arm BEFORE the default expression-call
+  path. Receives the raw AST args so the hook can do its own shape
+  validation alongside lowering. Returning a non-null `IRStmt` uses
+  it as the stmt's lowered form; returning `null` defers to the
+  default. `disp` and `error` use this to produce dedicated
+  `IRStmt.Disp` / `IRStmt.Error` nodes — without it, `lower.ts`
+  would have to hardcode their names.
+- **`lowerExpr(ctx, args, span)`** — invoked from `lowerFuncCall`
+  AFTER args are lowered but BEFORE arg-shape validation. Lets a
+  builtin constant-fold or rewrite the call based on the lowered
+  arg types (e.g. `length(string) → NumLit(1)`). Returning `null`
+  defers to the default validate / build path.
+
+These hooks are how non-uniform builtin behavior stays declarative
+in the registry instead of accumulating special cases in `lower.ts`.
+
 ## String-aware builtins
 
-`disp(s)` accepts a string `Var` or `StringLit` directly and routes
-into `IRStmt.Disp`; codegen picks `mtoc_disp_string` based on the
-arg's `MType`. `error("...")` is the parallel `IRStmt.Error`.
+`disp(s)` accepts a string `Var` or `StringLit` directly and produces
+`IRStmt.Disp` via its `lowerStmt` hook; codegen picks
+`mtoc_disp_string` based on the arg's `MType`. `error("...")` is the
+parallel `IRStmt.Error`, also produced by a `lowerStmt` hook.
 
-`length(s)` and `numel(s)` are special-cased in `lowerFuncCall`: when
-the argument is a string, both fold to a `NumLit(1)` at lowering
-(numbl semantics for the scalar string handle). When the argument is
-a char array, `CharLit` folds to a `NumLit(n)` (static length) and
-char-array `Var` emits a synthetic Call that reads `.cols` from the
-`mtoc_char_tensor_t` struct — no runtime helper needed. Tensor /
-numeric arguments still flow through the regular `reduceTensor` /
-`reduceVector` factory entries.
+`length(s)` and `numel(s)` use their `lowerExpr` hook to handle
+non-tensor arguments. When the argument is a string, both fold to a
+`NumLit(1)` at lowering (numbl semantics for the scalar string
+handle). When the argument is a char array, `CharLit` folds to a
+`NumLit(n)` (static length) and char-array `Var` emits a synthetic
+Call that reads `.cols` from the `mtoc_char_tensor_t` struct — no
+runtime helper needed. Tensor / numeric arguments fall through to
+the default `reduceTensor` validate / build path.
 
 String concat (`+` on two strings) is handled in the binary lowering
 path, not as a builtin; it produces a `Binary(Add, …)` IR node typed

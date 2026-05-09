@@ -22,6 +22,7 @@
 
 import type { AbstractSyntaxTree, Expr, Span, Stmt } from "../parser/index.js";
 import { Workspace } from "../workspace/workspace.js";
+import { getBuiltin } from "../workspace/builtins.js";
 import { getConstant } from "../workspace/constants.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type {
@@ -497,7 +498,10 @@ export class Lowerer {
         // route them to `MultiAssignCall` here. 1-output user calls
         // continue through the regular `lowerExpr` → `ExprStmt(Call)`
         // pipeline so the emitted C is the existing `(void)(foo(x));`
-        // shape. Builtins always go through the regular path.
+        // shape. Builtins delegate to their `lowerStmt` hook (if any)
+        // before the default expression-call path; that's how `disp`
+        // and `error` produce dedicated `IRStmt.Disp` / `IRStmt.Error`
+        // nodes without lower.ts hardcoding their names.
         if (s.expr.type === "FuncCall") {
           const target = this.shared.workspace.resolve(s.expr.name);
           if (target?.kind === "userFunction") {
@@ -513,75 +517,11 @@ export class Lowerer {
               );
             }
           }
-        }
-        // Special-case `disp(arg)` at statement level so codegen can emit
-        // a direct call to the runtime helper instead of a value-bearing
-        // call.
-        if (
-          s.expr.type === "FuncCall" &&
-          s.expr.name === "disp" &&
-          s.expr.args.length === 1
-        ) {
-          const arg = this.lowerExpr(s.expr.args[0]);
-          // Codegen can only print scalars or named tensor variables; a
-          // tensor expression has no addressable storage to hand to the
-          // runtime helper, so reject it with a span before codegen.
-          // Exception: CharLit (non-owning literal handle) is always OK.
-          if (
-            isMultiElement(arg.ty) &&
-            arg.kind !== "Var" &&
-            arg.kind !== "CharLit"
-          ) {
-            throw new UnsupportedConstruct(
-              `'disp' of a tensor expression is only supported for ` +
-                `variable references; assign the value to a name first`,
-              s.expr.args[0].span
-            );
+          const builtin = getBuiltin(s.expr.name);
+          if (builtin?.lowerStmt) {
+            const lowered = builtin.lowerStmt(this, s.expr.args, s.span);
+            if (lowered !== null) return lowered;
           }
-          // Same restriction for strings: a bare concat expression has
-          // no named buffer to hand to the runtime helper, and the
-          // owned result would leak. Allow `StringLit` (cheap, points
-          // at .rodata) and `Var`; reject otherwise.
-          if (
-            isString(arg.ty) &&
-            arg.kind !== "Var" &&
-            arg.kind !== "StringLit"
-          ) {
-            throw new UnsupportedConstruct(
-              `'disp' of a string expression is only supported for string ` +
-                `literals or variables; assign the value to a name first`,
-              s.expr.args[0].span
-            );
-          }
-          return { kind: "Disp", arg, span: s.span };
-        }
-        // Special-case `error(arg)` at statement level. `error` is a
-        // statement-only builtin that never returns; we lower it to a
-        // dedicated IRStmt so codegen can emit a direct
-        // `mtoc_error_string(arg);` call. Only single-arg string form
-        // is supported today; numbl's `error(id, fmt, ...)` shapes are
-        // deferred.
-        if (
-          s.expr.type === "FuncCall" &&
-          s.expr.name === "error" &&
-          s.expr.args.length === 1
-        ) {
-          const arg = this.lowerExpr(s.expr.args[0]);
-          if (!isString(arg.ty)) {
-            throw new UnsupportedConstruct(
-              `'error' currently requires a single string argument ` +
-                `(got ${typeToString(arg.ty)})`,
-              s.expr.args[0].span
-            );
-          }
-          if (arg.kind !== "Var" && arg.kind !== "StringLit") {
-            throw new UnsupportedConstruct(
-              `'error' of a string expression is only supported for string ` +
-                `literals or variables; assign the value to a name first`,
-              s.expr.args[0].span
-            );
-          }
-          return { kind: "Error", arg, span: s.span };
         }
         const expr = this.lowerExpr(s.expr);
         // A bare tensor-valued expression at statement scope can't be
