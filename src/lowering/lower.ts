@@ -34,7 +34,6 @@ import type {
 import {
   isMultiElement,
   isScalarReal,
-  isNumeric,
   MType,
   scalarComplex,
   scalarDouble,
@@ -136,14 +135,32 @@ export class Lowerer {
    *  read/write this directly. */
   env = new Map<string, MType>();
   /** Vars assigned inside the current scope. EXCLUDES params — they are
-   *  declared via the C function signature, not predeclared. Each entry
-   *  carries the C identifier so codegen never has to mangle. */
+   *  declared via the C function signature, not predeclared. Keyed by
+   *  the emitted C identifier — one entry per emitted C variable. A
+   *  single MATLAB name can produce multiple entries when an
+   *  incompatible reassignment is split into a fresh binding (see
+   *  `recordAssignment`). */
   private assignedVars = new Map<string, VarBinding>();
+  /** MATLAB name → current C identifier. Tracks both params and
+   *  assigned vars; updated when an incompatible reassignment splits a
+   *  variable. Reads of an Ident consult this so they see the current
+   *  binding's cName. */
+  private currentBindingCName = new Map<string, string>();
+  /** Counter for the synthetic suffix used when splitting an
+   *  incompatible reassignment. Per-scope so different functions don't
+   *  share numbering. */
+  private splitCounter = 0;
   /** Names of params for the current scope (function scope only). */
   private params: ReadonlySet<string>;
   /** Output variable for the current function scope, or null at script
    *  scope. Used to lower MATLAB `return` into `return <outputCName>;`. */
   private outputVar: string | null;
+  /** Nesting depth inside control-flow constructs. Bumped by
+   *  `lowerIf` / `lowerWhile` / `lowerFor` via `withControlDepth`.
+   *  Splitting an incompatible reassignment is only allowed at depth
+   *  0 — inside a branch or loop the merge would have to reconcile
+   *  bindings across arms / iterations, which Phase 1 doesn't attempt. */
+  controlDepth = 0;
 
   /** Function-specialization cache + workspace handle. Helpers in
    *  sibling files reach through this for user-call dispatch. */
@@ -151,15 +168,47 @@ export class Lowerer {
 
   constructor(
     shared: SharedSpecState,
-    paramBindings: Array<{ name: string; ty: MType }> = [],
+    paramBindings: Array<{ name: string; cName: string; ty: MType }> = [],
     outputVar: string | null = null
   ) {
     this.shared = shared;
     this.params = new Set(paramBindings.map(p => p.name));
     for (const p of paramBindings) {
       this.env.set(p.name, p.ty);
+      this.currentBindingCName.set(p.name, p.cName);
     }
     this.outputVar = outputVar;
+  }
+
+  /** Run `fn` with `controlDepth` incremented; restored on exit. Used by
+   *  the control-flow lowering helpers to mark "we're inside a branch
+   *  or loop body" so an incompatible reassignment falls into the throw
+   *  path rather than the split path. */
+  withControlDepth<T>(fn: () => T): T {
+    this.controlDepth++;
+    try {
+      return fn();
+    } finally {
+      this.controlDepth--;
+    }
+  }
+
+  /** Current C identifier bound to `name` in this scope, falling back
+   *  to the static cNameFor mapping when the name isn't tracked (e.g.
+   *  a fresh assignment whose cName is being computed at the call
+   *  site). Helpers lowering Ident reads / Return targets call this so
+   *  references see the post-split cName. */
+  currentCNameFor(name: string): string {
+    return this.currentBindingCName.get(name) ?? cNameFor(name);
+  }
+
+  /** Determine whether the unified type can be represented by a single
+   *  predeclared C variable. Numeric types need both dims statically
+   *  exact (so codegen knows the buffer size); Unknown / Void can never
+   *  share storage. */
+  private static canShareStorage(t: MType): boolean {
+    if (t.kind !== "Numeric") return false;
+    return t.rows.kind === "exact" && t.cols.kind === "exact";
   }
 
   // ── Statements ────────────────────────────────────────────────────────
@@ -181,51 +230,87 @@ export class Lowerer {
     return this.env.get(name);
   }
 
-  recordAssignment(name: string, ty: MType, span: Span): void {
+  /** Record `<name> = <expr-of-type ty>` in the current scope and
+   *  return the C identifier the lowered IR Assign should target.
+   *
+   *  Three cases:
+   *  - Param reassignment — env updates, no `assignedVars` entry, returns
+   *    the param's existing cName (params are declared via the function
+   *    signature).
+   *  - Compatible reassignment / first assignment — env updates,
+   *    `assignedVars` updated under the existing cName (or a fresh one
+   *    for the first write), returns that cName.
+   *  - Incompatible reassignment — the unified type can't live in a
+   *    single C variable (different elem kinds, non-exact dims, etc.).
+   *    At `controlDepth === 0` we split: a fresh cName is allocated and
+   *    a new `assignedVars` entry created; the old binding stays for
+   *    earlier reads. Inside control flow we throw — Phase 2 will lift
+   *    that with liveness analysis. */
+  recordAssignment(name: string, ty: MType, span: Span): string {
     assertNotMtocReserved(name, span);
-    // env tracks the LATEST type at the current program point — sequential
-    // assignment replaces, it does not unify with prior types.
+    // env tracks the LATEST type at the current program point —
+    // sequential assignment replaces, it does not unify with prior types.
     this.env.set(name, ty);
-    // assignedVars is the union of every type the variable has held in
-    // this scope. Codegen uses it to predeclare a single C variable that
-    // can hold all observed types. When the union returns Unknown, the
-    // two assignments can't share one C storage location — flag it at
-    // the offending line.
-    if (!this.params.has(name)) {
-      const prevBinding = this.assignedVars.get(name);
-      const prev = prevBinding?.ty;
-      const merged = prev ? unify(prev, ty) : ty;
-      if (prev && merged.kind === "Unknown") {
-        throw new TypeError(
-          `'${name}' was previously ${typeToString(prev)} and is now being ` +
-            `reassigned to ${typeToString(ty)}; mtoc cannot represent both in ` +
-            `one C variable. Use a different name for the new value.`,
-          span
-        );
-      }
-      // Reject assignments that would unify into a tensor with non-exact
-      // dims — codegen needs an exact size for the predeclared storage.
-      // This typically arises when two assignments give the variable
-      // different shapes (e.g. `v=[1 2 3]` then `v=[1 2 3 4]`).
-      if (
-        prev &&
-        isNumeric(merged) &&
-        isMultiElement(merged) &&
-        (merged.rows.kind !== "exact" || merged.cols.kind !== "exact")
-      ) {
-        throw new UnsupportedConstruct(
-          `'${name}' was previously ${typeToString(prev)} and is now being ` +
-            `assigned ${typeToString(ty)}; mtoc requires a fixed shape ` +
-            `across all assignments to a tensor variable. Use a different ` +
-            `name for the new value.`,
-          span
-        );
-      }
-      this.assignedVars.set(name, {
-        ty: merged,
-        cName: prevBinding?.cName ?? cNameFor(name),
-      });
+
+    if (this.params.has(name)) {
+      // Params keep their fixed cName (declared by the C function
+      // signature). Phase 1 doesn't split params.
+      return this.currentBindingCName.get(name) ?? cNameFor(name);
     }
+
+    const prevCName = this.currentBindingCName.get(name);
+    const prevBinding = prevCName
+      ? this.assignedVars.get(prevCName)
+      : undefined;
+
+    if (!prevBinding) {
+      // First assignment in this scope.
+      const cName = cNameFor(name);
+      this.assignedVars.set(cName, { ty, cName });
+      this.currentBindingCName.set(name, cName);
+      return cName;
+    }
+
+    const merged = unify(prevBinding.ty, ty);
+    if (Lowerer.canShareStorage(merged)) {
+      // Compatible — widen the existing binding's type in place.
+      this.assignedVars.set(prevBinding.cName, {
+        ty: merged,
+        cName: prevBinding.cName,
+      });
+      return prevBinding.cName;
+    }
+
+    // Incompatible. Either split (depth 0) or throw.
+    if (this.controlDepth === 0) {
+      this.splitCounter++;
+      const splitCName = `_mtoc_${cNameFor(name)}__v${this.splitCounter}`;
+      this.assignedVars.set(splitCName, { ty, cName: splitCName });
+      this.currentBindingCName.set(name, splitCName);
+      return splitCName;
+    }
+
+    // The merged-type Unknown branch and the non-exact-dims branch report
+    // different errors today; preserve that distinction so the existing
+    // "use a different name" guidance still kicks in for char/struct
+    // mismatches versus shape conflicts.
+    if (merged.kind === "Unknown") {
+      throw new TypeError(
+        `'${name}' was previously ${typeToString(prevBinding.ty)} and is now ` +
+          `being reassigned to ${typeToString(ty)}; mtoc cannot represent ` +
+          `both in one C variable. Use a different name for the new value, ` +
+          `or hoist the reassignment outside the surrounding control-flow.`,
+        span
+      );
+    }
+    throw new UnsupportedConstruct(
+      `'${name}' was previously ${typeToString(prevBinding.ty)} and is now ` +
+        `being assigned ${typeToString(ty)}; mtoc requires a fixed shape ` +
+        `across all assignments to a tensor variable inside control flow. ` +
+        `Use a different name for the new value, or hoist the reassignment ` +
+        `outside the surrounding if/while/for.`,
+      span
+    );
   }
 
   /**
@@ -306,12 +391,13 @@ export class Lowerer {
 
       case "Assign": {
         const rhs = this.lowerExpr(s.expr);
-        this.recordAssignment(s.name, rhs.ty, s.span);
         // Reject non-exact dims up front: codegen needs a statically
         // known numel to emit a stack-backed `mtoc_tensor_t`, and a
         // multi-element RHS without exact dims has nowhere safe to
         // land. We surface this at lowering time so the user sees a
         // span. (TensorLit always has exact dims by construction.)
+        // Done before recordAssignment so this never produces a
+        // never-emit-able split binding.
         if (
           isMultiElement(rhs.ty) &&
           rhs.kind !== "TensorLit" &&
@@ -324,10 +410,11 @@ export class Lowerer {
             s.span
           );
         }
+        const cName = this.recordAssignment(s.name, rhs.ty, s.span);
         return {
           kind: "Assign",
           name: s.name,
-          cName: cNameFor(s.name),
+          cName,
           rhs,
           ty: rhs.ty,
           span: s.span,
@@ -391,7 +478,7 @@ export class Lowerer {
         }
         return {
           kind: "ReturnFromFunction",
-          outputCName: cNameFor(this.outputVar),
+          outputCName: this.currentCNameFor(this.outputVar),
           span: s.span,
         };
       }
@@ -448,7 +535,7 @@ export class Lowerer {
           return {
             kind: "Var",
             name: e.name,
-            cName: cNameFor(e.name),
+            cName: this.currentCNameFor(e.name),
             ty,
             span: e.span,
           };

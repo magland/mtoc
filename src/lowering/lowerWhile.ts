@@ -13,14 +13,16 @@ export function lowerWhile(
   this: Lowerer,
   s: Extract<Stmt, { type: "While" }>
 ): IRStmt {
-  const envBefore = new Map(this.env);
-  const cond = this.lowerExpr(s.cond);
-  this.requireScalarReal(cond.ty, "while condition", s.span);
-  const body = this.lowerStmts(s.body);
-  this.env = this.mergeBranchEnvs(
-    [envBefore, new Map(this.env)],
-    s.span,
-    "while"
-  );
-  return { kind: "While", cond, body, span: s.span };
+  return this.withControlDepth(() => {
+    const envBefore = new Map(this.env);
+    const cond = this.lowerExpr(s.cond);
+    this.requireScalarReal(cond.ty, "while condition", s.span);
+    const body = this.lowerStmts(s.body);
+    this.env = this.mergeBranchEnvs(
+      [envBefore, new Map(this.env)],
+      s.span,
+      "while"
+    );
+    return { kind: "While", cond, body, span: s.span };
+  });
 }

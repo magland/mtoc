@@ -15,7 +15,6 @@ import {
   signIsPositive,
   SCALAR_DOUBLE,
 } from "./types.js";
-import { cNameFor } from "./lower.js";
 import type { Lowerer } from "./lower.js";
 
 export function lowerFor(
@@ -76,25 +75,35 @@ export function lowerFor(
       loopVarSign = "nonpositive";
     }
   }
-  // Snapshot before introducing the loop variable; after the loop, the
-  // merge widens the loop var's type with `zero` so the post-loop sign
-  // reflects "loop may not have run".
-  const envBefore = new Map(this.env);
-  this.recordAssignment(s.varName, scalarDouble(loopVarSign), s.span);
-  const body = this.lowerStmts(s.body);
-  this.env = this.mergeBranchEnvs(
-    [envBefore, new Map(this.env)],
-    s.span,
-    "for"
-  );
-  return {
-    kind: "For",
-    var: s.varName,
-    cVar: cNameFor(s.varName),
-    start,
-    step,
-    end,
-    body,
-    span: s.span,
-  };
+  return this.withControlDepth(() => {
+    // Snapshot before introducing the loop variable; after the loop,
+    // the merge widens the loop var's type with `zero` so the post-loop
+    // sign reflects "loop may not have run". The loop-var assignment
+    // happens INSIDE the depth wrap so an incompatible re-typing of an
+    // outer variable falls into the throw path rather than splitting
+    // (the post-merge env would have no way to reconcile a split that
+    // only exists inside the body).
+    const envBefore = new Map(this.env);
+    const cVar = this.recordAssignment(
+      s.varName,
+      scalarDouble(loopVarSign),
+      s.span
+    );
+    const body = this.lowerStmts(s.body);
+    this.env = this.mergeBranchEnvs(
+      [envBefore, new Map(this.env)],
+      s.span,
+      "for"
+    );
+    return {
+      kind: "For",
+      var: s.varName,
+      cVar,
+      start,
+      step,
+      end,
+      body,
+      span: s.span,
+    };
+  });
 }

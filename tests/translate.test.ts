@@ -23,11 +23,14 @@ const repoRoot = resolve(here, "..");
 const cliPath = join(repoRoot, "src", "cli.ts");
 const example1Path = join(repoRoot, "examples", "example1.m");
 
-function translate(source: string): string {
+function translate(
+  source: string,
+  opts: { includeRuntime?: boolean } = {}
+): string {
   const ast = parseMFile(source, "test.m");
   const ws = new Workspace("test.m");
   ws.addFile({ name: "test.m", source, ast });
-  return emitC(lower(ast, ws));
+  return emitC(lower(ast, ws), opts);
 }
 
 describe("translate scalar example", () => {
@@ -122,10 +125,30 @@ describe("translate scalar example", () => {
     );
   });
 
-  it("rejects shape-changing reassignment at lowering with a span", () => {
+  it("splits a top-level shape-changing reassignment into two C variables", () => {
+    // v gets two distinct shapes at script top level; the lowerer
+    // allocates a fresh `_mtoc_v__v<N>` binding for the second
+    // assignment so both can coexist in the same scope.
+    const c = translate("v = [1 2 3];\ndisp(v);\nv = [1 2 3 4];\ndisp(v);\n");
+    expect(c).toMatch(/mtoc_tensor_t v = \{ _mtoc_v_re,/);
+    expect(c).toMatch(
+      /mtoc_tensor_t _mtoc_v__v\d+ = \{ _mtoc__mtoc_v__v\d+_re,/
+    );
+    // Both disps are emitted, on the two different bindings.
+    expect(c).toMatch(/mtoc_disp_tensor\(v\);/);
+    expect(c).toMatch(/mtoc_disp_tensor\(_mtoc_v__v\d+\);/);
+  });
+
+  it("splits a scalar→tensor top-level reassignment", () => {
+    const c = translate("x = 4;\ndisp(x);\nx = [1 2 3];\ndisp(x);\n");
+    expect(c).toMatch(/double x = 0\.0;/);
+    expect(c).toMatch(/mtoc_tensor_t _mtoc_x__v\d+ /);
+  });
+
+  it("still rejects shape-changing reassignment inside control flow", () => {
     let err: unknown;
     try {
-      translate("v = [1 2 3];\nv = [1 2 3 4];\n");
+      translate("v = [1 2 3];\nif 1\n  v = [1 2 3 4];\nend\n");
     } catch (e) {
       err = e;
     }
@@ -133,7 +156,16 @@ describe("translate scalar example", () => {
     const e = err as { name: string; message: string; span: unknown };
     expect(e.name).toBe("UnsupportedConstruct");
     expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/fixed shape|dynamic|shape/i);
+    expect(e.message).toMatch(/inside control flow|hoist/i);
+  });
+
+  it("does not split when reassigning to a compatible type", () => {
+    // x stays scalar real on both writes — should remain a single
+    // `double x` declaration with no split bindings introduced.
+    const c = translate("x = 1;\nx = x + 1;\nx = x * 10;\ndisp(x);\n");
+    const decls = c.match(/double x = 0\.0;/g) ?? [];
+    expect(decls.length).toBe(1);
+    expect(c).not.toMatch(/_mtoc_x__v/);
   });
 
   it("rejects a tensor literal embedded inside a binary expression", () => {
@@ -198,6 +230,44 @@ describe("CLI translate + run", () => {
       })
     ).toThrow();
   });
+
+  it("translate with no output path writes to stdout", () => {
+    const stdout = execFileSync(
+      "npx",
+      ["tsx", cliPath, "translate", example1Path],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    ).toString();
+    expect(stdout).toContain("int main(void)");
+    expect(stdout).toContain("mtoc_disp_double(z);");
+  });
+
+  it("translate --no-runtime omits helper bodies", () => {
+    const stdout = execFileSync(
+      "npx",
+      ["tsx", cliPath, "translate", example1Path, "--no-runtime"],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    ).toString();
+    expect(stdout).toContain("int main(void)");
+    expect(stdout).toContain("mtoc_disp_double(z);"); // referenced
+    expect(stdout).not.toContain("static void mtoc_disp_double"); // not defined
+  });
+
+  it("run --no-runtime is rejected with a clear error", () => {
+    let stderr = "";
+    expect(() => {
+      try {
+        execFileSync(
+          "npx",
+          ["tsx", cliPath, "run", example1Path, "--no-runtime"],
+          { stdio: ["ignore", "pipe", "pipe"] }
+        );
+      } catch (e) {
+        stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? "";
+        throw e;
+      }
+    }).toThrow();
+    expect(stderr).toMatch(/--no-runtime is incompatible with `run`/);
+  });
 });
 
 describe("complex scalar codegen", () => {
@@ -238,6 +308,50 @@ describe("complex scalar codegen", () => {
     expect(c).toContain("double _Complex z = 0.0;");
     expect(c).toContain("z = (2.5 * I);");
     expect(c).toContain("mtoc_disp_complex(z);");
+  });
+});
+
+describe("emitC includeRuntime option", () => {
+  // The runtime-helper bodies (mtoc_format_double, mtoc_disp_double,
+  // mtoc_tensor_t typedef, etc.) get omitted when includeRuntime is
+  // false. User code, user-function specializations, main(), and the
+  // headers needed by the user code itself stay.
+
+  it("default (includeRuntime: true) includes runtime helpers", () => {
+    const c = translate("v = [1 2 3]; s = sum(v); disp(s);");
+    expect(c).toContain("typedef struct {");
+    expect(c).toContain("mtoc_tensor_t");
+    expect(c).toContain("static double mtoc_sum");
+    expect(c).toContain("static int mtoc_format_double");
+    expect(c).toContain("static void mtoc_disp_double");
+  });
+
+  it("includeRuntime: false omits the runtime-helper bodies", () => {
+    const c = translate("v = [1 2 3]; s = sum(v); disp(s);", {
+      includeRuntime: false,
+    });
+    // No helper bodies / typedef.
+    expect(c).not.toContain("typedef struct {");
+    expect(c).not.toContain("static double mtoc_sum");
+    expect(c).not.toContain("static int mtoc_format_double");
+    expect(c).not.toContain("static void mtoc_disp_double");
+    // User code still references the helper names — caller's link
+    // environment supplies them.
+    expect(c).toContain("mtoc_tensor_t v");
+    expect(c).toContain("mtoc_sum(v)");
+    expect(c).toContain("mtoc_disp_double(s)");
+    expect(c).toContain("int main(void) {");
+  });
+
+  it("includeRuntime: false drops runtime-only headers but keeps user-code headers", () => {
+    // disp_tensor pulls in <stdlib.h> and <string.h> for malloc/strlen.
+    // With runtime stripped, those should disappear; <stdio.h> always
+    // stays, and <math.h> stays because the for-loop emits floor().
+    const c = translate("for k = 1:5; disp(k); end", { includeRuntime: false });
+    expect(c).toContain("#include <stdio.h>");
+    expect(c).toContain("#include <math.h>"); // user code uses floor()
+    expect(c).not.toContain("#include <stdlib.h>");
+    expect(c).not.toContain("#include <string.h>");
   });
 });
 

@@ -20,20 +20,57 @@ function usage(): never {
   process.stderr.write(
     [
       "Usage:",
-      "  mtoc translate <input.m> <output.c>",
+      "  mtoc translate <input.m> [output.c] [--no-runtime]",
       "  mtoc run <input.m>",
+      "",
+      "Options:",
+      "  --no-runtime    Skip the runtime-helper bodies (mtoc_format_double,",
+      "                  mtoc_disp_double, mtoc_tensor_t typedef, …) and the",
+      "                  headers they pull in. Useful when embedding mtoc",
+      "                  output into a project that supplies its own runtime.",
+      "",
+      "When <output.c> is omitted, the translated C is written to stdout.",
       "",
     ].join("\n")
   );
   process.exit(2);
 }
 
-function compileMtoCSource(source: string, inputName: string): string {
+interface CompileOptions {
+  includeRuntime: boolean;
+}
+
+function compileMtoCSource(
+  source: string,
+  inputName: string,
+  opts: CompileOptions
+): string {
   const ast = parseMFile(source, inputName);
   const workspace = new Workspace(inputName);
   workspace.addFile({ name: inputName, source, ast });
   const ir = lower(ast, workspace);
-  return emitC(ir);
+  return emitC(ir, { includeRuntime: opts.includeRuntime });
+}
+
+interface ParsedArgs {
+  positional: string[];
+  noRuntime: boolean;
+}
+
+function parseArgs(args: string[]): ParsedArgs {
+  const positional: string[] = [];
+  let noRuntime = false;
+  for (const a of args) {
+    if (a === "--no-runtime") {
+      noRuntime = true;
+    } else if (a.startsWith("--")) {
+      process.stderr.write(`mtoc: unknown option '${a}'\n`);
+      usage();
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, noRuntime };
 }
 
 function reportError(e: unknown, inputPath: string, source: string): never {
@@ -50,14 +87,21 @@ function reportError(e: unknown, inputPath: string, source: string): never {
 }
 
 function cmdTranslate(args: string[]): void {
-  if (args.length !== 2) usage();
-  const [inputPath, outputPath] = args;
+  const { positional, noRuntime } = parseArgs(args);
+  if (positional.length < 1 || positional.length > 2) usage();
+  const [inputPath, outputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
   let cSource: string;
   try {
-    cSource = compileMtoCSource(source, basename(inputPath));
+    cSource = compileMtoCSource(source, basename(inputPath), {
+      includeRuntime: !noRuntime,
+    });
   } catch (e) {
     reportError(e, inputPath, source);
+  }
+  if (outputPath === undefined) {
+    process.stdout.write(cSource);
+    return;
   }
   const outDir = dirname(resolve(outputPath));
   mkdirSync(outDir, { recursive: true });
@@ -65,12 +109,21 @@ function cmdTranslate(args: string[]): void {
 }
 
 function cmdRun(args: string[]): void {
-  if (args.length !== 1) usage();
-  const [inputPath] = args;
+  const { positional, noRuntime } = parseArgs(args);
+  if (positional.length !== 1) usage();
+  if (noRuntime) {
+    process.stderr.write(
+      "mtoc: --no-runtime is incompatible with `run` (the runtime helpers are required to compile and execute).\n"
+    );
+    process.exit(2);
+  }
+  const [inputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
   let cSource: string;
   try {
-    cSource = compileMtoCSource(source, basename(inputPath));
+    cSource = compileMtoCSource(source, basename(inputPath), {
+      includeRuntime: true,
+    });
   } catch (e) {
     reportError(e, inputPath, source);
   }

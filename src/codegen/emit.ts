@@ -780,7 +780,7 @@ function emitTensorLitAssign(
   }
 }
 
-/** Emit predeclarations for a {matlabName → VarBinding} table. Scalars
+/** Emit predeclarations for a {cName → VarBinding} table. Scalars
  *  become `double <cName> = 0.0;` (real) or `double _Complex <cName> = 0.0;`
  *  (complex). Multi-element real tensors get a stack-backed
  *  `mtoc_tensor_t <cName>` whose `real` points at a sibling
@@ -794,11 +794,11 @@ function emitDeclarations(
   level: number,
   vars: ReadonlyMap<string, VarBinding>
 ): void {
-  // Iteration order: by numbl name so the generated declaration order
-  // is stable across runs and matches the original (pre-mangling) names.
-  const names = [...vars.keys()].sort();
-  for (const name of names) {
-    const binding = vars.get(name)!;
+  // Iteration order: by C identifier so the generated declaration order
+  // is stable across runs.
+  const cNames = [...vars.keys()].sort();
+  for (const key of cNames) {
+    const binding = vars.get(key)!;
     const { ty, cName } = binding;
     if (isScalarReal(ty)) {
       pushStmt(state, level, `double ${cName} = 0.0;`);
@@ -812,7 +812,7 @@ function emitDeclarations(
       const numel = staticNumElements(ty);
       if (numel === null) {
         throw new Error(
-          `codegen internal: variable '${name}' has dynamic dimensions ` +
+          `codegen internal: variable '${cName}' has dynamic dimensions ` +
             `(${typeToString(ty)}); should have been rejected at lowering`
         );
       }
@@ -844,7 +844,7 @@ function emitDeclarations(
       continue;
     }
     throw new Error(
-      `codegen: unsupported declaration for '${name}': ${typeToString(ty)}`
+      `codegen: unsupported declaration for '${cName}': ${typeToString(ty)}`
     );
   }
 }
@@ -909,7 +909,23 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
   return [...functionHeaderComment(fn), sig, ...lines, `  ${cReturn}`, "}"];
 }
 
-export function emitC(prog: IRProgram): string {
+/** Options for `emitC`. */
+export interface EmitOptions {
+  /** When false, the runtime-helper bodies (`mtoc_format_double`,
+   *  `mtoc_disp_double`, `mtoc_tensor_t` typedef, etc.) are omitted
+   *  from the output. Headers contributed solely by those snippets
+   *  are likewise omitted; standard headers needed by the user code
+   *  itself (`<math.h>` for `floor()` in for-loops, `<complex.h>`
+   *  when complex appears) stay. The caller is then responsible for
+   *  providing `mtoc_*` symbols at link time — useful when embedding
+   *  mtoc output into a project that supplies its own runtime.
+   *  Default: true (full self-contained translation unit). */
+  includeRuntime?: boolean;
+}
+
+export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
+  const includeRuntime = opts.includeRuntime ?? true;
+
   const state: EmitState = {
     needMath: { value: false },
     needComplex: { value: false },
@@ -941,16 +957,22 @@ export function emitC(prog: IRProgram): string {
   emitDeclarations(state, 1, prog.assignedVars);
   for (const s of prog.stmts) emitStmt(state, 1, s);
 
-  // Headers: union of explicit needs + every runtime snippet's headers.
+  // Headers: explicit needs from user code, plus runtime-snippet
+  // headers when those snippets are part of the output. With
+  // `includeRuntime: false`, only the user-code-level needs survive
+  // — the caller's link environment supplies whatever the runtime
+  // helpers would have brought in.
   const headerSet = new Set<string>(["<stdio.h>"]);
   if (state.needMath.value) headerSet.add("<math.h>");
   if (state.needComplex.value) headerSet.add("<complex.h>");
-  for (const snippet of state.runtime) {
-    for (const h of snippet.headers) headerSet.add(h);
+  if (includeRuntime) {
+    for (const snippet of state.runtime) {
+      for (const h of snippet.headers) headerSet.add(h);
+    }
   }
   const headers = [...headerSet].map(h => `#include ${h}`);
 
-  const runtimeBlocks = state.runtime.map(s => s.code);
+  const runtimeBlocks = includeRuntime ? state.runtime.map(s => s.code) : [];
 
   const out: string[] = [...headers, ""];
   for (const block of runtimeBlocks) {

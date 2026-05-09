@@ -162,8 +162,9 @@ export interface IRFunction {
   outputCName: string;
   returnTy: MType;
   /** Locals declared inside the body (excluding params). Keyed by
-   *  MATLAB name; each entry carries the C identifier the codegen
-   *  emits for that variable's storage. */
+   *  C identifier — one entry per emitted C variable. A single MATLAB
+   *  name may produce multiple entries when the lowerer splits an
+   *  incompatible reassignment (see `Lowerer.recordAssignment`). */
   assignedVars: Map<string, VarBinding>;
   body: IRStmt[];
   span: Span;
@@ -176,7 +177,9 @@ export interface IRFunction {
 export interface IRProgram {
   /** Variables assigned anywhere in the program (with their inferred
    *  type and C identifier). Codegen uses this to predeclare them at
-   *  the top of main(). */
+   *  the top of main(). Keyed by C identifier — see the same field on
+   *  `IRFunction` for why a single MATLAB name can map to several
+   *  entries. */
   assignedVars: Map<string, VarBinding>;
   /** User-function specializations, in lowering order. Emitted before
    *  `main()` in the C output. */

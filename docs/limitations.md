@@ -13,9 +13,15 @@ workaround or a roadmap note.
   across iterations may keep a sound but imprecise post-loop type — usually
   `unknown`. The merge function documents the gap. Fixpoint iteration is part
   of the larger "decouple type inference from IR construction" roadmap item.
-- **Variable re-typing across kinds is rejected.** `x = 3; x = 'hi';` errors
-  at the second assignment because mtoc can't fit both in one C variable.
-  Use a different name.
+- **Variable re-typing across kinds is split at top level, rejected
+  inside control flow.** At script or function-body top level, an
+  assignment whose new type can't share a C variable with the prior
+  binding is lowered to a fresh `_mtoc_<name>__v<N>` C variable; later
+  reads of the same name see the new binding. Inside an `if` / `while`
+  / `for` body the same pattern still errors at the second assignment —
+  the merge across branches/iterations would need to reconcile distinct
+  bindings, which Phase 1 doesn't attempt. The workaround inside
+  control flow is to rename, or hoist the reassignment outside.
 
 ## Tensors
 

@@ -11,11 +11,21 @@ be reasoned about statically.
 
 ```bash
 npx tsx src/cli.ts translate input.m output.c   # write the .c
+npx tsx src/cli.ts translate input.m            # write to stdout
+npx tsx src/cli.ts translate input.m --no-runtime  # skip runtime helpers
 npx tsx src/cli.ts run       input.m            # translate + compile + run
 ```
 
 `run` translates to a temporary directory, compiles with `cc` (override via the
 `CC` env var), and runs the resulting binary, streaming stdout/stderr through.
+
+`--no-runtime` omits the inline runtime-helper bodies (`mtoc_format_double`,
+`mtoc_disp_double`, the `mtoc_tensor_t` typedef, …) and the headers those
+snippets pull in, leaving just the user code. Useful when embedding mtoc
+output into a project that supplies its own runtime; the caller is then
+responsible for providing `mtoc_*` symbols at link time. Headers needed by
+the user code itself (`<math.h>` for for-loops, `<complex.h>` for complex)
+stay.
 
 ## What works today
 

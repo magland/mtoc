@@ -365,7 +365,11 @@ function specialize(
       matlabName,
       params: paramBindings,
       outputVar: outputName,
-      outputCName: cNameFor(outputName),
+      // After body lowering, the output variable's binding may have
+      // been split (top-level reassignment with an incompatible type);
+      // ask the lowerer for the current cName so the implicit
+      // end-of-function `return <cName>;` reads the live binding.
+      outputCName: inner.currentCNameFor(outputName),
       returnTy,
       assignedVars: inner.getAssignedVars(),
       body,

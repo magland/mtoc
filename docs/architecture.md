@@ -71,6 +71,17 @@ Lowering does several jobs in one walk:
   per-branch envs at the merge point (using the predeclared-zero default for
   variables that fall through unassigned). It's currently single-pass;
   oscillating loops can be sound-but-imprecise, documented in the merge.
+  The control-flow helpers also bump `controlDepth` so an incompatible
+  reassignment inside a branch falls through to an error rather than the
+  variable-splitting path (next bullet).
+- **Variable splitting**: at top level (`controlDepth === 0`), if a
+  reassignment's new type can't share a single C variable with the prior
+  binding (Unknown unify, or non-exact dims after widening), the lowerer
+  allocates a fresh `_mtoc_<cName>__v<N>` C identifier and starts a new
+  `assignedVars` entry. Subsequent reads of the same MATLAB name resolve
+  to the new binding via `currentBindingCName`. Inside control flow the
+  same conflict throws, with a message pointing the user at hoisting or
+  renaming.
 - **C-name mangling**: every `IRExpr.Var` / `IRStmt.Assign` / `IRFunction` param
   / loop-counter carries a `cName` field computed once via `cNameFor`. Codegen
   never re-mangles. The synthetic prefix `_mtoc_` is reserved.
