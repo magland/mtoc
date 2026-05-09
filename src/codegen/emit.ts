@@ -683,6 +683,39 @@ function findShapeSourceVar(
   }
 }
 
+/** Walk an IR expression and collect every distinct multi-element
+ *  `Var` on its RHS, keyed by C identifier so duplicates collapse
+ *  (the canonical `v .* v` case yields a single entry). The walk
+ *  order matches `findShapeSourceVar`'s left-first DFS, so the
+ *  shape-source picked there is also the first entry in the returned
+ *  Map — a nice property for emitting stable shape-check pairs.
+ *  Scalars (NumLit, ImagLit, scalar Vars) are skipped: broadcast
+ *  handles any shape, so they have nothing to check against. */
+function collectMultiElementVarsByCName(
+  e: IRExpr,
+  out: Map<string, Extract<IRExpr, { kind: "Var" }>>
+): void {
+  switch (e.kind) {
+    case "Var":
+      if (isMultiElement(e.ty) && !out.has(e.cName)) out.set(e.cName, e);
+      return;
+    case "Binary":
+      collectMultiElementVarsByCName(e.left, out);
+      collectMultiElementVarsByCName(e.right, out);
+      return;
+    case "Unary":
+      collectMultiElementVarsByCName(e.operand, out);
+      return;
+    case "Call":
+      for (const a of e.args) collectMultiElementVarsByCName(a, out);
+      return;
+    case "NumLit":
+    case "ImagLit":
+    case "TensorLit":
+      return;
+  }
+}
+
 /** Emit an Assign whose multi-element RHS is NOT a TensorLit. Pattern:
  *  read shape from a deterministic shape-source `Var`, allocate a
  *  fresh staging buffer (so reads from the target inside the body
@@ -715,7 +748,33 @@ function emitTensorAssignFromExpr(
   const iterName = iterId === 0 ? "_mtoc_i" : `_mtoc_i${iterId}`;
   const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
 
+  // Collect every distinct multi-element Var in the RHS (keyed by
+  // cName so duplicates like `v .* v` collapse). The shape source
+  // already picked by `findShapeSourceVar` is the first entry; for
+  // every other Var we emit one `mtoc_check_shape(<source>, <other>)`
+  // before the staging-buffer alloc. Same-Var and scalar-broadcast
+  // cases produce zero checks. The check is once-per-assign — once
+  // the source is shape-compatible with every other operand, every
+  // per-element read inside the loop is in bounds.
+  const multiVars = new Map<string, Extract<IRExpr, { kind: "Var" }>>();
+  collectMultiElementVarsByCName(rhs, multiVars);
+  const checkPairs: Array<Extract<IRExpr, { kind: "Var" }>> = [];
+  for (const [cName, v] of multiVars) {
+    if (cName === src.cName) continue;
+    checkPairs.push(v);
+  }
+  if (checkPairs.length > 0) {
+    useRuntimeByName(state, "mtoc_check_shape");
+  }
+
   pushStmt(state, level, `{`);
+  for (const other of checkPairs) {
+    pushStmt(
+      state,
+      level + 1,
+      `mtoc_check_shape(${src.cName}, ${other.cName});`
+    );
+  }
   pushStmt(state, level + 1, `long _mtoc_rows = ${src.cName}.rows;`);
   pushStmt(state, level + 1, `long _mtoc_cols = ${src.cName}.cols;`);
   pushStmt(state, level + 1, `long _mtoc_n = _mtoc_rows * _mtoc_cols;`);

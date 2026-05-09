@@ -380,6 +380,51 @@ describe("CLI translate + run", () => {
   });
 });
 
+describe("elementwise shape check", () => {
+  // The runtime helper `mtoc_check_shape` traps same-category
+  // mismatches the dim lattice can't reject statically (e.g. two
+  // row vectors of different runtime widths). Codegen emits one
+  // call per distinct non-source multi-element Var, just before
+  // the staging-buffer alloc.
+
+  it("aborts with a clear diagnostic on shape-mismatched elementwise op", () => {
+    const tmp = mkdtempSync(join(tmpdir(), "mtoc-test-"));
+    const inputM = join(tmp, "bad_shape.m");
+    writeFileSync(inputM, "a = [1 2 3];\nb = [4 5];\nc = a + b;\ndisp(c);\n");
+    let err: { stderr?: Buffer | string } | null = null;
+    let stderr = "";
+    try {
+      execFileSync("npx", ["tsx", cliPath, "run", inputM], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch (e) {
+      err = e as { stderr?: Buffer | string };
+      stderr = err.stderr?.toString() ?? "";
+    }
+    expect(err).not.toBeNull();
+    expect(stderr).toMatch(/shape mismatch/);
+    expect(stderr).toMatch(/1 x 3/); // dimensions in the diagnostic
+    expect(stderr).toMatch(/1 x 2/);
+  });
+
+  it("does not emit mtoc_check_shape for the same-Var case (v .* v)", () => {
+    const c = translate("v = [1 2 3];\nw = v .* v;\ndisp(w);\n");
+    // Only one distinct multi-element Var on the RHS, so the helper
+    // is neither activated nor called. Confirm both: no body and no
+    // call site.
+    expect(c).not.toContain("mtoc_check_shape");
+  });
+
+  it("emits mtoc_check_shape(<source>, <other>) for two distinct multi-element Vars", () => {
+    const c = translate("v = [1 2 3];\nw = [4 5 6];\nr = v + w;\ndisp(r);\n");
+    // The shape-source is the first multi-element Var encountered
+    // (`v`); the check is emitted against `w`.
+    expect(c).toContain("mtoc_check_shape(v, w);");
+    // And the helper body is present.
+    expect(c).toMatch(/static void mtoc_check_shape\(/);
+  });
+});
+
 describe("complex scalar codegen", () => {
   // Cross-runner tests live in test_scripts/complex/; these vitest
   // assertions cover the codegen shapes that exercise builtins or paths

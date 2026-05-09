@@ -104,6 +104,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_alloc", MTOC_ALLOC],
   ["mtoc_disp_tensor", MTOC_DISP_TENSOR],
   ["mtoc_disp_tensor_complex", MTOC_DISP_TENSOR_COMPLEX],
+  ["mtoc_check_shape", loadSnippet("check_shape.h", ["mtoc_tensor_t"])],
   ["mtoc_mod", loadSnippet("mod.h")],
   ["mtoc_sign", loadSnippet("sign.h")],
   ["mtoc_sum", loadSnippet("sum.h", ["mtoc_tensor_t"])],

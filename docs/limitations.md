@@ -32,12 +32,6 @@ workaround or a roadmap note.
   (`total([1 2 3])` and `total([1 2 3 4])` share one mangled function)
   and lets a tensor variable take on different runtime shapes via free +
   realloc at the assignment site.
-- **No runtime shape-mismatch check yet.** Categorical mismatches
-  (rowVec + colVec) are rejected at lowering, but a same-category
-  pair with different runtime sizes (e.g. `[1 2 3] + [4 5]`) is
-  accepted at lowering and produces undefined behavior or a crash at
-  runtime. A follow-up stage will add an `mtoc_check_shape` runtime
-  helper that traps the mismatch with a clear diagnostic.
 - **Builtins for runtime-shape allocation aren't here yet.**
   `zeros(N, M)`, `ones(N, M)`, etc. with a runtime size still raise
   `UnsupportedConstruct`. The codegen path for dynamic-shape allocation

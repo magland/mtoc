@@ -112,6 +112,22 @@ recognize it. It tells the compiler that two distinct `mtoc_tensor_t`
 values' buffers do not alias each other, which the autovectorizer relies on
 for elementwise loops.
 
+**Shape-mismatch trap (`mtoc_check_shape`).** With the coarse dim lattice
+the type system no longer catches same-category shape mismatches like
+`[1 2 3] + [4 5]` at lowering. The codegen closes the gap at the
+elementwise-assign site: it picks the same shape source as
+`findShapeSourceVar` and emits one `mtoc_check_shape(<source>, <other>)`
+per distinct non-source multi-element Var on the RHS, just before the
+staging-buffer alloc. The helper compares `rows` and `cols`; on mismatch
+it prints `mtoc: shape mismatch in elementwise op - got (R x C) and
+(R' x C')` to stderr and `abort()`s. Same-Var cases (`v .* v`) and
+scalar-broadcast cases (`v .* 2`, `-v`) emit zero checks, since there
+is nothing to compare against. The check is once-per-assign — once the
+source agrees in shape with every other operand, every per-element read
+inside the loop is in-bounds. Lives at `runtime/check_shape.h`,
+registered as the `mtoc_check_shape` snippet, and depends on
+`mtoc_tensor_t`.
+
 Scalars do **not** use the struct. Real scalars are bare `double`; complex
 scalars are `double _Complex` (C99).
 
