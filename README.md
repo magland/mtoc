@@ -77,10 +77,15 @@ The subset is growing iteratively. Roughly:
   `atan2`, `hypot`, `power`
 - Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`
   (full registry: [`src/workspace/builtins.ts`](src/workspace/builtins.ts))
-- User-defined functions (single output, scalar input or tensor input,
-  scalar return for now), with one specialization per unique call-site
-  argument-type tuple. Tensor params are borrowed by value — the body
-  cannot reassign one (introduce a fresh local instead)
+- User-defined functions with 0, 1, or N≥2 scalar outputs (input may
+  be scalar or tensor; outputs must be scalars today). One
+  specialization per unique call-site argument-type tuple. The C ABI
+  is picked per output count: 0 → `void`, 1 → return-by-value, N≥2 →
+  `void` with one `T *_mtoc_o<i>` out-pointer per output. Multi-
+  output calls use the `[a, b] = foo(x);` syntax (with `~` to drop a
+  slot); 0-output and N-output functions can also be invoked as bare
+  statements `foo(x);`. Tensor params are owned by the callee under
+  copy-on-arg-pass — the body can reassign them freely
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
 - Complex numbers (scalar and tensor): literals (`1i`, `2.5i`,

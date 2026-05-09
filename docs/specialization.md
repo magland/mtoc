@@ -75,14 +75,41 @@ names back to source. The same comment shape applies to tensor parameters —
 `typeToString` renders e.g. `Numeric<rowVec(1x5), real>` and the emitted C
 signature uses `mtoc_tensor_t v` for that param (borrowed by value).
 
+## Output conventions
+
+mtoc supports user functions with **0, 1, or N≥2** scalar outputs. The
+emitted C ABI is picked per output count:
+
+- **0 outputs**: `static void <mangled>(args) { … }`. A bare-statement call
+  `foo(x);` lowers to `<mangled>(args);`.
+- **1 output**: classic return-by-value — `static T <mangled>(args) { … }`,
+  with `return <local>;` at every exit. Scalar real → `double`; scalar
+  complex → `double _Complex`.
+- **N≥2 outputs**: `static void <mangled>(args, T1 *_mtoc_o0, T2 *_mtoc_o1, …)`.
+  At every exit (the implicit fall-through and every explicit `return;`),
+  the codegen writes each output's local through the matching out-pointer
+  (`*_mtoc_o<i> = <cName>;`) and then `return;`s.
+
+The N-output call site looks like `[a, b] = foo(x);` (with `~` to ignore
+a slot, e.g. `[~, q] = divmod(a, b);`). The codegen wraps the call in
+a `{ … }` block; ignored slots get a `T_i _mtoc_discard_<callIdx>_<slot>;`
+local declared inline so the discard temps stay scoped to the call.
+Calling an N-output function as a bare statement (`foo(x);`) is the
+"drop-all" form — every slot becomes a discard temp.
+
+`[a] = foo(x);` where `foo` has 1 output is equivalent to
+`a = foo(x);`. Asking for more outputs than the callee provides
+(`[a, b] = single_output_foo(x);`) is rejected at lowering with a
+span.
+
 ## Limitations
 
-- Single output per function. Multi-output (`[a, b] = f(x)`) is not yet
-  supported — when added, the C path will likely use output pointers.
-- Tensor-valued parameters are now supported (real or complex; borrowed by
-  value as `mtoc_tensor_t`). Tensor params cannot be reassigned in the body
-  — introduce a fresh local instead. Tensor-valued returns are still
-  rejected at lowering; sret arrives in a later stage.
+- Each output must be a scalar today (real or complex). Tensor-valued
+  outputs are still rejected at lowering for both single- and
+  multi-output functions; sret arrives in a later stage.
+- Tensor-valued parameters are supported (real or complex; borrowed by
+  value as `mtoc_tensor_t`). Tensor params can be reassigned in the body
+  via copy-on-arg-pass.
 - Local functions only — function files (one function per `.m` file) and
   workspace-wide dispatch from numbl's `functionResolve.ts` aren't yet
   inherited beyond the local-function case.

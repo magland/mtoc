@@ -55,7 +55,7 @@ import { lowerFor } from "./lowerFor.js";
 import { lowerWhile } from "./lowerWhile.js";
 import { lowerBinary } from "./lowerBinary.js";
 import { lowerUnary } from "./lowerUnary.js";
-import { lowerFuncCall } from "./lowerFuncCall.js";
+import { lowerFuncCall, lowerMultiAssignCall } from "./lowerFuncCall.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
 
 // Reserved C identifiers that need mangling. Mirrors numbl's
@@ -159,9 +159,19 @@ export class Lowerer {
   private splitCounter = 0;
   /** Names of params for the current scope (function scope only). */
   private params: ReadonlySet<string>;
-  /** Output variable for the current function scope, or null at script
-   *  scope. Used to lower MATLAB `return` into `return <outputCName>;`. */
-  private outputVar: string | null;
+  /** Output variables for the current function scope, in declaration
+   *  order. Empty array at script scope and inside zero-output
+   *  functions; length 1 for classic single-output functions; length ≥
+   *  2 for multi-output. Used to (1) decide whether `return` is legal
+   *  here and (2) populate `IRStmt.ReturnFromFunction.outputCNames`
+   *  with the LIVE post-lowering cName of every output via
+   *  `currentCNameFor`. */
+  private outputVars: string[];
+  /** True iff this lowerer is lowering inside a function body. Empty
+   *  `outputVars` alone can't distinguish script scope from a zero-
+   *  output function — both have nothing to return — so this flag
+   *  drives the "is `return` legal here?" check. */
+  private isInsideFunction: boolean;
   /** Nesting depth inside control-flow constructs. Bumped by
    *  `lowerIf` / `lowerWhile` / `lowerFor` via `withControlDepth`.
    *  Splitting an incompatible reassignment is only allowed at depth
@@ -176,7 +186,8 @@ export class Lowerer {
   constructor(
     shared: SharedSpecState,
     paramBindings: Array<{ name: string; cName: string; ty: MType }> = [],
-    outputVar: string | null = null
+    outputVars: string[] = [],
+    isInsideFunction = false
   ) {
     this.shared = shared;
     this.params = new Set(paramBindings.map(p => p.name));
@@ -184,7 +195,8 @@ export class Lowerer {
       this.env.set(p.name, p.ty);
       this.currentBindingCName.set(p.name, p.cName);
     }
-    this.outputVar = outputVar;
+    this.outputVars = outputVars;
+    this.isInsideFunction = isInsideFunction;
   }
 
   /** Run `fn` with `controlDepth` incremented; restored on exit. Used by
@@ -474,6 +486,29 @@ export class Lowerer {
       }
 
       case "ExprStmt": {
+        // Bare-statement user-function call: 0-output and N≥2-output
+        // user functions can't appear in expression position (their C
+        // ABI is `void` + out-pointers, not return-by-value), so we
+        // route them to `MultiAssignCall` here. 1-output user calls
+        // continue through the regular `lowerExpr` → `ExprStmt(Call)`
+        // pipeline so the emitted C is the existing `(void)(foo(x));`
+        // shape. Builtins always go through the regular path.
+        if (s.expr.type === "FuncCall") {
+          const target = this.shared.workspace.resolve(s.expr.name);
+          if (target?.kind === "userFunction") {
+            const fnAst = this.shared.workspace.localFunctions.get(s.expr.name);
+            if (fnAst && fnAst.outputs.length !== 1) {
+              return lowerMultiAssignCall.call(
+                this,
+                fnAst,
+                s.expr.name,
+                s.expr.args,
+                [],
+                s.span
+              );
+            }
+          }
+        }
         // Special-case `disp(arg)` at statement level so codegen can emit
         // a direct call to the runtime helper instead of a value-bearing
         // call.
@@ -581,7 +616,7 @@ export class Lowerer {
         return { kind: "Continue", span: s.span };
 
       case "Return": {
-        if (this.outputVar === null) {
+        if (this.outputVars.length === 0 && !this.isInsideFunction) {
           throw new UnsupportedConstruct(
             `'return' at script scope is not supported (only inside functions)`,
             s.span
@@ -589,13 +624,51 @@ export class Lowerer {
         }
         return {
           kind: "ReturnFromFunction",
-          outputCName: this.currentCNameFor(this.outputVar),
+          outputCNames: this.outputVars.map(o => this.currentCNameFor(o)),
           span: s.span,
         };
       }
 
       case "For":
         return lowerFor.call(this, s);
+
+      case "MultiAssign": {
+        // `[a, b, ~] = foo(x);` — only legal when `foo` resolves to a
+        // user function; multi-assigning a builtin isn't supported
+        // because builtins are scalar return-by-value and have no
+        // multi-output convention in mtoc today.
+        if (s.expr.type !== "FuncCall") {
+          throw new UnsupportedConstruct(
+            `multi-assign right-hand side must be a user-function call`,
+            s.span
+          );
+        }
+        const target = this.shared.workspace.resolve(s.expr.name);
+        if (target?.kind !== "userFunction") {
+          throw new UnsupportedConstruct(
+            `multi-assign of '${s.expr.name}' is not supported ` +
+              `(only user-defined functions can appear on the right of ` +
+              `\`[...] = ...\`)`,
+            s.span
+          );
+        }
+        const fnAst = this.shared.workspace.localFunctions.get(s.expr.name);
+        if (!fnAst) {
+          throw new UnsupportedConstruct(
+            `internal: workspace claimed '${s.expr.name}' is a user function ` +
+              `but no AST is registered`,
+            s.span
+          );
+        }
+        return lowerMultiAssignCall.call(
+          this,
+          fnAst,
+          s.expr.name,
+          s.expr.args,
+          s.lvalues,
+          s.span
+        );
+      }
 
       default:
         throw new UnsupportedConstruct(
@@ -908,6 +981,16 @@ function validateStmt(s: IRStmt): void {
       rejectNestedOwnedExpr(s.step);
       rejectNestedOwnedExpr(s.end);
       validateStmts(s.body);
+      return;
+    case "MultiAssignCall":
+      // Multi-output user-function calls accept the same arg shapes
+      // as a regular `Call` in expression position — every nested
+      // owned producer is rejected. (User-function signatures only
+      // accept numeric scalars/tensors today, so this loop never
+      // sees a string-concat or TensorLit at the top level — but
+      // run the check uniformly with `Assign.rhs` for the day a
+      // user-function arg admits a top-level owned producer.)
+      for (const a of s.args) rejectNestedOwnedExpr(a);
       return;
     case "Break":
     case "Continue":

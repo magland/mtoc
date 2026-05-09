@@ -26,6 +26,7 @@ import {
   isNumeric,
   isString,
   typeToString,
+  type MType,
   type NumericType,
 } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
@@ -257,6 +258,28 @@ interface EmitState {
    *  inside the body don't graduate to the post-loop freed set,
    *  because the loop may have iterated zero times. */
   freedOwned: Set<string>;
+  /** The outputs[] array of the user function currently being emitted,
+   *  or null at script scope. Drives the codegen for
+   *  `IRStmt.ReturnFromFunction`:
+   *    - null   : script scope. (Lowering rejects `return` here, so a
+   *               ReturnFromFunction reaching emit means a lowerer escape.)
+   *    - length 0: zero-output function — emit a bare `return;` (no
+   *               value).
+   *    - length 1: classic single-output function — emit
+   *               `return <cName>;` (return-by-value).
+   *    - length ≥ 2: multi-output function — emit `*_mtoc_o<i> = <cName>;`
+   *               for each output, then `return;`. */
+  currentFunctionOutputs: ReadonlyArray<{
+    name: string;
+    cName: string;
+    ty: MType;
+  }> | null;
+  /** Counter for synthetic discard-temp suffixes used at multi-output
+   *  call sites (`_mtoc_discard_<N>_<slot>`). Each `MultiAssignCall`
+   *  takes the next available index and bumps the counter, so two
+   *  adjacent calls don't collide even though the temps are scoped
+   *  inside per-call `{}` blocks. */
+  multiAssignCallCounter: number;
 }
 
 /** Build the small facade view passed to `BuiltinSig.emit` closures.
@@ -688,6 +711,15 @@ function analyzeStmt(state: EmitState, s: IRStmt): void {
       analyzeExpr(state, s.cond);
       for (const t of s.body) analyzeStmt(state, t);
       return;
+    case "MultiAssignCall":
+      // Mirrors the `Call` case in `analyzeExpr`: a user-function
+      // call doesn't itself need <math.h>, but we set the flag for
+      // structural symmetry with the analyzer's Call handling — the
+      // arg pre-walk also activates any builtin runtime helpers a
+      // sub-expression depends on.
+      state.needMath.value = true;
+      for (const a of s.args) analyzeExpr(state, a);
+      return;
     case "Break":
     case "Continue":
     case "ReturnFromFunction":
@@ -1051,7 +1083,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       pushStmt(state, level, `continue;`);
       break;
 
-    case "ReturnFromFunction":
+    case "ReturnFromFunction": {
       // Free every tensor backing in the enclosing function's scope
       // before we return — but skip ones already freed earlier on
       // this linear path so the same var doesn't get a redundant
@@ -1059,7 +1091,10 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // tensor params) by `emitFunctionBody`. Lowering only emits
       // this kind inside a function body, so the field is always
       // non-null here.
-      if (state.currentScopeVars === null) {
+      if (
+        state.currentScopeVars === null ||
+        state.currentFunctionOutputs === null
+      ) {
         throw new Error(
           "codegen internal: ReturnFromFunction reached emit outside a " +
             "function scope; should have been rejected at lowering"
@@ -1071,8 +1106,116 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         state.currentScopeVars,
         state.freedOwned
       );
-      pushStmt(state, level, `return ${s.outputCName};`);
+      const outputs = state.currentFunctionOutputs;
+      if (outputs.length === 0) {
+        // Zero-output function: no value to carry back, no out-pointer
+        // writes. Emit a bare `return;` so the C control-flow path is
+        // explicit. Falls through cleanly to the `void` return type
+        // emitted by `emitFunction`.
+        pushStmt(state, level, `return;`);
+      } else if (outputs.length === 1) {
+        // Classic single-output convention: return-by-value of the
+        // local that holds the output's current value at this exit
+        // point. The lowerer captured that live cName when it built
+        // the IR node.
+        pushStmt(state, level, `return ${s.outputCNames[0]};`);
+      } else {
+        // Multi-output convention: write each output's local into
+        // the corresponding `_mtoc_o<i>` out-pointer (declared as a
+        // C parameter by `emitFunction`), then `return;`.
+        for (let i = 0; i < outputs.length; i++) {
+          pushStmt(state, level, `*_mtoc_o${i} = ${s.outputCNames[i]};`);
+        }
+        pushStmt(state, level, `return;`);
+      }
       break;
+    }
+
+    case "MultiAssignCall": {
+      // Multi-output / 0-output user-function call. The invariant set
+      // by `lowerMultiAssignCall`:
+      //   - `outputs.length === 0`           → 0-output bare statement
+      //   - `outputs.length >= 2`            → either an N-output
+      //     `[a, b, ~] = foo(x);` or the drop-all bare form
+      //     `foo(x);` (every slot.binding is null).
+      // The call site never appears with `outputs.length === 1`
+      // because that case routes to `Assign` / `ExprStmt(Call)` in
+      // lowering (1-output is return-by-value).
+      const argStrs = s.args.map(a => {
+        const inner = emitExpr(state, a, 0);
+        // Copy-on-arg-pass for tensor args, mirroring the regular
+        // `Call` path in `emitExpr`.
+        if (isMultiElement(a.ty)) {
+          if (isCharArray(a.ty)) {
+            useRuntimeByName(state, "mtoc_char_tensor_copy");
+            return `mtoc_char_tensor_copy(${inner})`;
+          }
+          const helper =
+            isNumeric(a.ty) && a.ty.isComplex
+              ? "mtoc_tensor_copy_complex"
+              : "mtoc_tensor_copy";
+          useRuntimeByName(state, helper);
+          return `${helper}(${inner})`;
+        }
+        return inner;
+      });
+      if (s.outputs.length === 0) {
+        // Zero-output: simplest form — bare `<mangled>(args);`. No
+        // discard temps, no surrounding block.
+        pushStmt(state, level, `${s.mangled}(${argStrs.join(", ")});`);
+        // An owned LHS reassigned via the call's outputs would have
+        // been recorded already (see the freedOwned bookkeeping
+        // below); 0-output calls have nothing to reset.
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
+        break;
+      }
+      // N≥2-output: open a `{}` block so any discard temps stay
+      // scoped to the call. For each ignored slot, declare a typed
+      // `_mtoc_discard_<callIdx>_<slot>` local and pass its address;
+      // for each named slot, pass the address of the lowered
+      // binding's predeclared local. Per-call counter on the
+      // EmitState gives each call a unique suffix for its temps,
+      // even though they're structurally scoped — handy when reading
+      // the emitted C diff for unrelated calls.
+      const callIdx = state.multiAssignCallCounter++;
+      pushStmt(state, level, `{`);
+      const outArgs: string[] = [];
+      for (let i = 0; i < s.outputs.length; i++) {
+        const slot = s.outputs[i];
+        const cTy = cTypeFor(slot.ty);
+        if (cTy === null) {
+          throw new Error(
+            `codegen internal: MultiAssignCall slot ${i} of '${s.name}' ` +
+              `has unsupported type ${typeToString(slot.ty)}`
+          );
+        }
+        if (slot.binding === null) {
+          const tmp = `_mtoc_discard_${callIdx}_${i}`;
+          pushStmt(state, level + 1, `${cTy} ${tmp};`);
+          outArgs.push(`&${tmp}`);
+        } else {
+          outArgs.push(`&${slot.binding.cName}`);
+        }
+      }
+      pushStmt(
+        state,
+        level + 1,
+        `${s.mangled}(${[...argStrs, ...outArgs].join(", ")});`
+      );
+      pushStmt(state, level, `}`);
+      // Reassigning to an owned LHS via the call clears its freed
+      // marker on the current linear path, mirroring `Assign` to an
+      // owned LHS. Today user-function outputs must be scalars (so
+      // never owned), but the bookkeeping stays consistent for the
+      // day they can be.
+      for (const slot of s.outputs) {
+        if (slot.binding !== null && isOwned(slot.ty)) {
+          state.freedOwned.delete(slot.binding.cName);
+        }
+      }
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
+    }
 
     case "For": {
       // Step is guaranteed to be a NumLit by lowering.
@@ -1669,6 +1812,7 @@ function emitFunctionBody(
   const outerScopeVars = state.currentScopeVars;
   const outerLiveness = state.futureTouches;
   const outerFreed = state.freedOwned;
+  const outerOutputs = state.currentFunctionOutputs;
   state.lines = [];
   // Predecls cover assignedVars only — params are declared by the C
   // signature. Scope-exit frees cover both: locals from the body and
@@ -1677,22 +1821,40 @@ function emitFunctionBody(
   state.currentScopeVars = freeOnExit;
   state.futureTouches = computeFutureTouches(fn.body);
   state.freedOwned = new Set();
+  state.currentFunctionOutputs = fn.outputs;
 
   emitDeclarations(state, 1, fn.assignedVars);
   for (const s of fn.body) emitStmt(state, 1, s);
   // Implicit fall-through return at the end of the function: free every
   // tensor backing not already released earlier on the linear path,
-  // then return the output. Early-exit `return` paths emitted by
-  // `IRStmt.ReturnFromFunction` carry their own copy of the free
-  // preamble (see `emitStmt`).
+  // then carry the output(s) back. Early-exit `return` paths emitted
+  // by `IRStmt.ReturnFromFunction` carry their own copy of the free
+  // preamble + output write (see `emitStmt`).
   emitScopeExitFrees(state, 1, freeOnExit, state.freedOwned);
-  pushStmt(state, 1, `return ${fn.outputCName};`);
+  if (fn.outputs.length === 0) {
+    // 0-output: C `void` function; no fall-through write or return
+    // value is needed. Skip the trailing `return;` — falling off the
+    // end of a `void` function is well-defined.
+  } else if (fn.outputs.length === 1) {
+    // Classic single-output convention: return-by-value of the
+    // post-body live binding's C name.
+    pushStmt(state, 1, `return ${fn.outputs[0].cName};`);
+  } else {
+    // Multi-output convention: write each output's local through the
+    // matching `_mtoc_o<i>` out-pointer, then `return;`. Out-pointers
+    // are declared as C parameters by `emitFunction`.
+    for (let i = 0; i < fn.outputs.length; i++) {
+      pushStmt(state, 1, `*_mtoc_o${i} = ${fn.outputs[i].cName};`);
+    }
+    pushStmt(state, 1, `return;`);
+  }
 
   const bodyLines = state.lines;
   state.lines = outerLines;
   state.currentScopeVars = outerScopeVars;
   state.futureTouches = outerLiveness;
   state.freedOwned = outerFreed;
+  state.currentFunctionOutputs = outerOutputs;
   return { lines: bodyLines };
 }
 
@@ -1702,7 +1864,8 @@ function emitFunctionBody(
 function functionHeaderComment(fn: IRFunction): string[] {
   const labelWidth = Math.max(
     "returns".length,
-    ...fn.params.map(p => p.name.length)
+    ...fn.params.map(p => p.name.length),
+    ...fn.outputs.map(o => o.name.length)
   );
   const pad = (s: string) => s.padEnd(labelWidth);
   const argSummary = fn.params.map(p => p.name).join(", ");
@@ -1720,26 +1883,53 @@ function functionHeaderComment(fn: IRFunction): string[] {
   for (const p of fn.params) {
     lines.push(` *   ${pad(p.name)} : ${typeToString(p.ty)}`);
   }
-  lines.push(` *   ${pad("returns")} : ${typeToString(fn.returnTy)}`);
+  if (fn.outputs.length === 0) {
+    lines.push(` *   ${pad("returns")} : (none)`);
+  } else if (fn.outputs.length === 1) {
+    lines.push(` *   ${pad("returns")} : ${typeToString(fn.outputs[0].ty)}`);
+  } else {
+    // Multi-output: render each output on its own line so the C ABI
+    // (out-pointer per output) is readable.
+    for (const o of fn.outputs) {
+      lines.push(` *   ${pad(o.name)} : ${typeToString(o.ty)} (out)`);
+    }
+  }
   lines.push(` */`);
   return lines;
 }
 
 function emitFunction(state: EmitState, fn: IRFunction): string[] {
-  // Lowering rejects tensor returns (sret is a future stage); any
-  // shape other than a scalar reaching here is a lowerer escape.
-  // Scalar real → `double`; scalar complex → `double _Complex` (the
-  // existing complex-scalar codegen path handles return-by-value via
-  // C99's native complex ABI).
-  const returnCTy = cTypeFor(fn.returnTy);
-  if (returnCTy === null || isMultiElement(fn.returnTy)) {
-    throw new Error(
-      `codegen: function '${fn.matlabName}' has unsupported return type ` +
-        `${typeToString(fn.returnTy)}`
-    );
+  // C return-type and outputs:
+  //   - 0 outputs   : `void` return type, no out-pointer params.
+  //   - 1 output    : classic return-by-value (scalar real → `double`,
+  //                   scalar complex → `double _Complex`).
+  //   - N outputs   : `void` return type plus one trailing
+  //                   `T_i *_mtoc_o<i>` parameter per output.
+  // Lowering rejects tensor outputs per-output (sret is a future
+  // stage); any tensor shape reaching here is a lowerer escape.
+  for (const o of fn.outputs) {
+    if (isMultiElement(o.ty)) {
+      throw new Error(
+        `codegen: function '${fn.matlabName}' output '${o.name}' has ` +
+          `unsupported type ${typeToString(o.ty)}`
+      );
+    }
   }
-  if (isNumeric(fn.returnTy) && fn.returnTy.isComplex) {
-    state.needComplex.value = true;
+  let returnCTy: string;
+  if (fn.outputs.length === 1) {
+    const cTy = cTypeFor(fn.outputs[0].ty);
+    if (cTy === null) {
+      throw new Error(
+        `codegen: function '${fn.matlabName}' has unsupported return type ` +
+          `${typeToString(fn.outputs[0].ty)}`
+      );
+    }
+    returnCTy = cTy;
+    if (isNumeric(fn.outputs[0].ty) && fn.outputs[0].ty.isComplex) {
+      state.needComplex.value = true;
+    }
+  } else {
+    returnCTy = "void";
   }
   // Per param: `cTypeFor` picks the C representation — `double` for
   // real scalars, `double _Complex` for complex scalars, and the
@@ -1765,6 +1955,22 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
     else if (isMultiElement(p.ty)) needsTensorTypedef = true;
     if (isNumeric(p.ty) && p.ty.isComplex) state.needComplex.value = true;
     paramParts.push(`${cTy} ${p.cName}`);
+  }
+  // Multi-output convention: append `T_i *_mtoc_o<i>` per output
+  // after the user params, in declaration order.
+  if (fn.outputs.length >= 2) {
+    for (let i = 0; i < fn.outputs.length; i++) {
+      const o = fn.outputs[i];
+      const cTy = cTypeFor(o.ty);
+      if (cTy === null) {
+        throw new Error(
+          `codegen: function '${fn.matlabName}' output '${o.name}' has ` +
+            `unsupported type ${typeToString(o.ty)}`
+        );
+      }
+      if (isNumeric(o.ty) && o.ty.isComplex) state.needComplex.value = true;
+      paramParts.push(`${cTy} *_mtoc_o${i}`);
+    }
   }
   if (needsTensorTypedef) {
     useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
@@ -1806,6 +2012,8 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     currentScopeVars: null,
     futureTouches: null,
     freedOwned: new Set(),
+    currentFunctionOutputs: null,
+    multiAssignCallCounter: 0,
   };
 
   // One-pass pre-walk: activates runtime helpers referenced by the

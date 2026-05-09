@@ -5,7 +5,7 @@
  * site gets the most-precise return type.
  */
 
-import type { Expr, Span } from "../parser/index.js";
+import type { Expr, LValue, Span } from "../parser/index.js";
 import { offsetToLine } from "../parser/sourceLoc.js";
 import {
   getBuiltin,
@@ -314,9 +314,13 @@ function validateDomain(
   }
 }
 
-/** Lower a user-function call. Specializes (or reuses an existing
- *  specialization) keyed by argument-type tuple, then emits a Call
- *  with `callee.kind="userFunc"`. */
+/** Lower a user-function call in *expression position*. Returns an
+ *  IRExpr.Call with `callee.kind="userFunc"`. Multi-output (`N≥2`)
+ *  and zero-output user functions cannot appear here — they require
+ *  the statement-form `MultiAssignCall` lowering (see `lowerMultiAssignCall`)
+ *  because their C ABI is `void` + out-pointers, not return-by-value.
+ *  Specializes the callee on its argument-type tuple (or reuses an
+ *  existing specialization). */
 export function lowerUserCall(
   this: Lowerer,
   name: string,
@@ -330,12 +334,165 @@ export function lowerUserCall(
       span
     );
   }
-  if (fnAst.outputs.length !== 1) {
+  if (fnAst.outputs.length === 0) {
     throw new UnsupportedConstruct(
-      `function '${name}' must have exactly one output (got ${fnAst.outputs.length})`,
+      `function '${name}' has no outputs and cannot be used in an ` +
+        `expression position; call it as a bare statement instead`,
       span
     );
   }
+  if (fnAst.outputs.length !== 1) {
+    throw new UnsupportedConstruct(
+      `function '${name}' has ${fnAst.outputs.length} outputs and cannot be ` +
+        `used in an expression position; assign via ` +
+        `\`[a, b, ...] = ${name}(...)\` (or call as a bare statement to drop ` +
+        `all outputs)`,
+      span
+    );
+  }
+  const spec = specializeUserCall.call(this, name, fnAst, argExprs, span);
+  return {
+    kind: "Call",
+    name,
+    callee: { kind: "userFunc", mangled: spec.mangledName },
+    args: spec.args,
+    ty: spec.spec.outputs[0].ty,
+    span,
+  };
+}
+
+/** Lower a statement-position user-function call:
+ *    [a, b] = foo(x);     // lvalues.length >= 1, names + ignores
+ *    foo(x);              // lvalues.length === 0  (drop-all)
+ *  Returns an `IRStmt` of one of three shapes depending on the
+ *  callee's output count:
+ *    - 1 output, 1 named lvalue       → `IRStmt.Assign`
+ *    - 1 output, 1 ignored lvalue     → `IRStmt.ExprStmt(Call)`  (drop)
+ *    - 1 output, 0 lvalues            → `IRStmt.ExprStmt(Call)`  (drop)
+ *    - 0 or N≥2 outputs               → `IRStmt.MultiAssignCall`
+ *  The 1-output paths reuse the existing return-by-value C ABI.
+ *  Multi-output / zero-output go through `MultiAssignCall` because
+ *  their C ABI is `void` + out-pointers, which has no return value
+ *  to consume. Static checks enforced here:
+ *    - lvalues.length must be ≤ fn.outputs.length
+ *    - lvalues are simple `Var` or `~` (other lvalue forms aren't
+ *      supported in numbl's static subset today)
+ *    - args lower as numeric (matching `lowerUserCall`'s constraint) */
+export function lowerMultiAssignCall(
+  this: Lowerer,
+  fnAst: FunctionStmt,
+  name: string,
+  argExprs: Expr[],
+  lvalues: ReadonlyArray<LValue>,
+  span: Span
+): import("./ir.js").IRStmt {
+  if (lvalues.length > fnAst.outputs.length) {
+    throw new UnsupportedConstruct(
+      `function '${name}' returns ${fnAst.outputs.length} output(s) ` +
+        `but ${lvalues.length} were requested`,
+      span
+    );
+  }
+  for (const lv of lvalues) {
+    if (lv.type !== "Var" && lv.type !== "Ignore") {
+      throw new UnsupportedConstruct(
+        `multi-assign lvalue must be a simple identifier or '~' ignore ` +
+          `(got '${lv.type}')`,
+        span
+      );
+    }
+  }
+
+  const { args, mangledName, spec } = specializeUserCall.call(
+    this,
+    name,
+    fnAst,
+    argExprs,
+    span
+  );
+
+  // 1-output specialization: route to the classic return-by-value
+  // shapes. (We arrive here from MultiAssign with 1 lvalue; ExprStmt
+  // bare-statement form for a 1-output function never reaches this
+  // helper — that path lowers via the regular `ExprStmt(Call)`
+  // pipeline already.)
+  if (spec.outputs.length === 1) {
+    const callExpr: IRExpr = {
+      kind: "Call",
+      name,
+      callee: { kind: "userFunc", mangled: mangledName },
+      args,
+      ty: spec.outputs[0].ty,
+      span,
+    };
+    if (lvalues.length === 0) {
+      // Drop-all of a single-output call: `foo(x);` as a bare stmt
+      // — the bare-statement path doesn't reach here today, but
+      // handling it keeps the helper total.
+      return { kind: "ExprStmt", expr: callExpr, span };
+    }
+    const lv = lvalues[0];
+    if (lv.type !== "Var") {
+      // Ignore (validated above as the only other allowed shape)
+      return { kind: "ExprStmt", expr: callExpr, span };
+    }
+    const cName = this.recordAssignment(lv.name, spec.outputs[0].ty, span);
+    return {
+      kind: "Assign",
+      name: lv.name,
+      cName,
+      rhs: callExpr,
+      ty: spec.outputs[0].ty,
+      span,
+    };
+  }
+
+  // 0-output and N≥2-output: build the MultiAssignCall outputs[]
+  // array. Each declared output of the callee becomes one slot in
+  // the IR. Slots not consumed by an lvalue (either past the end of
+  // `lvalues`, or explicitly an `Ignore`) are `null` — codegen
+  // synthesizes a discard temp inside the call's `{}` block. Named
+  // slots route through `recordAssignment` so the type and cName flow
+  // through the lowerer's binding tracking like any other Assign.
+  const outputs: {
+    ty: MType;
+    binding: { name: string; cName: string } | null;
+  }[] = [];
+  for (let i = 0; i < spec.outputs.length; i++) {
+    const slotTy = spec.outputs[i].ty;
+    const lv = lvalues[i];
+    if (lv === undefined || lv.type !== "Var") {
+      // `Ignore` (the only other shape after the validation above)
+      // becomes a discard-temp slot. `ty` is always populated so
+      // codegen can declare the temp with the right C type.
+      outputs.push({ ty: slotTy, binding: null });
+      continue;
+    }
+    const cName = this.recordAssignment(lv.name, slotTy, span);
+    outputs.push({ ty: slotTy, binding: { name: lv.name, cName } });
+  }
+  return {
+    kind: "MultiAssignCall",
+    name,
+    mangled: mangledName,
+    args,
+    outputs,
+    span,
+  };
+}
+
+/** Shared "lower args + specialize" pipeline used by both
+ *  expression-position calls (`lowerUserCall`) and statement-position
+ *  multi-assign / drop-all calls (`lowerMultiAssignCall`). Returns
+ *  the lowered args, the mangled specialization name, and the
+ *  IRFunction itself. */
+export function specializeUserCall(
+  this: Lowerer,
+  name: string,
+  fnAst: FunctionStmt,
+  argExprs: Expr[],
+  span: Span
+): { args: IRExpr[]; mangledName: string; spec: IRFunction } {
   if (argExprs.length !== fnAst.params.length) {
     throw new TypeError(
       `function '${name}' expects ${fnAst.params.length} argument(s), got ${argExprs.length}`,
@@ -354,7 +511,6 @@ export function lowerUserCall(
   }
   const argTypes = args.map(a => a.ty);
   const mangledName = mangleSpecName(name, argTypes);
-
   let spec = this.shared.cache.get(mangledName);
   if (!spec) {
     if (this.shared.inFlight.has(mangledName)) {
@@ -365,14 +521,7 @@ export function lowerUserCall(
     }
     spec = specialize.call(this, name, fnAst, argTypes, mangledName);
   }
-  return {
-    kind: "Call",
-    name,
-    callee: { kind: "userFunc", mangled: mangledName },
-    args,
-    ty: spec.returnTy,
-    span,
-  };
+  return { args, mangledName, spec };
 }
 
 /**
@@ -432,22 +581,44 @@ function specialize(
       cName: cNameFor(p),
       ty: argTypes[i],
     }));
-    const inner = new Lowerer(this.shared, paramBindings, fnAst.outputs[0]);
+    const inner = new Lowerer(
+      this.shared,
+      paramBindings,
+      fnAst.outputs.slice(),
+      true
+    );
     const body = inner.lowerStmts(fnAst.body);
-    const outputName = fnAst.outputs[0];
-    const returnTy = inner.envLookup(outputName);
-    if (!returnTy) {
-      throw new TypeError(
-        `function '${matlabName}' did not assign its output variable '${outputName}' on any path`,
-        fnAst.span
-      );
-    }
-    if (!isScalar(returnTy)) {
-      throw new UnsupportedConstruct(
-        `function '${matlabName}' must return a scalar — ` +
-          `tensor returns are not yet supported (got ${typeToString(returnTy)})`,
-        fnAst.span
-      );
+    // After body lowering: every declared output must have an assigned
+    // type on every path, and must be a scalar (tensor returns aren't
+    // supported yet). Each output's `cName` reflects the LIVE binding
+    // at the function's exit point — the lowerer's
+    // `recordAssignment` may have split the binding to a fresh
+    // `_mtoc_<name>__v<N>` if the output's type changed across a
+    // top-level reassignment, so we read the post-body cName via
+    // `currentCNameFor`. Codegen uses this `cName` for both the
+    // implicit fall-through return and the per-output writes
+    // emitted at every `IRStmt.ReturnFromFunction`.
+    const outputs: { name: string; cName: string; ty: MType }[] = [];
+    for (const outName of fnAst.outputs) {
+      const ty = inner.envLookup(outName);
+      if (!ty) {
+        throw new TypeError(
+          `function '${matlabName}' did not assign its output variable '${outName}' on any path`,
+          fnAst.span
+        );
+      }
+      if (!isScalar(ty)) {
+        throw new UnsupportedConstruct(
+          `function '${matlabName}' must return a scalar — ` +
+            `tensor returns are not yet supported (got ${typeToString(ty)})`,
+          fnAst.span
+        );
+      }
+      outputs.push({
+        name: outName,
+        cName: inner.currentCNameFor(outName),
+        ty,
+      });
     }
     const file = fnAst.span.file;
     const source = this.shared.workspace.files.get(file)?.source ?? "";
@@ -460,13 +631,7 @@ function specialize(
       mangledName,
       matlabName,
       params: paramBindings,
-      outputVar: outputName,
-      // After body lowering, the output variable's binding may have
-      // been split (top-level reassignment with an incompatible type);
-      // ask the lowerer for the current cName so the implicit
-      // end-of-function `return <cName>;` reads the live binding.
-      outputCName: inner.currentCNameFor(outputName),
-      returnTy,
+      outputs,
       assignedVars: inner.getAssignedVars(),
       body,
       span: fnAst.span,

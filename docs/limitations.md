@@ -60,8 +60,12 @@ workaround or a roadmap note.
 
 - **Recursion is rejected** with an explicit error. Lifting requires forward
   declarations + fixpoint return-type inference.
-- **Single output per function.** Multi-output `[a, b] = f(x)` will likely use
-  C output pointers when added.
+- **Multi-output is supported, but each output must be a scalar.**
+  `function [a, b] = f(x)` lowers to a `void`-returning C function with
+  one out-pointer per output; tensor-valued outputs are still rejected
+  at lowering. Zero-output functions (`function foo(x)`) and the
+  bare-statement call form `foo(x);` also work. See `docs/specialization.md`
+  for the full ABI.
 - **No anonymous functions / function handles** (`@(x) x*x`, `@sin`).
 - **No file-level functions** (one function per `.m` file). Today only local
   functions defined within the same script work. numbl's wider workspace

@@ -184,8 +184,11 @@ A scope-exit free walk remains as a safety net: every owned binding
 in `assignedVars` (plus owned tensor parameters under copy-on-arg-
 pass) gets a closing free at every scope exit — the implicit
 fall-through return at the end of `main()`, the implicit fall-through
-return at the end of every user function, and every explicit
-`IRStmt.ReturnFromFunction` early-return inside a function body. The
+return at the end of every user function (a `return <cName>;` for
+single-output, the `*_mtoc_o<i> = …; return;` writes for
+multi-output, or simply falling off the `void` body for zero-output),
+and every explicit `IRStmt.ReturnFromFunction` early-return inside a
+function body. The
 walk consults a per-path `freedOwned` tracker and skips any name
 already freed earlier on the linear flow (so unconditionally dead
 values don't get a redundant scope-exit free emit). Path tracking is conservative at branches: only vars freed

@@ -131,6 +131,14 @@ export function topLevelOwnedUses(s: IRStmt): Set<string> {
       collectOwnedVarsInExpr(s.step, out);
       collectOwnedVarsInExpr(s.end, out);
       return out;
+    case "MultiAssignCall":
+      // Args contribute owned reads in the same shape as `Call`'s args
+      // contribute through `Assign.rhs`. (User-function calls today
+      // accept tensor/string/char args, all of which get copied at
+      // the call site — but the read of the source still counts as a
+      // touch for the future-touch dataflow.)
+      for (const a of s.args) collectOwnedVarsInExpr(a, out);
+      return out;
     case "Break":
     case "Continue":
     case "ReturnFromFunction":
@@ -138,13 +146,23 @@ export function topLevelOwnedUses(s: IRStmt): Set<string> {
   }
 }
 
-/** Top-level owned defs for a statement — only an `Assign` to an
- *  owned-typed variable contributes. The assigned C-name is the
- *  variable's predeclared identifier (in main / function scope). */
+/** Top-level owned defs for a statement — `Assign` to an owned-typed
+ *  variable contributes; so does any non-null owned-typed slot of a
+ *  `MultiAssignCall`. (The latter is structural: today's user-
+ *  function outputs must be scalars and so are never owned, but the
+ *  pattern matches `Assign` for the day they can be.) The assigned
+ *  C-name is the variable's predeclared identifier (in main /
+ *  function scope). */
 export function topLevelOwnedDefs(s: IRStmt): Set<string> {
   const out = new Set<string>();
   if (s.kind === "Assign" && isOwned(s.ty)) {
     out.add(s.cName);
+  } else if (s.kind === "MultiAssignCall") {
+    for (const slot of s.outputs) {
+      if (slot.binding !== null && isOwned(slot.ty)) {
+        out.add(slot.binding.cName);
+      }
+    }
   }
   return out;
 }
@@ -186,7 +204,8 @@ function touchStmt(
     case "Assign":
     case "ExprStmt":
     case "Disp":
-    case "Error": {
+    case "Error":
+    case "MultiAssignCall": {
       const out = new Set(futureAfter);
       unionInto(out, topLevelOwnedUses(s));
       unionInto(out, topLevelOwnedDefs(s));

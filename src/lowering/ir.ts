@@ -176,9 +176,51 @@ export type IRStmt =
     }
   | { kind: "Break"; span: Span }
   | { kind: "Continue"; span: Span }
-  /** MATLAB `return` inside a function — emitted by lowering only when
-   *  inside a function scope. Codegen turns it into `return <outputCName>;`. */
-  | { kind: "ReturnFromFunction"; outputCName: string; span: Span };
+  /** numbl `return` inside a function — emitted by lowering only when
+   *  inside a function scope. For a 1-output function, codegen turns this
+   *  into `return <outputCNames[0]>;`; for a 0-output function, into
+   *  `return;`; for an N-output function (N≥2), into a sequence of
+   *  `*_mtoc_o<i> = <outputCNames[i]>;` writes followed by `return;`. */
+  | { kind: "ReturnFromFunction"; outputCNames: string[]; span: Span }
+  /** Multi-output / 0-output user-function call statement. Drives:
+   *    - `[a, b] = foo(x);`            (N≥2 outputs, mix of named lvalues
+   *                                     and ignored `~` slots)
+   *    - `foo(x);`                     (0-output bare statement)
+   *    - `foo(x);`                     (N-output statement form — every
+   *                                     output is dropped via a discard
+   *                                     temp, mirroring numbl's "drop-all"
+   *                                     semantics)
+   *  Each entry of `outputs` is either a real lvalue (the slot's typed
+   *  binding plus the C identifier the assigned value lands in — driven
+   *  through `recordAssignment` like any other Assign) or `null` for an
+   *  ignored slot. The codegen wraps the call in a `{ … }` block and
+   *  declares one inline `_mtoc_discard_<callIdx>_<slot>` per `null`
+   *  slot so those temporaries stay scoped to the call. */
+  | {
+      kind: "MultiAssignCall";
+      /** numbl name (for diagnostics). */
+      name: string;
+      /** Mangled C identifier of the user-function specialization. */
+      mangled: string;
+      args: IRExpr[];
+      /** One entry per output slot of the callee. `ty` is the slot's
+       *  static type (always populated, so codegen can declare a
+       *  typed discard temp for ignored slots). `binding` is the
+       *  destination — `null` means "ignored output" (`~` lvalue or
+       *  unconsumed trailing slot in `[a] = f_with_two_outputs(x);`),
+       *  in which case codegen emits a `_mtoc_discard_<call>_<slot>`
+       *  local of type `ty` and passes its address. A non-null
+       *  binding means "store the call's i-th output into
+       *  <binding.cName>; the lowerer has already registered the
+       *  assignment via recordAssignment, so the codegen-side
+       *  predeclaration pipeline picks it up like any other Assign
+       *  target". */
+      outputs: {
+        ty: MType;
+        binding: { name: string; cName: string } | null;
+      }[];
+      span: Span;
+    };
 
 /** A predeclared variable: its inferred type plus the C identifier the
  *  codegen will emit. Computed once during lowering so emit.ts never
@@ -192,15 +234,22 @@ export interface VarBinding {
 export interface IRFunction {
   /** Mangled C identifier (e.g. "sq__d"). */
   mangledName: string;
-  /** MATLAB-source name (for diagnostics). */
+  /** numbl-source name (for diagnostics). */
   matlabName: string;
   params: { name: string; cName: string; ty: MType }[];
-  /** MATLAB name of the output variable (for diagnostics). */
-  outputVar: string;
-  /** C identifier of the output variable. Codegen emits
-   *  `return <outputCName>;` at the bottom of the function body. */
-  outputCName: string;
-  returnTy: MType;
+  /** Output variables of the function specialization, in declaration
+   *  order. Empty when the function has zero outputs (statement-only
+   *  invocation); length 1 for the classic single-output convention
+   *  (return-by-value); length ≥ 2 for the multi-output convention
+   *  (extra `T_i *_mtoc_o<i>` C parameters appended after the user
+   *  params, body assigns to each output's local, and at every return
+   *  path the codegen writes `*_mtoc_o<i> = <cName>;`).
+   *  `name` is the numbl identifier (for diagnostics); `cName` is the
+   *  identifier of the local that holds the value just before the
+   *  return. After body lowering, the binding may have been split via
+   *  `recordAssignment` so `cName` reflects the LIVE binding at the
+   *  function's exit point, not the original declaration. */
+  outputs: { name: string; cName: string; ty: MType }[];
   /** Locals declared inside the body (excluding params). Keyed by
    *  C identifier — one entry per emitted C variable. A single MATLAB
    *  name may produce multiple entries when the lowerer splits an
