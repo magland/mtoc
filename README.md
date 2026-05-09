@@ -13,6 +13,7 @@ be reasoned about statically.
 npx tsx src/cli.ts translate input.m output.c   # write the .c
 npx tsx src/cli.ts translate input.m            # write to stdout
 npx tsx src/cli.ts translate input.m --no-runtime  # skip runtime helpers
+npx tsx src/cli.ts translate input.m --dump-ir  # dump lowered IR as JSON
 npx tsx src/cli.ts run       input.m            # translate + compile + run
 ```
 
@@ -56,6 +57,11 @@ output into a project that supplies its own runtime; the caller is then
 responsible for providing `mtoc_*` symbols at link time. Headers needed by
 the user code itself (`<math.h>` for for-loops, `<complex.h>` for complex)
 stay.
+
+`--dump-ir` skips C generation and prints the lowered IR as JSON instead.
+Useful when debugging the lowering pass or inspecting how a numbl construct
+becomes IR. `BuiltinSig` closures (in call targets) are stubbed as
+`"<builtin: name>"` since functions aren't JSON-serializable.
 
 ## What works today
 

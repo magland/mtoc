@@ -9,6 +9,11 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 
 import { translateProject, type TranslateError } from "./translate.js";
+import { parseMFile } from "./parser/index.js";
+import { Workspace } from "./workspace/workspace.js";
+import { lower } from "./lowering/lower.js";
+import { UnsupportedConstruct, TypeError } from "./lowering/errors.js";
+import { SyntaxError as ParseSyntaxError } from "./parser/errors.js";
 import { offsetToLine } from "./parser/sourceLoc.js";
 import { startServer } from "../server/execution-service.js";
 
@@ -16,7 +21,7 @@ function usage(): never {
   process.stderr.write(
     [
       "Usage:",
-      "  mtoc translate <input.m> [output.c] [--no-runtime]",
+      "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir]",
       "  mtoc run <input.m>",
       "  mtoc serve --passkey <key> [--port N] [--host HOST]",
       "",
@@ -25,6 +30,9 @@ function usage(): never {
       "                  mtoc_disp_double, mtoc_tensor_t typedef, …) and the",
       "                  headers they pull in. Useful when embedding mtoc",
       "                  output into a project that supplies its own runtime.",
+      "  --dump-ir       Dump the lowered IR as JSON instead of generating C.",
+      "                  BuiltinSig closures are stubbed as the builtin name.",
+      "                  Useful for debugging the lowering pass.",
       "",
       "When <output.c> is omitted, the translated C is written to stdout.",
       "",
@@ -41,14 +49,18 @@ function usage(): never {
 interface ParsedArgs {
   positional: string[];
   noRuntime: boolean;
+  dumpIr: boolean;
 }
 
 function parseArgs(args: string[]): ParsedArgs {
   const positional: string[] = [];
   let noRuntime = false;
+  let dumpIr = false;
   for (const a of args) {
     if (a === "--no-runtime") {
       noRuntime = true;
+    } else if (a === "--dump-ir") {
+      dumpIr = true;
     } else if (a.startsWith("--")) {
       process.stderr.write(`mtoc: unknown option '${a}'\n`);
       usage();
@@ -56,7 +68,7 @@ function parseArgs(args: string[]): ParsedArgs {
       positional.push(a);
     }
   }
-  return { positional, noRuntime };
+  return { positional, noRuntime, dumpIr };
 }
 
 function reportError(
@@ -90,10 +102,27 @@ function compile(
 }
 
 function cmdTranslate(args: string[]): void {
-  const { positional, noRuntime } = parseArgs(args);
+  const { positional, noRuntime, dumpIr } = parseArgs(args);
   if (positional.length < 1 || positional.length > 2) usage();
   const [inputPath, outputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
+  if (dumpIr) {
+    if (noRuntime) {
+      process.stderr.write(
+        "mtoc: --no-runtime has no effect with --dump-ir (no C is emitted).\n"
+      );
+    }
+    const out = dumpIrAsJson(source, basename(inputPath), inputPath);
+    if (outputPath === undefined) {
+      process.stdout.write(out);
+      process.stdout.write("\n");
+      return;
+    }
+    const outDir = dirname(resolve(outputPath));
+    mkdirSync(outDir, { recursive: true });
+    writeFileSync(outputPath, out + "\n");
+    return;
+  }
   const cSource = compile(source, basename(inputPath), !noRuntime, inputPath);
   if (outputPath === undefined) {
     process.stdout.write(cSource);
@@ -102,6 +131,80 @@ function cmdTranslate(args: string[]): void {
   const outDir = dirname(resolve(outputPath));
   mkdirSync(outDir, { recursive: true });
   writeFileSync(outputPath, cSource);
+}
+
+/** Lower the source and serialize the IR as JSON. Stubs `BuiltinSig`
+ *  closures (functions can't go through `JSON.stringify`) by replacing
+ *  the `sig` field with `"<builtin: name>"` so call sites stay
+ *  readable. Throws via `reportError` on any user-facing error. */
+function dumpIrAsJson(
+  source: string,
+  inputName: string,
+  inputPath: string
+): string {
+  const ws = new Workspace(inputName);
+  let ast;
+  try {
+    ast = parseMFile(source, inputName);
+    ws.addFile({ name: inputName, source, ast });
+  } catch (e) {
+    if (e instanceof ParseSyntaxError) {
+      reportError(
+        {
+          kind: "SyntaxError",
+          message: e.message,
+          fileName: e.file ?? inputName,
+          startOffset: e.position,
+          endOffset: e.position + 1,
+        },
+        inputPath,
+        source
+      );
+    }
+    throw e;
+  }
+  let ir;
+  try {
+    ir = lower(ast, ws);
+  } catch (e) {
+    if (e instanceof UnsupportedConstruct || e instanceof TypeError) {
+      reportError(
+        {
+          kind: e.name as "UnsupportedConstruct" | "TypeError",
+          message: e.message,
+          fileName: e.span?.file ?? inputName,
+          startOffset: e.span?.start,
+          endOffset: e.span?.end,
+        },
+        inputPath,
+        source
+      );
+    }
+    throw e;
+  }
+  return JSON.stringify(
+    ir,
+    (key, value) => {
+      // Map / Set are common in the IR (assignedVars is a Map) and
+      // serialize as `{}` / `{}` by default. Re-render as plain
+      // objects / arrays so the dump is informative.
+      if (value instanceof Map) {
+        return Object.fromEntries(value);
+      }
+      if (value instanceof Set) {
+        return [...value];
+      }
+      // BuiltinSig holds an emit closure that can't serialize.
+      // Render `callee: { kind: "builtin", sig: BuiltinSig }` as a
+      // string so the IR shape stays inspectable.
+      if (key === "sig" && typeof value === "object" && value !== null) {
+        const name = (value as { name?: string }).name;
+        return typeof name === "string" ? `<builtin: ${name}>` : "<builtin>";
+      }
+      return value;
+    },
+    2
+  );
 }
 
 function cmdRun(args: string[]): void {

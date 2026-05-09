@@ -560,6 +560,30 @@ describe("CLI translate + run", () => {
     }).toThrow();
     expect(stderr).toMatch(/--no-runtime is incompatible with `run`/);
   });
+
+  it("translate --dump-ir prints lowered-IR JSON", () => {
+    // The dump is a debugging surface — we only assert that the
+    // shape is JSON, includes the program-level fields, and renders
+    // BuiltinSig closures as their human-readable stub. Span and
+    // type metadata are intentionally not pinned to specific values
+    // so this test stays robust across IR-shape evolution.
+    const tmp = mkdtempSync(join(tmpdir(), "mtoc-test-"));
+    const inputM = join(tmp, "dump.m");
+    writeFileSync(inputM, "x = sqrt(4);\ndisp(x);\n");
+    const stdout = execFileSync(
+      "npx",
+      ["tsx", cliPath, "translate", inputM, "--dump-ir"],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    ).toString();
+    const parsed = JSON.parse(stdout) as Record<string, unknown>;
+    expect(parsed).toHaveProperty("assignedVars");
+    expect(parsed).toHaveProperty("functions");
+    expect(parsed).toHaveProperty("stmts");
+    // No raw `[object Object]` from a Map / Set falling through.
+    expect(stdout).not.toContain("[object Object]");
+    // BuiltinSig stubs render as the marker string, not as a closure.
+    expect(stdout).toContain('"<builtin: sqrt>"');
+  });
 });
 
 describe("elementwise shape check", () => {
