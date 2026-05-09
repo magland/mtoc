@@ -98,8 +98,13 @@ The subset is growing iteratively. Roughly:
     `M(2:5)`. `Range` preserves orientation for vectors and produces
     a row for matrix linear indexing; `Colon` always linearizes to a
     column. The step must be a numeric literal.
-  - Multi-slot range/colon (`M(:, j)`, `M(a:b, c:d)`), char-tensor
-    range reads, and indexed writes (`v(i) = x`) are still deferred.
+- Indexed scalar writes on real-or-complex double tensors: `v(i) = x`,
+  `M(i, j) = x`, `v(end) = x`. The base's heap buffer is mutated in
+  place. A real RHS into a complex base sets imag = 0 (numbl
+  semantics); a complex RHS into a real base is rejected at lowering.
+- Still deferred: multi-slot range/colon (`M(:, j)`, `M(a:b, c:d)`),
+  char-tensor range reads, char-tensor writes, range/colon indexed
+  writes (`v(2:5) = w`).
 - Complex numbers (scalar and tensor): literals (`1i`, `2.5i`,
   `3+4i`, `[1+2i, 3+4i]`), unary `+`/`-`, arithmetic (`+ - * /`),
   comparisons + logicals (numbl semantics: ordering on real part,

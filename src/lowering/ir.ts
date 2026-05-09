@@ -219,6 +219,27 @@ export type IRStmt =
       ty: MType;
       span: Span;
     }
+  | {
+      /** In-place scalar write at an index of a multi-element tensor:
+       *  `v(i) = x`, `M(i, j) = x`. The base's heap allocation is
+       *  reused — only one slot is mutated — so this is NOT an
+       *  owned re-assignment; the freed-set bookkeeping is left
+       *  alone. The RHS must be a scalar; type rules:
+       *    - real RHS into real base   → write `.real[off] = rhs;`
+       *    - real RHS into complex base → write `.real[off] = rhs;
+       *                                    .imag[off] = 0;` (numbl
+       *                                    semantics: real promotes).
+       *    - complex RHS into complex base → write both halves via a
+       *                                       `double _Complex` temp
+       *                                       so creal/cimag don't
+       *                                       double-evaluate the RHS.
+       *    - complex RHS into real base   → rejected at lowering. */
+      kind: "IndexStore";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      indices: IRExpr[];
+      rhs: IRExpr;
+      span: Span;
+    }
   | { kind: "ExprStmt"; expr: IRExpr; span: Span }
   | { kind: "Disp"; arg: IRExpr; span: Span }
   | {

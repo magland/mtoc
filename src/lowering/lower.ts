@@ -57,6 +57,7 @@ import { lowerWhile } from "./lowerWhile.js";
 import { lowerBinary } from "./lowerBinary.js";
 import { lowerUnary } from "./lowerUnary.js";
 import { lowerFuncCall, lowerMultiAssignCall } from "./lowerFuncCall.js";
+import { lowerIndexStore } from "./lowerIndexStore.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
 import {
   forEachStmtInTree,
@@ -502,6 +503,20 @@ export class Lowerer {
           ty: rhs.ty,
           span: s.span,
         };
+      }
+
+      case "AssignLValue": {
+        // The parser produces this for any non-bare-identifier LHS:
+        // `v(i) = x`, `obj.field = x`, `M(i,j) = x`, etc. We only
+        // handle the indexed-write form today; other lvalue kinds
+        // raise UnsupportedConstruct with a span.
+        if (s.lvalue.type !== "Index") {
+          throw new UnsupportedConstruct(
+            `assignment to a ${s.lvalue.type} lvalue is not yet supported`,
+            s.span
+          );
+        }
+        return lowerIndexStore.call(this, s.lvalue, s.expr, s.span);
       }
 
       case "ExprStmt": {

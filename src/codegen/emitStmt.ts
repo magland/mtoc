@@ -219,6 +219,63 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       break;
     }
 
+    case "IndexStore": {
+      // `<base>(idx) = rhs;` — write one slot of the base's heap
+      // buffer in place. Lowering already validated:
+      //   - base is a multi-element double tensor (real or complex)
+      //   - the indices are real scalars (1 or 2)
+      //   - the RHS is a numeric scalar; complex into real has been
+      //     rejected, so the only widening case is real RHS into a
+      //     complex base (sets imag[off] = 0).
+      const baseCName = s.base.cName;
+      const baseTy = s.base.ty as NumericType;
+      const offsetExpr =
+        s.indices.length === 1
+          ? `(long)(${emitExpr(state, s.indices[0], 0)}) - 1L`
+          : `(long)(${emitExpr(state, s.indices[0], 0)}) - 1L + ` +
+            `((long)(${emitExpr(state, s.indices[1], 0)}) - 1L) * ` +
+            `${baseCName}.rows`;
+      const rhsExpr = emitExpr(state, s.rhs, 0);
+      if (baseTy.isComplex) {
+        // Stash the offset and (for a complex RHS) the value into
+        // locals so creal/cimag don't double-evaluate the RHS, and
+        // so an offset expression with an embedded function call
+        // doesn't run twice.
+        pushStmt(state, level, `{`);
+        pushStmt(state, level + 1, `long _mtoc_off = ${offsetExpr};`);
+        if (isNumeric(s.rhs.ty) && s.rhs.ty.isComplex) {
+          pushStmt(state, level + 1, `double _Complex _mtoc_rhs = ${rhsExpr};`);
+          pushStmt(
+            state,
+            level + 1,
+            `${baseCName}.real[_mtoc_off] = creal(_mtoc_rhs);`
+          );
+          pushStmt(
+            state,
+            level + 1,
+            `${baseCName}.imag[_mtoc_off] = cimag(_mtoc_rhs);`
+          );
+        } else {
+          // Real RHS into complex base — write real, zero imag.
+          pushStmt(
+            state,
+            level + 1,
+            `${baseCName}.real[_mtoc_off] = ${rhsExpr};`
+          );
+          pushStmt(state, level + 1, `${baseCName}.imag[_mtoc_off] = 0.0;`);
+        }
+        pushStmt(state, level, `}`);
+      } else {
+        pushStmt(
+          state,
+          level,
+          `${baseCName}.real[${offsetExpr}] = ${rhsExpr};`
+        );
+      }
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
+    }
+
     case "Disp": {
       const ty = s.arg.ty;
       const owned = ownedOps(ty);

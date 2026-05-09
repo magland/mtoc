@@ -45,18 +45,21 @@ workaround or a roadmap note.
   (likely calling into a BLAS-shaped helper).
 - **No tensor comparisons.** `a == b` requires both to be scalars. Elementwise
   comparison on tensors will land alongside auto-materialization.
-- **Indexing covers scalar reads and single-slot range/colon reads.**
-  Scalar reads (`v(i)`, `M(i, j)`, `v(end)`, `M(end, end)`) work for
-  any multi-element tensor (real, complex, or char). Single-slot
-  range / colon reads (`v(a:b)`, `v(a:s:b)`, `v(2:end)`, `v(:)`,
-  `M(:)`, `M(2:5)`) work for real-or-complex double tensors:
+- **Indexing covers scalar reads, single-slot range/colon reads, and
+  scalar writes.** Scalar reads and writes (`v(i)`, `M(i, j)`,
+  `v(end) = x`, `M(end, end) = x`) work for any multi-element
+  real-or-complex double tensor (reads also work on char tensors).
+  Single-slot range / colon reads (`v(a:b)`, `v(2:end)`, `v(:)`,
+  `M(2:5)`, `M(:)`) work for real-or-complex double tensors;
   `Range` preserves the base's orientation for vectors and produces
-  a row vector for matrix linear indexing; `Colon` always linearizes
-  to a column. The range step must be a numeric literal today.
-  Still deferred: char-tensor range reads, multi-slot mixed
-  scalar/range (`M(:, j)`, `M(i, :)`, `M(a:b, c:d)`), indexed writes
-  (`v(i) = x`, `v(2:5) = w`), and indexing into a scalar variable
-  (`x(1)` returning `x`).
+  a row for matrix linear indexing, `Colon` always linearizes to a
+  column. The range step must be a numeric literal today.
+  Indexed-write type rule: a real RHS into a complex base sets imag
+  to 0 (numbl semantics); a complex RHS into a real base is rejected
+  at lowering. Still deferred: char-tensor writes, char-tensor range
+  reads, multi-slot mixed scalar/range (`M(:, j)`, `M(i, :)`,
+  `M(a:b, c:d)`), range/colon indexed writes (`v(2:5) = w`), and
+  indexing into a scalar variable (`x(1)` returning `x`).
 - **Tensor-valued function returns aren't supported yet.** Functions accept
   tensor arguments (real or complex), but the return type must be a scalar
   (real or complex). Returning a tensor needs an sret-style codegen path

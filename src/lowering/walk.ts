@@ -142,6 +142,14 @@ export function forEachTopLevelExpr(s: IRStmt, fn: (e: IRExpr) => void): void {
     case "MultiAssignCall":
       for (const a of s.args) fn(a);
       return;
+    case "IndexStore":
+      // The base is a real Var read, so liveness sees the use through
+      // forEachTopLevelExpr. The indices and the RHS are top-level
+      // expressions held directly by the stmt.
+      fn(s.base);
+      for (const idx of s.indices) fn(idx);
+      fn(s.rhs);
+      return;
     case "Break":
     case "Continue":
     case "ReturnFromFunction":
@@ -176,6 +184,7 @@ export function forEachStmtInTree(
       case "Disp":
       case "Error":
       case "MultiAssignCall":
+      case "IndexStore":
       case "Break":
       case "Continue":
       case "ReturnFromFunction":

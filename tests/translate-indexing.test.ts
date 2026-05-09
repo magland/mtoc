@@ -281,7 +281,7 @@ describe("indexing — range and colon reads", () => {
     expect(e.message).toMatch(/char tensor/i);
   });
 
-  it("rejects multi-slot range indexing (deferred)", () => {
+  it("rejects multi-slot range indexing on read (deferred)", () => {
     let err: unknown;
     try {
       translate("M = [1 2; 3 4];\nw = M(:, 1);\n");
@@ -293,5 +293,131 @@ describe("indexing — range and colon reads", () => {
     expect(e.name).toBe("UnsupportedConstruct");
     expect(e.span).toBeTruthy();
     expect(e.message).toMatch(/multi-slot/i);
+  });
+});
+
+describe("indexing — scalar writes", () => {
+  it("emits an in-place write for v(i) = x on a real vector", () => {
+    const c = translate("v = [10 20 30];\nv(2) = 99;\ndisp(v);\n");
+    expect(c).toMatch(/v\.real\[\(long\)\(2\.0\) - 1L\] = 99\.0;/);
+    // The base is NOT reassigned via mtoc_tensor_assign — the heap
+    // backing is mutated in place.
+    expect(c).not.toMatch(/mtoc_tensor_assign\(&v, .*99/);
+  });
+
+  it("emits the column-major formula for M(i, j) = x", () => {
+    const c = translate("M = [1 2; 3 4];\nM(2, 1) = 99;\ndisp(M);\n");
+    expect(c).toMatch(
+      /M\.real\[\(long\)\(2\.0\) - 1L \+ \(\(long\)\(1\.0\) - 1L\) \* M\.rows\] = 99\.0;/
+    );
+  });
+
+  it("v(end) = x resolves end via numel for a 1-slot write", () => {
+    const c = translate("v = [1 2 3 4];\nv(end) = 99;\ndisp(v);\n");
+    expect(c).toMatch(
+      /v\.real\[\(long\)\(\(v\.rows \* v\.cols\)\) - 1L\] = 99\.0;/
+    );
+  });
+
+  it("does NOT emit an early free between an Assign and a subsequent IndexStore", () => {
+    // Regression test: the future-touch dataflow must see IndexStore
+    // as a use of its base. If it's missing, the prior Assign's
+    // dead-after pass would emit `mtoc_tensor_free(&v)` before the
+    // `v(2) = 99;` write, corrupting the program.
+    const c = translate("v = [10 20 30];\nv(2) = 99;\ndisp(v);\n");
+    const assignIdx = c.indexOf("mtoc_tensor_assign(&v,");
+    const writeIdx = c.indexOf("v.real[(long)(2.0) - 1L] = 99.0;");
+    const freeIdx = c.indexOf("mtoc_tensor_free(&v);");
+    expect(assignIdx).toBeGreaterThan(-1);
+    expect(writeIdx).toBeGreaterThan(-1);
+    // The IndexStore must precede any free — and the only free
+    // emitted should be the final scope-exit free.
+    expect(writeIdx).toBeLessThan(freeIdx);
+    // Exactly one free of v across the whole program (the scope-exit
+    // safety net).
+    expect((c.match(/mtoc_tensor_free\(&v\);/g) ?? []).length).toBe(1);
+  });
+
+  it("writes both .real and .imag for a complex RHS into a complex base", () => {
+    const c = translate("z = [1+2i, 3+4i];\nz(1) = 7+8i;\ndisp(z);\n");
+    // Complex RHS path: stash + creal/cimag.
+    expect(c).toMatch(/double _Complex _mtoc_rhs = .*7\.0.* \+ .*8\.0.* I/);
+    expect(c).toMatch(/z\.real\[_mtoc_off\] = creal\(_mtoc_rhs\);/);
+    expect(c).toMatch(/z\.imag\[_mtoc_off\] = cimag\(_mtoc_rhs\);/);
+  });
+
+  it("writes .imag = 0.0 for a real RHS into a complex base (numbl semantics)", () => {
+    const c = translate("z = [1+2i, 3+4i];\nz(2) = 99;\ndisp(z);\n");
+    expect(c).toMatch(/z\.real\[_mtoc_off\] = 99\.0;/);
+    expect(c).toMatch(/z\.imag\[_mtoc_off\] = 0\.0;/);
+  });
+
+  it("rejects a complex RHS into a real-typed base with a TypeError", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3];\nv(1) = 1 + 2i;\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("TypeError");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/imaginary/i);
+  });
+
+  it("rejects a tensor RHS in an indexed write", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3];\nw = [4 5];\nv(1) = w;\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("TypeError");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/numeric scalar/i);
+  });
+
+  it("rejects an indexed write into a char tensor (deferred)", () => {
+    let err: unknown;
+    try {
+      translate("s = 'abc';\ns(1) = 'z';\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/char tensor/i);
+  });
+
+  it("rejects a range indexed write with an UnsupportedConstruct (deferred)", () => {
+    let err: unknown;
+    try {
+      translate("v = [1 2 3 4];\nv(2:3) = [99 88];\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
+    expect(e.message).toMatch(/range\/colon indexed writes/i);
+  });
+
+  it("rejects an indexed write into a scalar variable", () => {
+    let err: unknown;
+    try {
+      translate("x = 5;\nx(1) = 99;\n");
+    } catch (e) {
+      err = e;
+    }
+    expect(err).toBeInstanceOf(Error);
+    const e = err as { name: string; message: string; span: unknown };
+    expect(e.name).toBe("UnsupportedConstruct");
+    expect(e.span).toBeTruthy();
   });
 });
