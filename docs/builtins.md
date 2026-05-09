@@ -111,9 +111,12 @@ arg's `MType`. `error("...")` is the parallel `IRStmt.Error`.
 
 `length(s)` and `numel(s)` are special-cased in `lowerFuncCall`: when
 the argument is a string, both fold to a `NumLit(1)` at lowering
-(numbl semantics for the scalar string handle). Tensor / numeric
-arguments still flow through the regular `reduceTensor` / `reduceVector`
-factory entries.
+(numbl semantics for the scalar string handle). When the argument is
+a char array, `CharLit` folds to a `NumLit(n)` (static length) and
+char-array `Var` emits a synthetic Call that reads `.cols` from the
+`mtoc_char_tensor_t` struct — no runtime helper needed. Tensor /
+numeric arguments still flow through the regular `reduceTensor` /
+`reduceVector` factory entries.
 
 String concat (`+` on two strings) is handled in the binary lowering
 path, not as a builtin; it produces a `Binary(Add, …)` IR node typed

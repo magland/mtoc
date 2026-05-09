@@ -17,6 +17,7 @@ import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr, IRFunction } from "./ir.js";
 import {
   canonicalizeType,
+  isCharArray,
   isMultiElement,
   isScalar,
   isScalarReal,
@@ -75,6 +76,51 @@ export function lowerFuncCall(
         ty: scalarDouble("positive"),
         span: e.span,
       };
+    }
+    // Char arrays: length = numel = cols (always 1×N). For a CharLit
+    // the size is statically known; fold directly to a NumLit so no
+    // runtime helper is needed. For a char-array Var, emit `.cols` via
+    // a synthetic Call whose emit closure accesses the struct field.
+    if (isCharArray(arg.ty)) {
+      if (arg.kind === "CharLit") {
+        return {
+          kind: "NumLit",
+          value: arg.value.length,
+          ty: scalarDouble("positive"),
+          span: e.span,
+        };
+      }
+      if (arg.kind === "Var") {
+        // Emit `cName.cols` — no runtime helper; the struct field is
+        // always present on `mtoc_char_tensor_t`.
+        const charLenSig = {
+          name: e.name,
+          category: "expr" as const,
+          params: [
+            {
+              shape: "tensor" as const,
+              domain: null,
+              elem: null as null,
+              complexDomain: "real-or-complex" as const,
+            },
+          ],
+          result: () => scalarDouble("nonnegative"),
+          emit: (argStrs: readonly string[]) => `${argStrs[0]}.cols`,
+        };
+        return {
+          kind: "Call",
+          name: e.name,
+          callee: { kind: "builtin", sig: charLenSig },
+          args: [arg],
+          ty: scalarDouble("nonnegative"),
+          span: e.span,
+        };
+      }
+      throw new UnsupportedConstruct(
+        `${e.name} on a char-array expression is not yet supported ` +
+          `(assign the char to a variable first)`,
+        e.span
+      );
     }
     return lowerBuiltinCallWithArgs.call(this, e.name, [arg], e.span);
   }

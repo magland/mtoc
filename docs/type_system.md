@@ -1,8 +1,8 @@
 # Type system
 
 Lives in `src/lowering/types.ts`. Designed to grow — the discriminated union
-has room for non-numeric variants (Logical, Char, Cell, Struct, Handle) without
-reshaping. Today only `Numeric` and the sentinels are populated.
+has room for non-numeric variants (Logical, Cell, Struct, Handle) without
+reshaping. Today `Numeric`, `String`, and the sentinels are populated.
 
 ## MType
 
@@ -17,12 +17,17 @@ MType =
 ```
 
 `NumericType` covers every numeric value mtoc reasons about — scalar or
-tensor, real or complex. `StringType` is the first non-numeric variant: a
-scalar handle to a UTF-8 buffer (numbl's `string`, distinct from numbl's
-`char`). `Unknown` shows up at type-check failures; `Void` is reserved for
+tensor, real or complex, **double-elem or char-elem**. numbl's `char`
+slots into `NumericType` via the `elem` field rather than as a separate
+top-level kind, because every char operation in numbl (`'A' * 2`,
+`length('abc')`, `'abc' + 1`) is a numeric-tensor operation that just
+happens to read its operand as a single-byte code unit. `StringType` is
+the first genuinely non-numeric variant: a scalar handle to a UTF-8
+buffer (numbl's `string`, distinct from `char` in shape and semantics).
+`Unknown` shows up at type-check failures; `Void` is reserved for
 statement-only constructs (e.g. `disp` returns nothing).
 
-When further non-numeric kinds (Logical/Char/Cell/Struct/Handle) get added,
+When further non-numeric kinds (Logical/Cell/Struct/Handle) get added,
 they land as new top-level variants — the discriminator is already there.
 Numeric code paths keep narrowing to `NumericType` without touching them.
 
@@ -31,7 +36,7 @@ Numeric code paths keep narrowing to `NumericType` without touching them.
 ```
 NumericType {
   kind: "Numeric"
-  elem: ElemKind        // today: "double" only (numbl tensors are double-only)
+  elem: ElemKind        // "double" or "char" — char-elem covers numbl's `char` type
   isComplex: boolean    // tracks the complex axis; codegen picks
                         //   `double` / `double _Complex` / `mtoc_tensor_t`
                         //   accordingly. Complex tensors mirror numbl's

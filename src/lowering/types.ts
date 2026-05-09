@@ -12,7 +12,7 @@
  * through numeric-only code paths.
  */
 
-export type ElemKind = "double";
+export type ElemKind = "double" | "char";
 
 /**
  * What we know about a single tensor dimension. The lattice is
@@ -117,6 +117,34 @@ export const SCALAR_DOUBLE: NumericType = {
   cols: { kind: "one" },
   sign: "unknown",
 };
+
+/** Scalar char (1×1, C type `char`). The char elem does not carry a
+ *  meaningful sign (code-unit values are unsigned by convention). */
+export const SCALAR_CHAR: NumericType = {
+  kind: "Numeric",
+  elem: "char",
+  isComplex: false,
+  rows: { kind: "one" },
+  cols: { kind: "one" },
+  sign: "unknown",
+};
+
+/** Construct a scalar char type. */
+export function scalarChar(): NumericType {
+  return SCALAR_CHAR;
+}
+
+/** Construct a 1×N char-array type with the given cols DimInfo. */
+export function charArrayType(cols: DimInfo): NumericType {
+  return {
+    kind: "Numeric",
+    elem: "char",
+    isComplex: false,
+    rows: { kind: "one" },
+    cols,
+    sign: "unknown",
+  };
+}
 
 export function scalarDouble(sign: Sign = "unknown"): NumericType {
   return { ...SCALAR_DOUBLE, sign };
@@ -245,12 +273,22 @@ export function isMultiElement(t: MType): boolean {
   return isNumeric(t) && (dimIsNotOne(t.rows) || dimIsNotOne(t.cols));
 }
 
+/** True when `t` is a scalar char (1×1, C `char`). */
+export function isCharScalar(t: MType): boolean {
+  return isNumeric(t) && t.elem === "char" && isScalar(t);
+}
+
+/** True when `t` is a multi-element char array (`mtoc_char_tensor_t`). */
+export function isCharArray(t: MType): boolean {
+  return isNumeric(t) && t.elem === "char" && isMultiElement(t);
+}
+
 /** True when the value of type `t` is backed by a heap allocation that
  *  the generated code is responsible for releasing — currently
- *  multi-element tensors and strings. Drives the "free at last use"
- *  liveness pass, the scope-exit free walks, and the "owned-allocating
- *  expression cannot appear nested" lowering check. New owned kinds
- *  (cell arrays, structs, …) plug in here. */
+ *  multi-element tensors (double and char) and strings. Drives the
+ *  "free at last use" liveness pass, the scope-exit free walks, and
+ *  the "owned-allocating expression cannot appear nested" lowering
+ *  check. New owned kinds (cell arrays, structs, …) plug in here. */
 export function isOwned(t: MType): boolean {
   return isMultiElement(t) || isString(t);
 }
@@ -275,13 +313,16 @@ export function staticNumElements(t: MType): number | null {
 
 /** The C type used to represent values of this MType in the generated
  *  source. Scalars become bare `double` (real) or `double _Complex`
- *  (complex); multi-element tensors become `mtoc_tensor_t` (the struct
- *  from runtime/tensor.h) — the struct's `imag` buffer answers the
- *  complex question on the C side. Returns null for types codegen does
- *  not yet handle (Unknown, Void, non-double elem). */
+ *  (complex); char scalars become bare `char`; multi-element tensors
+ *  become `mtoc_tensor_t`; char arrays become `mtoc_char_tensor_t`.
+ *  Returns null for types codegen does not yet handle (Unknown, Void). */
 export function cTypeFor(t: MType): string | null {
   if (t.kind === "String") return "mtoc_string_t";
   if (t.kind !== "Numeric") return null;
+  if (t.elem === "char") {
+    if (isScalar(t)) return "char";
+    return "mtoc_char_tensor_t";
+  }
   if (t.elem !== "double") return null;
   if (isScalar(t)) return t.isComplex ? "double _Complex" : "double";
   return "mtoc_tensor_t";
@@ -584,7 +625,12 @@ function dimMeet(a: DimInfo, b: DimInfo): DimInfo {
  */
 export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   if (!isNumeric(a) || !isNumeric(b)) return { kind: "Unknown" };
-  if (a.elem !== b.elem) return { kind: "Unknown" };
+  // Char promotion: any arithmetic with at least one char operand produces
+  // a double result. char + char → double, char + double → double.
+  // Any other elem mismatch (if future elem kinds are added) is Unknown.
+  const hasChar = a.elem === "char" || b.elem === "char";
+  if (!hasChar && a.elem !== b.elem) return { kind: "Unknown" };
+  const resultElem: ElemKind = hasChar ? "double" : a.elem;
   // Complex propagates: real⊙complex and complex⊙complex both produce
   // complex. Sign is meaningless on a complex result (the invariant is
   // enforced at output sites — canonicalizeType / unify normalize) so
@@ -598,7 +644,7 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   if (aSc && bSc) {
     return {
       kind: "Numeric",
-      elem: a.elem,
+      elem: resultElem,
       isComplex,
       rows: { kind: "one" },
       cols: { kind: "one" },
@@ -610,7 +656,7 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
     const tensor = aSc ? b : a;
     return {
       kind: "Numeric",
-      elem: tensor.elem,
+      elem: resultElem,
       isComplex,
       rows: tensor.rows,
       cols: tensor.cols,
@@ -628,7 +674,7 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   }
   return {
     kind: "Numeric",
-    elem: a.elem,
+    elem: resultElem,
     isComplex,
     rows: dimMeet(a.rows, b.rows),
     cols: dimMeet(a.cols, b.cols),

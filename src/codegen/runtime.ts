@@ -90,6 +90,14 @@ export const MTOC_STRING_STRUCT = loadSnippet("string.h");
  */
 export const MTOC_ALLOC = loadSnippet("alloc.h");
 
+/**
+ * Char-tensor struct typedef. No function body, but lives in the same
+ * snippet machinery so its definition appears above any helper that
+ * consumes it. Multi-element char codegen activates this directly via
+ * the char_tensor family in RUNTIME_HELPERS.
+ */
+export const MTOC_CHAR_TENSOR_STRUCT = loadSnippet("char_tensor.h");
+
 const MTOC_DISP_TENSOR = loadSnippet("disp_tensor.h", [
   "mtoc_format_double",
   "mtoc_tensor_t",
@@ -216,4 +224,46 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ],
   ["mtoc_disp_string", loadSnippet("disp_string.h", ["mtoc_string_t"])],
   ["mtoc_error_string", loadSnippet("error_string.h", ["mtoc_string_t"])],
+  // Char-tensor runtime helpers. The struct typedef seeds the graph;
+  // from_literal / empty / alloc / copy / free / assign / disp_char /
+  // disp_char_tensor all pull it in. Copy depends on alloc (for the
+  // heap buffer). Free and assign are shape-agnostic (free(NULL) is
+  // well-defined). disp_char is for scalar chars (bare C `char`);
+  // disp_char_tensor is for 1×N char arrays.
+  ["mtoc_char_tensor_t", MTOC_CHAR_TENSOR_STRUCT],
+  [
+    "mtoc_char_tensor_empty",
+    loadSnippet("char_tensor_empty.h", ["mtoc_char_tensor_t"]),
+  ],
+  [
+    "mtoc_char_tensor_from_literal",
+    loadSnippet("char_tensor_from_literal.h", ["mtoc_char_tensor_t"]),
+  ],
+  [
+    "mtoc_char_tensor_alloc",
+    loadSnippet("char_tensor_alloc.h", ["mtoc_char_tensor_t"]),
+  ],
+  [
+    "mtoc_char_tensor_copy",
+    loadSnippet("char_tensor_copy.h", [
+      "mtoc_char_tensor_t",
+      "mtoc_char_tensor_alloc",
+    ]),
+  ],
+  [
+    "mtoc_char_tensor_free",
+    loadSnippet("char_tensor_free.h", ["mtoc_char_tensor_t"]),
+  ],
+  [
+    "mtoc_char_tensor_assign",
+    loadSnippet("char_tensor_assign.h", [
+      "mtoc_char_tensor_t",
+      "mtoc_char_tensor_free",
+    ]),
+  ],
+  ["mtoc_disp_char", loadSnippet("disp_char.h")],
+  [
+    "mtoc_disp_char_tensor",
+    loadSnippet("disp_char_tensor.h", ["mtoc_char_tensor_t"]),
+  ],
 ]);

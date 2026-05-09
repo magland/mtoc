@@ -296,6 +296,46 @@ is idempotent on a zeroed struct.
   scalar string), so byte-vs-code-point ambiguity never surfaces in
   computed lengths.
 
+## Char-array representation
+
+Char arrays (numbl `'…'`, single-quoted) are a separate struct from
+both tensors and strings:
+
+```
+typedef struct {
+  const char *data;
+  long rows;
+  long cols;
+  int owned;
+} mtoc_char_tensor_t;
+```
+
+- `rows` / `cols` carry the runtime shape (today always `rows == 1`;
+  2D char matrices are deferred).
+- `owned` follows the same convention as `mtoc_string_t`: `0` for
+  handles pointing at a literal in `.rodata`, `1` for handles whose
+  buffer was malloc'd by `mtoc_char_tensor_alloc` /
+  `mtoc_char_tensor_copy`.
+
+Scalar chars (1×1) do **not** use the struct — they're a bare C `char`
+in automatic storage, like real scalars are bare `double`. The
+multi-element / scalar split is the same partition the tensor side
+uses.
+
+The lifecycle helpers (`mtoc_char_tensor_empty` /
+`_from_literal` / `_alloc` / `_copy` / `_assign` / `_free`) mirror the
+tensor and string helpers exactly, and char arrays plug into the same
+`isOwned` / early-free / scope-exit infrastructure as strings and
+double tensors. `mtoc_disp_char_tensor` and `mtoc_disp_char` print the
+bytes as text (followed by a newline), not as numeric values.
+
+Char-arithmetic (`'a' + 1`, `'abc' + 'def'`) reads each char as a
+double on-the-fly inside the elementwise loop (`(double)v.data[i]`)
+and produces a fresh double tensor. The promotion is a single read-
+site cast — there's no separate "convert char tensor to double tensor"
+pass. The outcome matches numbl: any binary arithmetic with a char
+operand widens to double.
+
 ## Adding a helper
 
 1. Create `src/codegen/runtime/foo.h` with the standard shape:

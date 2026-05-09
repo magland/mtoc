@@ -40,6 +40,21 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Single-quoted char literal `'...'`. `value` is the decoded
+       *  content (quotes stripped, doubled-quote `''` collapsed).
+       *  Codegen maps this to:
+       *    - a C `char` literal (e.g. `'a'`) for 1×1 scalar chars, or
+       *    - `mtoc_char_tensor_from_literal("abc", N)` for 1×N arrays,
+       *      which is a non-owning handle pointing at the string
+       *      constant in `.rodata`.
+       *  `ty` is a `NumericType` with `elem: "char"`. Scalar chars have
+       *  rows=one, cols=one; arrays have rows=one, cols=notOne. */
+      kind: "CharLit";
+      value: string;
+      ty: MType;
+      span: Span;
+    }
+  | {
       kind: "Var";
       /** MATLAB name (for diagnostics and assignedVars lookups). */
       name: string;

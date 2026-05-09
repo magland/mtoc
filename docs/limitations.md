@@ -81,15 +81,10 @@ workaround or a roadmap note.
   complex `min`/`max` over tensors (only scalars today) are not yet
   supported. `floor`/`ceil`/`round`/`fix` would need a componentwise
   runtime helper; `mod`/`rem` are real-only by numbl semantics.
-- **Strings are partial; char is not yet supported.** Double-quoted
-  scalar strings (`"hello"`) work for `disp`, `error("...")`, `+`
-  concatenation between two strings, and `length(s)` / `numel(s)`
-  (folded to `1`). What's deferred:
-  - **Char (single-quoted `'...'`) is rejected** with a span pointing
-    the user at double-quoted strings. numbl's char (a row-vector of
-    code units) has incompatible semantics — `length('hi') == 2` vs
-    `length("hi") == 1`, `'a' + 1 == 98` vs `"a" + 1 == "a1"` — and
-    sharing one C representation would force runtime tagging.
+- **Strings are partial.** Double-quoted scalar strings (`"hello"`)
+  work for `disp`, `error("...")`, `+` concatenation between two
+  strings, and `length(s)` / `numel(s)` (folded to `1`). What's
+  deferred:
   - **String arrays** (`["a", "b"]`, `string(...)`) — strings are
     scalar-only today.
   - **Indexing** (`s(1)`, `s(2:3)`).
@@ -102,6 +97,16 @@ workaround or a roadmap note.
     top-level RHS of an assignment; intermediates need a name.
   - **String returns from user functions.** Function returns are
     still scalar-numeric only.
+- **Char is partially supported.** Single-quoted char literals
+  (`'a'`, `'hello'`) work for `disp`, assignment, `length`/`numel`,
+  char arithmetic (`'a' + 1 == 98`, `'abc' + 1`), char comparisons
+  (`'a' == 'a'`), and horzcat (`['ab' 'cd']`). What's deferred:
+  - **2D char matrices** (`['ab'; 'cd']`).
+  - **Mixed char + string binary ops** (`'a' + "b"`).
+  - **Indexing into char arrays** (`s(1)`, `s(2:3)`).
+  - **Char function parameters and char return types.** User
+    functions still require scalar-numeric returns.
+  - **Most char builtins**: `upper`, `lower`, `num2str`, etc.
 - **No cell arrays, structs, classes.**
 - **No `fprintf`** beyond the `disp` runtime helper.
 

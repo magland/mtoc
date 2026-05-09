@@ -92,6 +92,9 @@ export function collectOwnedVarsInExpr(e: IRExpr, out: Set<string>): void {
     case "NumLit":
     case "ImagLit":
     case "StringLit":
+    case "CharLit":
+      // CharLit is a non-owning handle (points at .rodata or is a bare
+      // C char literal) — no heap allocation, so no owned var to track.
       return;
   }
 }

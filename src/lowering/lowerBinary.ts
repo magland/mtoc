@@ -15,6 +15,8 @@ import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
   arithResult,
+  isCharArray,
+  isCharScalar,
   isScalar,
   isScalarComplex,
   isScalarReal,
@@ -24,6 +26,7 @@ import {
   scalarDouble,
   STRING,
   type MType,
+  type NumericType,
   typeToString,
 } from "./types.js";
 import type { Lowerer } from "./lower.js";
@@ -116,7 +119,20 @@ export function lowerBinary(
   // surface as a `TypeError` so the user can wrap the other side
   // explicitly (today: just use a string variable). Any non-Add op on
   // a string operand is rejected.
+  //
+  // Mixed char + string is out of scope: numbl bridges at runtime but
+  // the codegen path is non-trivial. Reject with a clear message.
+  const leftIsChar = isNumeric(left.ty) && left.ty.elem === "char";
+  const rightIsChar = isNumeric(right.ty) && right.ty.elem === "char";
   if (isString(left.ty) || isString(right.ty)) {
+    if (leftIsChar || rightIsChar) {
+      throw new UnsupportedConstruct(
+        `binary ${e.op} on char and string operands is not yet supported ` +
+          `(mtoc does not bridge char and string types; ` +
+          `use double-quoted strings for concatenation)`,
+        e.span
+      );
+    }
     if (e.op !== "Add") {
       throw new UnsupportedConstruct(
         `binary ${e.op} on string operands is not supported ` +
@@ -158,20 +174,71 @@ export function lowerBinary(
   return lowerArith(e, left, right);
 }
 
-/** Comparisons / logical ops: scalar operands (real or complex).
- *  Element-wise comparison on tensors needs its own codegen path.
+/** Comparisons / logical ops: scalar operands (real or complex) or
+ *  char scalars / char arrays (element-wise comparison).
  *
  *  Numbl semantics on complex (mirrored by emit's complex branch):
  *    <  <=  >  >=     compare on the real part only
  *    ==  !=           compare both real and imag
  *    && ||            apply `toBool`: re != 0 || im != 0
- *  The IR result type stays a real-scalar logical (0/1, "nonnegative");
- *  codegen dispatches on operand `isComplex` to emit the correct C. */
+ *  Char comparisons are element-wise; the result is a double scalar
+ *  (for scalar chars) or a 1×N double row-vec (for char arrays). */
 function lowerComparison(
   e: Extract<Expr, { type: "Binary" }>,
   left: IRExpr,
   right: IRExpr
 ): IRExpr {
+  const leftIsCharArr = isCharArray(left.ty);
+  const rightIsCharArr = isCharArray(right.ty);
+  // Element-wise char array comparison (both must be char arrays).
+  if (leftIsCharArr || rightIsCharArr) {
+    if (!leftIsCharArr || !rightIsCharArr) {
+      throw new UnsupportedConstruct(
+        `comparison ${e.op} between char array and non-char operand ` +
+          `(${typeToString(left.ty)} vs ${typeToString(right.ty)}) ` +
+          `is not yet supported`,
+        e.span
+      );
+    }
+    // Result is a double row-vec (element-wise 0/1).
+    const resultTy: NumericType = {
+      kind: "Numeric",
+      elem: "double",
+      isComplex: false,
+      rows: { kind: "one" },
+      cols: { kind: "notOne" },
+      sign: "nonnegative",
+    };
+    return {
+      kind: "Binary",
+      op: e.op,
+      left,
+      right,
+      ty: resultTy,
+      span: e.span,
+    };
+  }
+  // Scalar char comparison (both scalar chars → scalar double 0/1).
+  const leftIsCharSc = isCharScalar(left.ty);
+  const rightIsCharSc = isCharScalar(right.ty);
+  if (leftIsCharSc || rightIsCharSc) {
+    if (!leftIsCharSc || !rightIsCharSc) {
+      throw new UnsupportedConstruct(
+        `comparison ${e.op} between scalar char and non-char operand ` +
+          `(${typeToString(left.ty)} vs ${typeToString(right.ty)}) ` +
+          `is not yet supported`,
+        e.span
+      );
+    }
+    return {
+      kind: "Binary",
+      op: e.op,
+      left,
+      right,
+      ty: scalarDouble("nonnegative"),
+      span: e.span,
+    };
+  }
   const ok = (t: IRExpr["ty"]): boolean =>
     isScalarReal(t) || isScalarComplex(t);
   if (!ok(left.ty) || !ok(right.ty)) {

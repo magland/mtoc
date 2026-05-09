@@ -39,6 +39,60 @@ export function lowerTensorLiteral(
       e.span
     );
   }
+
+  // Special case: char horzcat `['ab' 'cd']` / `['a' 'b' 'c']`.
+  // When any cell in any row is a Char AST node, dispatch entirely to
+  // the char horzcat path. In numbl, `[c1 c2 ... cN]` where every c_i
+  // is a char literal (single or multi-element) is horizontal
+  // concatenation — equivalent to Octave/MATLAB string concat.
+  // numbl also widens char arrays to double when mixed with numeric, but
+  // that path is deferred; we reject mixed-type tensor rows with a clear
+  // message. 2D char matrices (multiple rows) are also deferred.
+  if (e.rows.flat().some(cell => cell.type === "Char")) {
+    if (numRows > 1) {
+      throw new UnsupportedConstruct(
+        `2D char-array literals (multiple rows of char literals) are not ` +
+          `yet supported`,
+        e.span
+      );
+    }
+    if (!e.rows[0].every(cell => cell.type === "Char")) {
+      throw new UnsupportedConstruct(
+        `mixed char and non-char cells in a tensor literal are not yet ` +
+          `supported (got a mix of char literals and other expressions)`,
+        e.span
+      );
+    }
+    // Concatenate all char values into a single CharLit.
+    let combined = "";
+    for (const cell of e.rows[0]) {
+      const ir = this.lowerExpr(cell);
+      if (ir.kind !== "CharLit") {
+        throw new UnsupportedConstruct(
+          `internal: expected CharLit from char cell lowering`,
+          cell.span
+        );
+      }
+      combined += ir.value;
+    }
+    if (combined.length === 0) {
+      throw new UnsupportedConstruct(
+        `empty char-array literal is not yet supported`,
+        e.span
+      );
+    }
+    const n = combined.length;
+    const cols: DimInfo = n === 1 ? { kind: "one" } : { kind: "notOne" };
+    const ty: NumericType = {
+      kind: "Numeric",
+      elem: "char",
+      isComplex: false,
+      rows: { kind: "one" },
+      cols,
+      sign: "unknown",
+    };
+    return { kind: "CharLit", value: combined, ty, span: e.span };
+  }
   const elements: IRExpr[][] = [];
   const elementSigns: Sign[] = [];
   // The literal is complex iff any cell is complex. We track this

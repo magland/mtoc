@@ -32,17 +32,22 @@ import type {
   VarBinding,
 } from "./ir.js";
 import {
+  isCharArray,
+  isCharScalar,
   isMultiElement,
   isScalar,
   isScalarReal,
   isString,
   MType,
+  NumericType,
+  scalarChar,
   scalarComplex,
   scalarDouble,
   signFromValue,
   STRING,
   typeToString,
   unify,
+  type DimInfo,
 } from "./types.js";
 
 import { lowerIf } from "./lowerIf.js";
@@ -387,9 +392,23 @@ export class Lowerer {
         const t = e.get(k);
         if (t !== undefined) present.push(t);
       }
+      // Absent default: the value a C predeclaration gives the variable
+      // when a branch doesn't assign it. Numeric → 0.0; string →
+      // mtoc_string_empty(); char scalar → '\0'; char array → empty.
       const absentDefault: MType = present.every(isString)
         ? STRING
-        : scalarDouble("zero");
+        : present.every(t => isCharArray(t))
+          ? {
+              kind: "Numeric",
+              elem: "char",
+              isComplex: false,
+              rows: { kind: "one" },
+              cols: { kind: "notOne" },
+              sign: "unknown",
+            }
+          : present.every(t => isCharScalar(t))
+            ? scalarChar()
+            : scalarDouble("zero");
 
       let unified: MType | undefined;
       for (const e of envs) {
@@ -467,7 +486,12 @@ export class Lowerer {
           // Codegen can only print scalars or named tensor variables; a
           // tensor expression has no addressable storage to hand to the
           // runtime helper, so reject it with a span before codegen.
-          if (isMultiElement(arg.ty) && arg.kind !== "Var") {
+          // Exception: CharLit (non-owning literal handle) is always OK.
+          if (
+            isMultiElement(arg.ty) &&
+            arg.kind !== "Var" &&
+            arg.kind !== "CharLit"
+          ) {
             throw new UnsupportedConstruct(
               `'disp' of a tensor expression is only supported for ` +
                 `variable references; assign the value to a name first`,
@@ -624,16 +648,37 @@ export class Lowerer {
       }
 
       case "Char": {
-        // numbl's char (single-quoted) is a row-vector of code units —
-        // semantics diverge from `string` (e.g. `length('hi') == 2`
-        // vs `length("hi") == 1`, `'a' + 1 == 98` vs `"a" + 1 == "a1"`).
-        // mtoc doesn't yet have a char codegen path; defer with a
-        // clear error pointing the user at double-quoted strings.
-        throw new UnsupportedConstruct(
-          `char literals (single-quoted) are not yet supported; ` +
-            `use a double-quoted string ("...") instead`,
-          e.span
-        );
+        // numbl's char (single-quoted) is a 1×N row-vector of code
+        // units. mtoc maps each char literal to a NumericType with
+        // elem:"char". Scalar chars (N=1) become bare C `char`;
+        // multi-element chars become `mtoc_char_tensor_t`.
+        const raw = e.value;
+        if (raw.length < 2 || raw[0] !== "'" || raw[raw.length - 1] !== "'") {
+          throw new UnsupportedConstruct(
+            `internal: malformed char literal lexeme '${raw}'`,
+            e.span
+          );
+        }
+        // Doubled single-quote '' → ' inside a char literal.
+        const inner = raw.slice(1, -1).replace(/''/g, "'");
+        if (inner.length === 0) {
+          throw new UnsupportedConstruct(
+            `empty char literal ('') is not yet supported ` +
+              `(1×0 char arrays are deferred)`,
+            e.span
+          );
+        }
+        const n = inner.length;
+        const cols: DimInfo = n === 1 ? { kind: "one" } : { kind: "notOne" };
+        const ty: NumericType = {
+          kind: "Numeric",
+          elem: "char",
+          isComplex: false,
+          rows: { kind: "one" },
+          cols,
+          sign: "unknown",
+        };
+        return { kind: "CharLit", value: inner, ty, span: e.span };
       }
 
       case "ImagUnit": {
@@ -752,6 +797,9 @@ function rejectNestedOwnedExpr(e: IRExpr): void {
     case "NumLit":
     case "ImagLit":
     case "StringLit":
+    case "CharLit":
+      // CharLit produces a non-owning handle or a bare char literal —
+      // no heap allocation, so it's safe in any expression position.
       return;
     case "Binary":
       rejectNestedOwnedExpr(e.left);
@@ -786,6 +834,8 @@ function rejectCallInTensorContext(e: IRExpr): void {
       );
     case "NumLit":
     case "ImagLit":
+    case "StringLit":
+    case "CharLit":
     case "Var":
     case "TensorLit":
       // TensorLit has already been rejected by `rejectNestedTensorLit`

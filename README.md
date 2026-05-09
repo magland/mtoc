@@ -101,9 +101,14 @@ The subset is growing iteratively. Roughly:
   `numel(s)` (both folded to `1` per numbl semantics). Stored as a
   small `mtoc_string_t` struct (data pointer + byte length + owned
   flag); literals point at `.rodata` while concat results allocate
-  a fresh buffer. Char (single-quoted `'...'`), string arrays,
-  string indexing, `sprintf`/`strcat`/`num2str`, and string + numeric
-  coercion are deferred and rejected with a span.
+  a fresh buffer. String arrays, string indexing, `sprintf`/`strcat`/
+  `num2str`, and string + numeric coercion are deferred.
+- Char (numbl `char`, single-quoted `'...'`): scalar chars (`'a'`),
+  char arrays (`'hello'`), `disp`, `length`/`numel`, horzcat
+  (`['ab' 'cd']`), arithmetic (`'a' + 1 == 98`, `'abc' + 1`), and
+  comparisons (`'a' == 'a'`, `'abc' == 'abd'`). Scalar chars are bare
+  C `char`; char arrays use `mtoc_char_tensor_t`. Char + string binary
+  ops, 2D char matrices, and char indexing are deferred.
 
 Anything outside the supported subset raises `UnsupportedConstruct` with a
 source span pointing to the offending line.
