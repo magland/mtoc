@@ -19,6 +19,12 @@ The runner uses `npx tsx ../numbl/src/cli.ts` as the oracle. Concurrency
 defaults to `os.cpus().length`; the corpus typically finishes in single-digit
 seconds.
 
+The mtoc side of every comparison runs with `--check-leaks`, so the binary
+is built with `-fsanitize=address`. AddressSanitizer + LeakSanitizer fail
+the script (with the leak trace surfaced in the failure detail) if any
+buffer is still live at exit. Tests therefore double as a memory-leak
+invariant on every codegen path that produces output.
+
 ### Layout
 
 `test_scripts/` is organized into category subdirectories. Adding a new test

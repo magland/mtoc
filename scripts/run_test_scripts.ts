@@ -68,6 +68,21 @@ async function captureStdout(cmd: string, args: string[]): Promise<string> {
   return stdout;
 }
 
+/** Like captureStdout, but returns stderr too — used for the mtoc run
+ *  so we can surface AddressSanitizer / LeakSanitizer reports in the
+ *  failure detail when --check-leaks fires. */
+async function captureBoth(
+  cmd: string,
+  args: string[]
+): Promise<{ stdout: string; stderr: string }> {
+  const { stdout, stderr } = await execFileAsync(cmd, args, {
+    maxBuffer: 16 * 1024 * 1024,
+    timeout: TIMEOUT_MS,
+    killSignal: "SIGKILL",
+  });
+  return { stdout, stderr };
+}
+
 function diff(expected: string, actual: string): string {
   const al = expected.split("\n");
   const bl = actual.split("\n");
@@ -118,14 +133,38 @@ async function runOne(scriptPath: string): Promise<Result> {
   }
 
   let actual: string;
+  let mtocStderr: string;
   try {
-    actual = await captureStdout("npx", ["tsx", cliPath, "run", scriptPath]);
+    const out = await captureBoth("npx", [
+      "tsx",
+      cliPath,
+      "run",
+      "--check-leaks",
+      scriptPath,
+    ]);
+    actual = out.stdout;
+    mtocStderr = out.stderr;
   } catch (e) {
-    const msg = (e as Error).message.split("\n")[0];
-    return { name, status: "FAIL", detail: `mtoc errored: ${msg}` };
+    // execFile throws on non-zero exit, including ASan/LSan leak
+    // reports. Surface stderr so the leak trace is visible in the
+    // failure detail rather than silently dropped.
+    const err = e as Error & { stderr?: string; stdout?: string };
+    const tail = (err.stderr ?? "").trim();
+    const head = err.message.split("\n")[0];
+    const detail = tail
+      ? `mtoc errored: ${head}\n${tail}`
+      : `mtoc errored: ${head}`;
+    return { name, status: "FAIL", detail };
   }
 
   if (actual === expected) {
+    if (mtocStderr.includes("LeakSanitizer:")) {
+      return {
+        name,
+        status: "FAIL",
+        detail: `LeakSanitizer reported leaks:\n${mtocStderr.trim()}`,
+      };
+    }
     return { name, status: "PASS", detail: null };
   }
   return { name, status: "FAIL", detail: diff(expected, actual) };

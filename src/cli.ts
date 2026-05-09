@@ -22,7 +22,7 @@ function usage(): never {
     [
       "Usage:",
       "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir]",
-      "  mtoc run <input.m>",
+      "  mtoc run <input.m> [--check-leaks]",
       "  mtoc serve --passkey <key> [--port N] [--host HOST]",
       "",
       "Options:",
@@ -33,6 +33,9 @@ function usage(): never {
       "  --dump-ir       Dump the lowered IR as JSON instead of generating C.",
       "                  BuiltinSig closures are stubbed as the builtin name.",
       "                  Useful for debugging the lowering pass.",
+      "  --check-leaks   (run only) Build with -fsanitize=address so",
+      "                  AddressSanitizer + LeakSanitizer flag any unfreed",
+      "                  buffer at exit. ~2x slowdown; off by default.",
       "",
       "When <output.c> is omitted, the translated C is written to stdout.",
       "",
@@ -50,17 +53,21 @@ interface ParsedArgs {
   positional: string[];
   noRuntime: boolean;
   dumpIr: boolean;
+  checkLeaks: boolean;
 }
 
 function parseArgs(args: string[]): ParsedArgs {
   const positional: string[] = [];
   let noRuntime = false;
   let dumpIr = false;
+  let checkLeaks = false;
   for (const a of args) {
     if (a === "--no-runtime") {
       noRuntime = true;
     } else if (a === "--dump-ir") {
       dumpIr = true;
+    } else if (a === "--check-leaks") {
+      checkLeaks = true;
     } else if (a.startsWith("--")) {
       process.stderr.write(`mtoc: unknown option '${a}'\n`);
       usage();
@@ -68,7 +75,7 @@ function parseArgs(args: string[]): ParsedArgs {
       positional.push(a);
     }
   }
-  return { positional, noRuntime, dumpIr };
+  return { positional, noRuntime, dumpIr, checkLeaks };
 }
 
 function reportError(
@@ -208,7 +215,7 @@ function dumpIrAsJson(
 }
 
 function cmdRun(args: string[]): void {
-  const { positional, noRuntime } = parseArgs(args);
+  const { positional, noRuntime, checkLeaks } = parseArgs(args);
   if (positional.length !== 1) usage();
   if (noRuntime) {
     process.stderr.write(
@@ -226,8 +233,15 @@ function cmdRun(args: string[]): void {
   writeFileSync(cFile, cSource);
 
   const cc = process.env.CC || "cc";
+  // --check-leaks builds with AddressSanitizer (which includes
+  // LeakSanitizer at exit). On a leak the report goes to stderr with
+  // a stack trace and the process exits non-zero. Off by default
+  // because ASan adds noticeable runtime + memory overhead — the
+  // cross-runner enables it for every test_scripts/ run.
+  const ccArgs = [cFile, "-o", exeFile, "-lm"];
+  if (checkLeaks) ccArgs.push("-fsanitize=address", "-g");
   try {
-    execFileSync(cc, [cFile, "-o", exeFile, "-lm"], { stdio: "inherit" });
+    execFileSync(cc, ccArgs, { stdio: "inherit" });
   } catch {
     process.stderr.write(
       `mtoc: ${cc} failed (see output above). Source at ${cFile}\n`

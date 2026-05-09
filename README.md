@@ -49,6 +49,11 @@ compiler. See [`docs/web.md`](docs/web.md) for protocol and architecture.
 
 `run` translates to a temporary directory, compiles with `cc` (override via the
 `CC` env var), and runs the resulting binary, streaming stdout/stderr through.
+Add `--check-leaks` to build with `-fsanitize=address`; AddressSanitizer +
+LeakSanitizer then flag any unfreed buffer at exit (with a stack trace) and
+the process exits non-zero. Off by default because ASan adds ~2× runtime and
+memory overhead; the cross-runner (`scripts/run_test_scripts.ts`) passes the
+flag for every test so leaks fail CI.
 
 `--no-runtime` omits the inline runtime-helper bodies (`mtoc_format_double`,
 `mtoc_disp_double`, the `mtoc_tensor_t` typedef, …) and the headers those
