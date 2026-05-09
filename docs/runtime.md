@@ -76,47 +76,98 @@ Layout is **column-major** to match numbl / LAPACK. For a tensor of shape
 the imaginary part lives at `imag[r + c * R]`).
 
 Backing storage is allocated on the **heap** for every tensor, by every
-emitted program — there is no stack-array fast path. The codegen predeclares
-each tensor as a single struct value whose `real` (and `imag`, when complex)
-fields are populated by an inline call to the `mtoc_alloc` runtime helper:
-
-```
-mtoc_tensor_t v = { mtoc_alloc(N * sizeof(double)), NULL, R, C };
-mtoc_tensor_t z = { mtoc_alloc(N * sizeof(double)),
-                    mtoc_alloc(N * sizeof(double)), R, C };
-```
+emitted program — there is no stack-array fast path. Going uniformly heap
+means every `.m` script — even ones that only ever use small tensors —
+exercises the production allocation path.
 
 `mtoc_alloc` is a thin wrapper around `malloc` that aborts with a clear
 diagnostic on allocation failure (so the call site can drop the result
 straight into a struct initializer without a NULL check). Lives at
-`runtime/alloc.h`, registered as the `mtoc_alloc` snippet, and activated
-alongside `mtoc_tensor_t` whenever any tensor is declared.
-
-Going uniformly heap means every `.m` script — even ones that only ever
-use small tensors — exercises the production allocation path. The earlier
-stack-array model would have only kicked over to heap above an 8 MB stack
-budget, leaving the heap path bitrot-prone. Cross-runner coverage now
-comes "for free" from every existing test.
-
-**Cleanup.** Every `mtoc_alloc` is paired with a `free` at scope exit.
-Codegen emits `free(<v>.real)` (and `free(<v>.imag)` for complex tensors)
-immediately before each `return` in:
-
-- the implicit fall-through return at the end of `main()`,
-- the implicit fall-through return at the end of every user function,
-- every explicit `IRStmt.ReturnFromFunction` early-return inside a
-  function body.
-
-Free order matches declaration order (sorted by C identifier) so the
-generated C is deterministic. The free is unconditional — the malloc
-above is also unconditional, even when the variable's first source-level
-assignment is inside an `if` branch.
+`runtime/alloc.h` and is the lowest-level building block; the
+construction helpers below all delegate to it.
 
 `MTOC_RESTRICT` is a small macro defined alongside the struct: it expands to
 `__restrict__` under GCC/Clang and to nothing on compilers that don't
 recognize it. It tells the compiler that two distinct `mtoc_tensor_t`
 values' buffers do not alias each other, which the autovectorizer relies on
 for elementwise loops.
+
+## Tensor lifecycle helpers
+
+Generated C goes through a small family of helpers so the emitted code
+reads close to the numbl source. The full set lives under
+`src/codegen/runtime/tensor_*.h`:
+
+- `mtoc_tensor_empty()` — zero-initialized placeholder (`{NULL, NULL,
+0, 0}`). Returned at every predecl site so a tensor variable starts
+  in a known state.
+- `mtoc_tensor_alloc(rows, cols)` /
+  `mtoc_tensor_alloc_complex(rows, cols)` — allocate an uninitialized
+  tensor of the given shape. The workhorse for elementwise-result
+  construction.
+- `mtoc_tensor_from_row(data, n)` /
+  `mtoc_tensor_from_row_complex(re, im, n)` — build a 1×n tensor from
+  a flat data pointer (typically a C99 compound literal).
+- `mtoc_tensor_from_matrix(data, rows, cols)` /
+  `mtoc_tensor_from_matrix_complex(re, im, rows, cols)` — same, for a
+  rows×cols matrix in column-major order.
+- `mtoc_tensor_copy(src)` / `mtoc_tensor_copy_complex(src)` — deep
+  copy. The receiver gets a freshly-owned tensor.
+- `mtoc_tensor_free(&t)` — release backing buffers and reset the
+  struct. Shape-agnostic (real and complex use the same helper —
+  `free(NULL)` is well-defined and the imag-side free is a no-op for
+  real tensors, so there is no runtime branch on `isComplex`).
+- `mtoc_tensor_assign(&lhs, rhs)` — consume-and-replace. Frees
+  `*lhs`'s current buffers and moves `rhs`'s buffers into `*lhs`.
+  Codegen guarantees that every RHS is a freshly-owned tensor
+  (literal, copy, or alloc'd elementwise result), so the move (rather
+  than a deep copy here) is sound.
+
+The split-by-isComplex helpers (`alloc`, `from_row`, `from_matrix`,
+`copy`) preserve the "no runtime branch on `imag != NULL`" invariant:
+codegen knows `isComplex` statically and dispatches to the right
+variant. `empty` / `free` / `assign` are shape-agnostic by design.
+
+## Copy semantics
+
+Every manipulation copies. Specifically:
+
+- **Tensor-by-name assignment** (`y = x;`) emits
+  `mtoc_tensor_assign(&y, mtoc_tensor_copy(x));`.
+- **Tensor literals** (`x = [1 2 3];`) emit
+  `mtoc_tensor_assign(&x, mtoc_tensor_from_row((double[]){1.0, 2.0,
+3.0}, 3));` — one helper-pair per source statement.
+- **Elementwise expressions** (`s = a + b;`) build a fresh tensor via
+  `mtoc_tensor_alloc(...)`, fill its `.real` / `.imag` slots in a
+  loop, then `mtoc_tensor_assign(&s, _mtoc_t)`. The check-shape
+  helper guards same-category mismatches just before the alloc.
+- **User-function calls** wrap every tensor argument in
+  `mtoc_tensor_copy(...)` so the callee gets an owned tensor (which
+  it may reassign or free at scope exit). Builtins like `disp`,
+  `sum`, `length`, and `numel` are known read-only and skip the wrap.
+
+Optimizations to share buffers safely (avoiding the copy when liveness
+analysis can prove no other reference exists) are an open roadmap
+item; the priority for the current generation is clarity and
+correctness over performance.
+
+## Cleanup
+
+Every `mtoc_tensor_*` allocation is paired with `mtoc_tensor_free` at
+scope exit:
+
+- the implicit fall-through return at the end of `main()`,
+- the implicit fall-through return at the end of every user function,
+- every explicit `IRStmt.ReturnFromFunction` early-return inside a
+  function body.
+
+The free walk includes both function-body locals (`assignedVars`) and
+every multi-element tensor parameter — under copy-on-arg-pass the
+callee owns each tensor argument, so its release is the callee's
+responsibility. Free order is sorted by C identifier so generated C
+stays deterministic. The free is unconditional — the predecl above
+is also unconditional, even when the variable's first source-level
+assignment is inside an `if` branch.
 
 **Shape-mismatch trap (`mtoc_check_shape`).** With the coarse dim lattice
 the type system no longer catches same-category shape mismatches like
@@ -160,10 +211,11 @@ scalars are `double _Complex` (C99).
 ## Reserved name prefix
 
 Anything beginning with `_mtoc_` is reserved for the codegen — synthetic
-loop counters (`_mtoc_i`, `_mtoc_n`), elementwise staging temporaries
-(`_mtoc_t`), and split-binding names introduced by the lowerer
+loop counters (`_mtoc_i`, `_mtoc_n`), elementwise staging tensors
+(`_mtoc_t`), per-cell complex temporaries inside tensor literals
+(`_mtoc_c<N>`), and split-binding names introduced by the lowerer
 (`_mtoc_<name>__v<N>`). The lowerer defensively rejects user identifiers
 starting with `_mtoc_` (numbl syntax already disallows leading underscores,
-but it's belt-and-suspenders). Tensor backing storage no longer has a
-named C identifier — `mtoc_alloc` returns the pointer directly into the
-struct initializer, so there's nothing to label.
+but it's belt-and-suspenders). Tensor backing storage has no named C
+identifier — the `mtoc_tensor_*` helpers return the struct directly into
+the assign call, so there's nothing to label.

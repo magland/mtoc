@@ -152,11 +152,6 @@ export class Lowerer {
   private splitCounter = 0;
   /** Names of params for the current scope (function scope only). */
   private params: ReadonlySet<string>;
-  /** Original (call-site) param types — kept distinct from `env` so the
-   *  param-reassignment guard can inspect the param's borrowed type
-   *  even AFTER `env` has been overwritten by the assignment we're
-   *  about to reject. Function scope only; empty at script scope. */
-  private paramTypes: ReadonlyMap<string, MType>;
   /** Output variable for the current function scope, or null at script
    *  scope. Used to lower MATLAB `return` into `return <outputCName>;`. */
   private outputVar: string | null;
@@ -178,7 +173,6 @@ export class Lowerer {
   ) {
     this.shared = shared;
     this.params = new Set(paramBindings.map(p => p.name));
-    this.paramTypes = new Map(paramBindings.map(p => [p.name, p.ty]));
     for (const p of paramBindings) {
       this.env.set(p.name, p.ty);
       this.currentBindingCName.set(p.name, p.cName);
@@ -279,23 +273,15 @@ export class Lowerer {
     this.env.set(name, ty);
 
     if (this.params.has(name)) {
-      // Tensor params are borrowed by value and the body must never
-      // write through them — the buffer is shared with the caller.
-      // Reject the reassignment with a span pointing at the offending
-      // statement; the user can introduce a fresh local instead.
-      // (We consult `paramTypes` rather than `env` because `env` was
-      // already overwritten with the new RHS type two lines above.)
-      const paramTy = this.paramTypes.get(name);
-      if (paramTy && isMultiElement(paramTy)) {
-        throw new UnsupportedConstruct(
-          `tensor parameter '${name}' cannot be reassigned in the function ` +
-            `body; introduce a fresh local instead ` +
-            `(e.g. \`w = ${name} ...; ... = w;\`)`,
-          span
-        );
-      }
-      // Scalar params keep their fixed cName (declared by the C
-      // function signature). Phase 1 doesn't split params.
+      // Params keep their fixed cName (declared by the C function
+      // signature). Tensor params are owned by the callee under
+      // copy-on-arg-pass — the caller wrapped the argument in
+      // `mtoc_tensor_copy(...)`, so the body is free to reassign
+      // through `mtoc_tensor_assign(&v, ...)` and the scope-exit free
+      // releases the final buffer. Scalar params keep the same shape
+      // they always had: assign-in-place at the param's C name.
+      // Category-changing reassignments (scalar↔tensor, real↔complex)
+      // remain a known gap and are not split today.
       return this.currentBindingCName.get(name) ?? cNameFor(name);
     }
 

@@ -25,7 +25,6 @@ import {
 } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import {
-  MTOC_ALLOC,
   MTOC_DISP_COMPLEX,
   MTOC_DISP_DOUBLE,
   MTOC_TENSOR_STRUCT,
@@ -221,7 +220,24 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       // `needMath` for builtins that conditionally pull in <math.h>.
       // The closure receives the arg MTypes so it can dispatch on
       // `isComplex` (e.g. `sqrt(x)` vs `sqrt(z)` → `csqrt(z)`).
-      const argStrs = e.args.map(a => emitExpr(state, a, 0));
+      //
+      // Copy-on-arg-pass: for user-function calls, every tensor-typed
+      // argument is wrapped in `mtoc_tensor_copy(...)` so the callee
+      // gets an owned tensor (which it may freely reassign or free at
+      // scope exit). Builtins are known read-only and skip the wrap.
+      const isUserCall = e.callee.kind === "userFunc";
+      const argStrs = e.args.map(a => {
+        const inner = emitExpr(state, a, 0);
+        if (isUserCall && isMultiElement(a.ty)) {
+          const helper =
+            isNumeric(a.ty) && a.ty.isComplex
+              ? "mtoc_tensor_copy_complex"
+              : "mtoc_tensor_copy";
+          useRuntimeByName(state, helper);
+          return `${helper}(${inner})`;
+        }
+        return inner;
+      });
       if (e.callee.kind === "userFunc") {
         return `${e.callee.mangled}(${argStrs.join(", ")})`;
       }
@@ -508,6 +524,15 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         break;
       }
       if (isNumeric(s.ty) && isMultiElement(s.ty) && s.ty.elem === "double") {
+        // Tensor-by-name: `y = x;` collapses to a single helper call
+        // pair — `mtoc_tensor_assign(&y, mtoc_tensor_copy(x));`. The
+        // RHS-is-a-Var case is the simplest manifestation of "every
+        // manipulation copies"; non-trivial RHSs (Binary, Unary, …)
+        // build a fresh tensor via the elementwise loop below.
+        if (s.rhs.kind === "Var") {
+          emitTensorVarCopyAssign(state, level, s.cName, s.rhs);
+          break;
+        }
         emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
         break;
       }
@@ -716,13 +741,39 @@ function collectMultiElementVarsByCName(
   }
 }
 
-/** Emit an Assign whose multi-element RHS is NOT a TensorLit. Pattern:
- *  read shape from a deterministic shape-source `Var`, allocate a
- *  fresh staging buffer (so reads from the target inside the body
- *  see the OLD buffer — important when the RHS aliases the target,
- *  e.g. `M = M + 1`), evaluate the body into the staging buffer,
- *  free the previous backing, then swap. Wrapped in `{}` so the
- *  staging-buffer locals are scoped per Assign. */
+/** Emit `<target> = <var>;` where `<var>` is a tensor variable. The
+ *  cleanest manifestation of "copy on every manipulation": one helper
+ *  call to copy the source, one helper call to consume-replace the
+ *  target. Same shape regardless of real/complex (codegen picks the
+ *  right `mtoc_tensor_copy{,_complex}` variant statically). */
+function emitTensorVarCopyAssign(
+  state: EmitState,
+  level: number,
+  cTarget: string,
+  src: Extract<IRExpr, { kind: "Var" }>
+): void {
+  useRuntimeByName(state, "mtoc_tensor_assign");
+  const isComplex = isNumeric(src.ty) && src.ty.isComplex;
+  const copyHelper = isComplex
+    ? "mtoc_tensor_copy_complex"
+    : "mtoc_tensor_copy";
+  useRuntimeByName(state, copyHelper);
+  pushStmt(
+    state,
+    level,
+    `mtoc_tensor_assign(&${cTarget}, ${copyHelper}(${src.cName}));`
+  );
+}
+
+/** Emit an Assign whose multi-element RHS is NOT a TensorLit and not
+ *  a bare Var. Pattern: read shape from a deterministic shape-source
+ *  `Var`, allocate a fresh tensor via `mtoc_tensor_alloc{,_complex}`
+ *  (so reads from the target inside the body see the OLD buffer —
+ *  important when the RHS aliases the target, e.g. `M = M + 1`),
+ *  evaluate the body into the staging tensor's slots, then
+ *  `mtoc_tensor_assign(&target, _mtoc_t)` to consume-replace the
+ *  target. Wrapped in `{}` so the staging local is scoped per
+ *  Assign. */
 function emitTensorAssignFromExpr(
   state: EmitState,
   level: number,
@@ -742,11 +793,20 @@ function emitTensorAssignFromExpr(
     );
   }
   useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-  useRuntime(state, "mtoc_alloc", MTOC_ALLOC);
+  useRuntimeByName(state, "mtoc_tensor_assign");
+
+  const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
+  const allocHelper = isComplex
+    ? "mtoc_tensor_alloc_complex"
+    : "mtoc_tensor_alloc";
+  useRuntimeByName(state, allocHelper);
 
   const iterId = state.elemwiseLoopCounter++;
   const iterName = iterId === 0 ? "_mtoc_i" : `_mtoc_i${iterId}`;
-  const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
+  // Single-purpose name for the staging tensor — distinct from the
+  // `_mtoc_t<n>` per-cell complex temp in `emitTensorLitAssign`, which
+  // never appears in this function's emission.
+  const stagingName = "_mtoc_t";
 
   // Collect every distinct multi-element Var in the RHS (keyed by
   // cName so duplicates like `v .* v` collapse). The shape source
@@ -775,21 +835,16 @@ function emitTensorAssignFromExpr(
       `mtoc_check_shape(${src.cName}, ${other.cName});`
     );
   }
-  pushStmt(state, level + 1, `long _mtoc_rows = ${src.cName}.rows;`);
-  pushStmt(state, level + 1, `long _mtoc_cols = ${src.cName}.cols;`);
-  pushStmt(state, level + 1, `long _mtoc_n = _mtoc_rows * _mtoc_cols;`);
   pushStmt(
     state,
     level + 1,
-    `double *_mtoc_new = mtoc_alloc(_mtoc_n * sizeof(double));`
+    `mtoc_tensor_t ${stagingName} = ${allocHelper}(${src.cName}.rows, ${src.cName}.cols);`
   );
-  if (isComplex) {
-    pushStmt(
-      state,
-      level + 1,
-      `double *_mtoc_new_im = mtoc_alloc(_mtoc_n * sizeof(double));`
-    );
-  }
+  pushStmt(
+    state,
+    level + 1,
+    `long _mtoc_n = ${stagingName}.rows * ${stagingName}.cols;`
+  );
   pushStmt(
     state,
     level + 1,
@@ -799,36 +854,51 @@ function emitTensorAssignFromExpr(
   const bodyStr = emitExpr(state, rhs, 0);
   state.iterStack.pop();
   if (isComplex) {
-    pushStmt(state, level + 2, `double _Complex _mtoc_t = ${bodyStr};`);
-    pushStmt(state, level + 2, `_mtoc_new[${iterName}] = creal(_mtoc_t);`);
-    pushStmt(state, level + 2, `_mtoc_new_im[${iterName}] = cimag(_mtoc_t);`);
+    pushStmt(state, level + 2, `double _Complex _mtoc_c = ${bodyStr};`);
+    pushStmt(
+      state,
+      level + 2,
+      `${stagingName}.real[${iterName}] = creal(_mtoc_c);`
+    );
+    pushStmt(
+      state,
+      level + 2,
+      `${stagingName}.imag[${iterName}] = cimag(_mtoc_c);`
+    );
   } else {
-    pushStmt(state, level + 2, `_mtoc_new[${iterName}] = ${bodyStr};`);
+    pushStmt(
+      state,
+      level + 2,
+      `${stagingName}.real[${iterName}] = ${bodyStr};`
+    );
   }
   pushStmt(state, level + 1, `}`);
-  // Free the previous backing buffers (NULL on first assignment, valid
-  // on subsequent reassignments). Both `free(NULL)` and `free` of a
-  // valid buffer are well-defined.
-  pushStmt(state, level + 1, `free(${cTarget}.real);`);
-  if (isComplex) {
-    pushStmt(state, level + 1, `free(${cTarget}.imag);`);
-  }
-  pushStmt(state, level + 1, `${cTarget}.real = _mtoc_new;`);
-  if (isComplex) {
-    pushStmt(state, level + 1, `${cTarget}.imag = _mtoc_new_im;`);
-  }
-  pushStmt(state, level + 1, `${cTarget}.rows = _mtoc_rows;`);
-  pushStmt(state, level + 1, `${cTarget}.cols = _mtoc_cols;`);
+  pushStmt(
+    state,
+    level + 1,
+    `mtoc_tensor_assign(&${cTarget}, ${stagingName});`
+  );
   pushStmt(state, level, `}`);
 }
 
-/** Emit a tensor-literal assignment. After the dim coarsening, the
- *  predeclared `mtoc_tensor_t` carries NULL buffers / 0 dims; the
- *  assignment site allocates a fresh staging buffer, populates it
- *  in column-major order, then frees the previous backing and swaps.
- *  Using a staging buffer (rather than writing directly to
- *  `<target>.real`) keeps cell expressions that read from the target
- *  (e.g. `M = [1, sum(M)]`) seeing the OLD buffer until the swap. */
+/** Emit a tensor-literal assignment. The runtime helpers
+ *  (`mtoc_tensor_from_row` / `_complex` / `mtoc_tensor_from_matrix` /
+ *  `_complex`) take a flat column-major data pointer and return a
+ *  freshly-allocated tensor; `mtoc_tensor_assign` consumes that
+ *  result and replaces the target's backing in one shot.
+ *
+ *  Real cells go straight into a C99 compound literal — `(double[])
+ *  {1.0, 2.0, x, x*y}` — so the emitted C matches the numbl source
+ *  one-for-one.
+ *
+ *  Complex literals build the staging tensor first (`mtoc_tensor_alloc_complex`),
+ *  fill its `.real` / `.imag` slots in column-major order, then
+ *  consume-replace via `mtoc_tensor_assign`. This handles arbitrary
+ *  per-cell shapes (NumLit, ImagLit, real-scalar exprs, and full
+ *  complex exprs needing creal/cimag splits) uniformly. Reads from
+ *  the target (e.g. `M = [1, sum(M)]`) see the OLD buffer up until
+ *  the final assign call, since the staging tensor is a separate
+ *  allocation. */
 function emitTensorLitAssign(
   state: EmitState,
   level: number,
@@ -845,61 +915,62 @@ function emitTensorLitAssign(
   // row-uniformity check.
   const rows = lit.elements.length;
   const cols = rows > 0 ? lit.elements[0].length : 0;
-  const numel = rows * cols;
   useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-  useRuntime(state, "mtoc_alloc", MTOC_ALLOC);
+  useRuntimeByName(state, "mtoc_tensor_assign");
 
+  if (!ty.isComplex) {
+    // Real path: every cell is a real-scalar C expression. Drop them
+    // straight into a compound literal in column-major order, then
+    // hand to the matching from_row / from_matrix helper.
+    const cells: string[] = [];
+    for (let c = 0; c < cols; c++) {
+      for (let r = 0; r < rows; r++) {
+        cells.push(emitExpr(state, lit.elements[r][c], 0));
+      }
+    }
+    const helper =
+      rows === 1 ? "mtoc_tensor_from_row" : "mtoc_tensor_from_matrix";
+    useRuntimeByName(state, helper);
+    const shapeArgs = rows === 1 ? `${cols}` : `${rows}, ${cols}`;
+    pushStmt(
+      state,
+      level,
+      `mtoc_tensor_assign(&${target}, ${helper}((double[]){${cells.join(", ")}}, ${shapeArgs}));`
+    );
+    return;
+  }
+
+  // Complex path: build the staging tensor up front and write each
+  // cell's (real, imag) parts into its `.real`/`.imag` slots in
+  // column-major order. Complex-typed cells (e.g. `x + 1` where x is
+  // complex, or a complex Binary) need a per-cell `double _Complex`
+  // temp so creal/cimag don't double-evaluate the expression.
+  useRuntimeByName(state, "mtoc_tensor_alloc_complex");
   pushStmt(state, level, `{`);
   pushStmt(
     state,
     level + 1,
-    `double *_mtoc_new = mtoc_alloc(${numel} * sizeof(double));`
+    `mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc_complex(${rows}, ${cols});`
   );
-  if (ty.isComplex) {
-    pushStmt(
-      state,
-      level + 1,
-      `double *_mtoc_new_im = mtoc_alloc(${numel} * sizeof(double));`
-    );
-  }
   for (let c = 0; c < cols; c++) {
     for (let r = 0; r < rows; r++) {
       const cellExpr = lit.elements[r][c];
       const idx = r + c * rows;
-      if (!ty.isComplex) {
-        pushStmt(
-          state,
-          level + 1,
-          `_mtoc_new[${idx}] = ${emitExpr(state, cellExpr, 0)};`
-        );
-        continue;
-      }
-      // Complex literal: write both halves. Special-case structurally
-      // recognizable cells so the emitted C is the same shape numbl's
-      // values would print:
-      //   - NumLit v       → real=v, imag=0
-      //   - ImagLit v      → real=0, imag=v
-      //   - else (a complex-typed expression at this slot): emit a
-      //     temporary `double _Complex` and use creal / cimag. This
-      //     covers nested complex Binary/Unary/Var cells.
-      // Real-typed but not-NumLit cells (e.g. `x` where x is real
-      // scalar) write the cell expression to `_mtoc_new` and 0 to
-      // `_mtoc_new_im`.
       if (cellExpr.kind === "NumLit") {
         pushStmt(
           state,
           level + 1,
-          `_mtoc_new[${idx}] = ${formatNumLit(cellExpr.value)};`
+          `_mtoc_t.real[${idx}] = ${formatNumLit(cellExpr.value)};`
         );
-        pushStmt(state, level + 1, `_mtoc_new_im[${idx}] = 0.0;`);
+        pushStmt(state, level + 1, `_mtoc_t.imag[${idx}] = 0.0;`);
         continue;
       }
       if (cellExpr.kind === "ImagLit") {
-        pushStmt(state, level + 1, `_mtoc_new[${idx}] = 0.0;`);
+        pushStmt(state, level + 1, `_mtoc_t.real[${idx}] = 0.0;`);
         pushStmt(
           state,
           level + 1,
-          `_mtoc_new_im[${idx}] = ${formatNumLit(cellExpr.value)};`
+          `_mtoc_t.imag[${idx}] = ${formatNumLit(cellExpr.value)};`
         );
         continue;
       }
@@ -909,48 +980,36 @@ function emitTensorLitAssign(
         pushStmt(
           state,
           level + 1,
-          `_mtoc_new[${idx}] = ${emitExpr(state, cellExpr, 0)};`
+          `_mtoc_t.real[${idx}] = ${emitExpr(state, cellExpr, 0)};`
         );
-        pushStmt(state, level + 1, `_mtoc_new_im[${idx}] = 0.0;`);
+        pushStmt(state, level + 1, `_mtoc_t.imag[${idx}] = 0.0;`);
         continue;
       }
       // Generic complex cell: stash into a temp and split with
       // creal/cimag. The temp is scoped per-cell with a `{}` block so
       // adjacent cells don't collide.
-      const tmp = `_mtoc_t${state.elemwiseLoopCounter++}`;
+      const tmp = `_mtoc_c${state.elemwiseLoopCounter++}`;
       const cellStr = emitExpr(state, cellExpr, 0);
       pushStmt(state, level + 1, `{`);
       pushStmt(state, level + 2, `double _Complex ${tmp} = ${cellStr};`);
-      pushStmt(state, level + 2, `_mtoc_new[${idx}] = creal(${tmp});`);
-      pushStmt(state, level + 2, `_mtoc_new_im[${idx}] = cimag(${tmp});`);
+      pushStmt(state, level + 2, `_mtoc_t.real[${idx}] = creal(${tmp});`);
+      pushStmt(state, level + 2, `_mtoc_t.imag[${idx}] = cimag(${tmp});`);
       pushStmt(state, level + 1, `}`);
     }
   }
-  // Free the previous backings (NULL on first assignment) and swap in
-  // the freshly populated buffers + new dims.
-  pushStmt(state, level + 1, `free(${target}.real);`);
-  if (ty.isComplex) {
-    pushStmt(state, level + 1, `free(${target}.imag);`);
-  }
-  pushStmt(state, level + 1, `${target}.real = _mtoc_new;`);
-  if (ty.isComplex) {
-    pushStmt(state, level + 1, `${target}.imag = _mtoc_new_im;`);
-  }
-  pushStmt(state, level + 1, `${target}.rows = ${rows};`);
-  pushStmt(state, level + 1, `${target}.cols = ${cols};`);
+  pushStmt(state, level + 1, `mtoc_tensor_assign(&${target}, _mtoc_t);`);
   pushStmt(state, level, `}`);
 }
 
 /** Emit predeclarations for a {cName → VarBinding} table. Scalars
  *  become `double <cName> = 0.0;` (real) or `double _Complex <cName> = 0.0;`
  *  (complex). Multi-element tensors are predeclared empty
- *  (`mtoc_tensor_t <cName> = { NULL, NULL, 0, 0 };`); the assignment
- *  site allocates `<cName>.real` (and `<cName>.imag` for complex) and
- *  populates `.rows` / `.cols` from the actual runtime shape, freeing
- *  any prior backing. Activates the `mtoc_tensor_t` typedef whenever
- *  any tensor is declared. Cleanup is paired in `emitScopeExitFrees`,
- *  which is invoked at every `return` site (script end, function end,
- *  and `IRStmt.ReturnFromFunction`). */
+ *  (`mtoc_tensor_t <cName> = mtoc_tensor_empty();`); the assignment
+ *  site overwrites them via `mtoc_tensor_assign`, which frees the
+ *  empty buffers (a no-op on NULL) and installs the new ones.
+ *  Activates the `mtoc_tensor_t` typedef + `mtoc_tensor_empty` helper
+ *  whenever any tensor is declared. Cleanup is paired in
+ *  `emitScopeExitFrees`, invoked at every `return` site. */
 function emitDeclarations(
   state: EmitState,
   level: number,
@@ -972,7 +1031,8 @@ function emitDeclarations(
     }
     if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
       useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-      pushStmt(state, level, `mtoc_tensor_t ${cName} = { NULL, NULL, 0, 0 };`);
+      useRuntimeByName(state, "mtoc_tensor_empty");
+      pushStmt(state, level, `mtoc_tensor_t ${cName} = mtoc_tensor_empty();`);
       continue;
     }
     throw new Error(
@@ -981,38 +1041,61 @@ function emitDeclarations(
   }
 }
 
-/** Emit `free(...)` lines for every multi-element tensor binding in
- *  `vars`. Real tensors get one free for `<v>.real`; complex tensors
- *  get a second for `<v>.imag` (which is NULL for real tensors, so
- *  freeing it would be a wasted no-op). Iteration order matches
- *  `emitDeclarations` (sorted by C identifier) so generated C stays
- *  deterministic. Called at every scope-exit site — end of `main`,
- *  end of each function body, and every `IRStmt.ReturnFromFunction`. */
+/** Emit `mtoc_tensor_free(&<v>);` for every multi-element tensor
+ *  binding in `vars`. Iteration order matches `emitDeclarations`
+ *  (sorted by C identifier) so generated C stays deterministic.
+ *  Called at every scope-exit site — end of `main`, end of each
+ *  function body, and every `IRStmt.ReturnFromFunction`. The same
+ *  helper handles real and complex (free(NULL) is well-defined and
+ *  the imag-side free is a no-op for real tensors), so there is no
+ *  per-call branch on `isComplex`. */
 function emitScopeExitFrees(
   state: EmitState,
   level: number,
   vars: ReadonlyMap<string, VarBinding>
 ): void {
   const cNames = [...vars.keys()].sort();
+  let activated = false;
   for (const key of cNames) {
     const binding = vars.get(key)!;
     const { ty, cName } = binding;
     if (!(isNumeric(ty) && isMultiElement(ty) && ty.elem === "double")) {
       continue;
     }
-    pushStmt(state, level, `free(${cName}.real);`);
-    if (ty.isComplex) {
-      pushStmt(state, level, `free(${cName}.imag);`);
+    if (!activated) {
+      useRuntimeByName(state, "mtoc_tensor_free");
+      activated = true;
+    }
+    pushStmt(state, level, `mtoc_tensor_free(&${cName});`);
+  }
+}
+
+/** Build the per-function "free at scope exit" set: every entry in
+ *  `assignedVars` plus every multi-element tensor parameter. Tensor
+ *  params are owned by the callee under copy-on-arg-pass — the caller
+ *  wraps each argument in `mtoc_tensor_copy(...)`, so the param's
+ *  buffer is the callee's responsibility to release. Scalar params
+ *  stay out of the set: they have no heap buffer. */
+function functionFreeOnExitSet(
+  fn: IRFunction
+): ReadonlyMap<string, VarBinding> {
+  const out = new Map<string, VarBinding>(fn.assignedVars);
+  for (const p of fn.params) {
+    if (isMultiElement(p.ty)) {
+      out.set(p.cName, { ty: p.ty, cName: p.cName });
     }
   }
+  return out;
 }
 
 /** Emit the body of a user-defined function (predeclarations + body
  *  stmts + scope-exit frees + final return) into a fresh local-line
- *  buffer. The frees pair with `emitDeclarations`'s heap allocations:
- *  every tensor local is freed before the implicit fall-through return,
- *  and every `IRStmt.ReturnFromFunction` early exit picks up the same
- *  free preamble (driven by `state.currentScopeVars`). */
+ *  buffer. The frees pair with `emitDeclarations`'s heap allocations
+ *  AND with the caller-side `mtoc_tensor_copy` for every tensor
+ *  parameter: every tensor local AND every owned tensor param is
+ *  freed before the implicit fall-through return, and every
+ *  `IRStmt.ReturnFromFunction` early exit picks up the same free
+ *  preamble (driven by `state.currentScopeVars`). */
 function emitFunctionBody(
   state: EmitState,
   fn: IRFunction
@@ -1022,7 +1105,11 @@ function emitFunctionBody(
   const outerLines = state.lines;
   const outerScopeVars = state.currentScopeVars;
   state.lines = [];
-  state.currentScopeVars = fn.assignedVars;
+  // Predecls cover assignedVars only — params are declared by the C
+  // signature. Scope-exit frees cover both: locals from the body and
+  // owned tensor params from the call site.
+  const freeOnExit = functionFreeOnExitSet(fn);
+  state.currentScopeVars = freeOnExit;
 
   emitDeclarations(state, 1, fn.assignedVars);
   for (const s of fn.body) emitStmt(state, 1, s);
@@ -1030,7 +1117,7 @@ function emitFunctionBody(
   // tensor backing, then return the output. Early-exit `return` paths
   // emitted by `IRStmt.ReturnFromFunction` carry their own copy of the
   // free preamble (see `emitStmt`).
-  emitScopeExitFrees(state, 1, fn.assignedVars);
+  emitScopeExitFrees(state, 1, freeOnExit);
   pushStmt(state, 1, `return ${fn.outputCName};`);
 
   const bodyLines = state.lines;
@@ -1088,12 +1175,11 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
   // real scalars, `double _Complex` for complex scalars, and the
   // `mtoc_tensor_t` struct for any multi-element tensor (real or
   // complex; the struct's `imag` buffer carries the complex half).
-  // Tensor params are borrowed by value: the struct fields (real /
-  // imag pointers + dims) are copied into the callee's frame, but the
-  // buffers themselves are shared with the caller. The lowerer rejects
-  // any reassignment of a tensor param so the body can never write
-  // through the borrowed buffer; params are not in `assignedVars` so
-  // the scope-exit free walk skips them.
+  // Tensor params are owned by the callee: the caller wraps each
+  // tensor argument in `mtoc_tensor_copy(...)` (see emitExpr's Call
+  // case), so the param's buffer is the callee's responsibility to
+  // release. The scope-exit free walk in `emitFunctionBody` adds
+  // every multi-element tensor param to the free set.
   const paramParts: string[] = [];
   let needsTensorTypedef = false;
   for (const p of fn.params) {

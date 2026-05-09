@@ -48,9 +48,10 @@ workaround or a roadmap note.
 - **Tensor-valued function returns aren't supported yet.** Functions accept
   tensor arguments (real or complex), but the return type must be a scalar
   (real or complex). Returning a tensor needs an sret-style codegen path
-  that's still pending. Tensor params are also borrowed by value: the body
-  cannot reassign one (the lowerer rejects it with a span pointing at the
-  offending statement) — introduce a fresh local instead.
+  that's still pending. Tensor params are owned by the callee (caller-side
+  copy-on-arg-pass), so reassigning a param inside the body is fine —
+  `mtoc_tensor_assign` frees the previous buffer and installs the new one,
+  and the scope-exit free reclaims the final value.
 - **`sum` on a matrix isn't supported.** Vector sum returns scalar; matrix sum
   in numbl returns a row vector of column sums, which needs a tensor-returning
   builtin path.

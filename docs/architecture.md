@@ -119,15 +119,18 @@ Responsibilities:
 - Predeclare every `assignedVars` entry at the top of `main()` and inside each
   function body. Scalars: `double x = 0.0;` (real) or
   `double _Complex z = 0.0;` (complex). Tensors are predeclared empty —
-  `mtoc_tensor_t v = { NULL, NULL, 0, 0 };` — and the assignment site
-  allocates the backing buffer via `mtoc_alloc`, populates `.rows` /
-  `.cols` from the runtime shape, and frees the previous backing
-  before installing the new one. (`free(NULL)` is well-defined, so the
-  first assignment's free is a no-op and subsequent reassignments
-  reclaim the prior buffer in place — even at a different shape.)
-  Paired `free(<name>.real)` (and `.imag` for complex) calls are
-  emitted before every `return` site so the cleanup path is exercised
-  by every test, not just large ones.
+  `mtoc_tensor_t v = mtoc_tensor_empty();` — and the assignment site
+  consumes a freshly-built tensor via `mtoc_tensor_assign(&v, ...)`,
+  which frees the previous backing and installs the new one in one
+  helper call. The RHS is one of: a literal helper
+  (`mtoc_tensor_from_row` / `_complex` / `mtoc_tensor_from_matrix` /
+  `_complex`), an `mtoc_tensor_copy` of a source variable, or an
+  alloc'd elementwise result (`mtoc_tensor_alloc` + a loop that fills
+  the slots). Every tensor argument to a user-function call is also
+  wrapped in `mtoc_tensor_copy(...)` so the callee owns its
+  parameter. Paired `mtoc_tensor_free(&<name>)` calls are emitted
+  before every `return` site so the cleanup path is exercised by
+  every test, not just large ones.
 - Emit user-function specializations ahead of `main`, each with a header
   comment showing the source span and the inferred type signature.
 - Map operators to C with a precedence-aware printer; nested unary operands

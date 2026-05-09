@@ -68,12 +68,13 @@ describe("translate scalar example", () => {
 
   it("accepts a row-vector literal (dynamic-shape allocation)", () => {
     const c = translate("v = [1 2 3]; disp(v);");
-    // Predeclared empty; populated and sized at the assignment site.
-    expect(c).toContain("mtoc_tensor_t v = { NULL, NULL, 0, 0 };");
-    expect(c).toContain("_mtoc_new[0] = 1.0;");
-    expect(c).toContain("v.real = _mtoc_new;");
-    expect(c).toContain("v.rows = 1;");
-    expect(c).toContain("v.cols = 3;");
+    // Predeclared empty via the helper; the assignment collapses to
+    // one helper-pair line — `mtoc_tensor_assign(&v,
+    // mtoc_tensor_from_row((double[]){...}, 3))`.
+    expect(c).toContain("mtoc_tensor_t v = mtoc_tensor_empty();");
+    expect(c).toContain(
+      "mtoc_tensor_assign(&v, mtoc_tensor_from_row((double[]){1.0, 2.0, 3.0}, 3));"
+    );
     expect(c).toContain("mtoc_disp_tensor(v);");
   });
 
@@ -132,21 +133,27 @@ describe("translate scalar example", () => {
   it("does not split a tensor reassignment at a different runtime shape", () => {
     // After dim coarsening, `[1 2 3]` and `[1 2 3 4]` share the same
     // coarse type (row vector with `cols: notOne`); the second
-    // assignment frees the previous backing and reallocs in place
-    // rather than introducing a fresh `_mtoc_v__v<N>` binding.
+    // assignment goes through the same `mtoc_tensor_assign` helper
+    // and reuses the predeclared `v` rather than introducing a
+    // fresh `_mtoc_v__v<N>` binding.
     const c = translate("v = [1 2 3];\ndisp(v);\nv = [1 2 3 4];\ndisp(v);\n");
-    expect(c).toContain("mtoc_tensor_t v = { NULL, NULL, 0, 0 };");
+    expect(c).toContain("mtoc_tensor_t v = mtoc_tensor_empty();");
     // No split binding.
     expect(c).not.toMatch(/_mtoc_v__v/);
-    // Both assignments allocate fresh storage and free the previous one.
-    const allocs =
-      c.match(/_mtoc_new = mtoc_alloc\(\d+ \* sizeof\(double\)\);/g) ?? [];
-    expect(allocs.length).toBeGreaterThanOrEqual(2);
-    const frees = c.match(/free\(v\.real\);/g) ?? [];
-    // Two reassignment-site frees plus the scope-exit free.
-    expect(frees.length).toBe(3);
-    expect(c).toMatch(/v\.cols = 3;/);
-    expect(c).toMatch(/v\.cols = 4;/);
+    // Two assignment-site helper calls, both consuming a freshly-
+    // built tensor of the right runtime shape.
+    const assigns = c.match(/mtoc_tensor_assign\(&v, /g) ?? [];
+    expect(assigns.length).toBe(2);
+    expect(c).toContain(
+      "mtoc_tensor_assign(&v, mtoc_tensor_from_row((double[]){1.0, 2.0, 3.0}, 3));"
+    );
+    expect(c).toContain(
+      "mtoc_tensor_assign(&v, mtoc_tensor_from_row((double[]){1.0, 2.0, 3.0, 4.0}, 4));"
+    );
+    // Single scope-exit free; the two assignments consume their old
+    // buffers internally.
+    const frees = c.match(/mtoc_tensor_free\(&v\);/g) ?? [];
+    expect(frees.length).toBe(1);
   });
 
   it("splits a scalar→tensor top-level reassignment", () => {
@@ -199,10 +206,10 @@ describe("translate scalar example", () => {
     expect(e.message).toMatch(/tensor literal/i);
   });
 
-  it("emits free(<v>.real) before the implicit return of a function with a tensor local", () => {
-    // The function declares a tensor local; codegen mallocs its
-    // backing in the predeclaration and must free it before the
-    // function returns. Free comes immediately before `return`.
+  it("emits mtoc_tensor_free(&v) before the implicit return of a function with a tensor local", () => {
+    // The function declares a tensor local; codegen heap-allocates
+    // its backing at the assignment site and must release it before
+    // the function returns. Free comes immediately before `return`.
     const c = translate(
       "disp(sum_first());\n" +
         "function r = sum_first()\n" +
@@ -210,12 +217,12 @@ describe("translate scalar example", () => {
         "  r = sum(v);\n" +
         "end\n"
     );
-    // The function body has `free(v.real);\n  return r;` adjacent
-    // (modulo whitespace).
-    expect(c).toMatch(/free\(v\.real\);\s*\n\s*return r;/);
+    // The function body has `mtoc_tensor_free(&v);\n  return r;`
+    // adjacent (modulo whitespace).
+    expect(c).toMatch(/mtoc_tensor_free\(&v\);\s*\n\s*return r;/);
   });
 
-  it("emits free(<v>.real) at every IRStmt.ReturnFromFunction early-exit site", () => {
+  it("emits mtoc_tensor_free(&v) at every IRStmt.ReturnFromFunction early-exit site", () => {
     // Each `return` keyword inside the function body lowers to its
     // own ReturnFromFunction node, and each one must carry a copy of
     // the free preamble for tensor locals in scope.
@@ -230,10 +237,10 @@ describe("translate scalar example", () => {
         "  y = sum(v) * 2;\n" +
         "end\n"
     );
-    // At least two `free(v.real);` should appear inside the function
-    // body — one for the explicit `return` and one for the implicit
-    // fall-through return.
-    const frees = c.match(/free\(v\.real\);/g) ?? [];
+    // At least two `mtoc_tensor_free(&v);` should appear inside the
+    // function body — one for the explicit `return` and one for the
+    // implicit fall-through return.
+    const frees = c.match(/mtoc_tensor_free\(&v\);/g) ?? [];
     expect(frees.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -268,26 +275,54 @@ describe("translate scalar example", () => {
     expect(c).not.toMatch(/static double avg__[0-9a-f]+\(double v\)/);
   });
 
-  it("rejects tensor-parameter reassignment with a span'd error", () => {
-    let err: unknown;
-    try {
-      translate(
-        "x = [1 2 3];\n" +
-          "disp(foo(x));\n" +
-          "function y = foo(v)\n" +
-          "  v = v .* 2;\n" +
-          "  y = sum(v);\n" +
-          "end\n"
-      );
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/tensor parameter/i);
-    expect(e.message).toContain("'v'");
+  it("allows tensor-parameter reassignment under copy-on-arg-pass", () => {
+    // The callee owns its tensor argument (caller wraps it in
+    // `mtoc_tensor_copy` at the call site), so the body is free to
+    // reassign through `mtoc_tensor_assign(&v, ...)`. The scope-exit
+    // free releases the final buffer regardless of how many times v
+    // was reassigned.
+    const c = translate(
+      "x = [1 2 3];\n" +
+        "disp(foo(x));\n" +
+        "function y = foo(v)\n" +
+        "  v = v .* 2;\n" +
+        "  y = sum(v);\n" +
+        "end\n"
+    );
+    // Caller-side: tensor arg wrapped in a copy.
+    expect(c).toMatch(/foo__[0-9a-f]+\(mtoc_tensor_copy\(x\)\)/);
+    // Callee-side: param signature, reassign-via-helper, scope-exit
+    // free of the param.
+    expect(c).toMatch(/static double foo__[0-9a-f]+\(mtoc_tensor_t v\)/);
+    expect(c).toContain("mtoc_tensor_assign(&v, ");
+    expect(c).toMatch(/mtoc_tensor_free\(&v\);\s*\n\s*return y;/);
+  });
+
+  it("emits mtoc_tensor_copy at user-function call sites (copy-on-arg-pass)", () => {
+    const c = translate(
+      "function s = total(v)\n" +
+        "  s = sum(v);\n" +
+        "end\n" +
+        "a = [1 2 3];\n" +
+        "disp(total(a));\n"
+    );
+    expect(c).toMatch(/total__[0-9a-f]+\(mtoc_tensor_copy\(a\)\)/);
+  });
+
+  it("does NOT wrap builtin tensor args in mtoc_tensor_copy", () => {
+    // Builtins (disp, sum, length, numel) are read-only; the args
+    // are passed through by value with no copy wrap.
+    const c = translate("v = [1 2 3];\ndisp(v);\ndisp(sum(v));\n");
+    expect(c).toContain("mtoc_disp_tensor(v);");
+    expect(c).toContain("mtoc_sum(v)");
+    expect(c).not.toMatch(/mtoc_tensor_copy\(v\)/);
+  });
+
+  it("emits mtoc_tensor_assign + mtoc_tensor_copy for tensor-by-name assignment", () => {
+    // `b = a;` collapses to one helper-pair line — the cleanest
+    // manifestation of "copy on every manipulation".
+    const c = translate("a = [1 2 3];\nb = a;\ndisp(b);\n");
+    expect(c).toContain("mtoc_tensor_assign(&b, mtoc_tensor_copy(a));");
   });
 
   it("emits a single specialization for two row-vector shapes", () => {

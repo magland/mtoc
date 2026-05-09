@@ -104,6 +104,59 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_disp_complex", MTOC_DISP_COMPLEX],
   ["mtoc_tensor_t", MTOC_TENSOR_STRUCT],
   ["mtoc_alloc", MTOC_ALLOC],
+  // Tensor lifecycle helpers. Every multi-element Assign + scope-exit
+  // path goes through these, so generated C reads close to the numbl
+  // source — `mtoc_tensor_assign(&x, mtoc_tensor_from_row(..., 3));`
+  // collapses what used to be a six-line allocate-fill-free-swap.
+  // Real and complex variants are split for `alloc` / `from_row` /
+  // `from_matrix` / `copy` (codegen knows `isComplex` statically and
+  // dispatches at the call site, preserving the "no runtime branch on
+  // imag" invariant); `empty` / `free` / `assign` are shape-agnostic
+  // (free(NULL) is well-defined) so they share a single helper.
+  ["mtoc_tensor_empty", loadSnippet("tensor_empty.h", ["mtoc_tensor_t"])],
+  [
+    "mtoc_tensor_alloc",
+    loadSnippet("tensor_alloc.h", ["mtoc_tensor_t", "mtoc_alloc"]),
+  ],
+  [
+    "mtoc_tensor_alloc_complex",
+    loadSnippet("tensor_alloc_complex.h", ["mtoc_tensor_t", "mtoc_alloc"]),
+  ],
+  [
+    "mtoc_tensor_from_row",
+    loadSnippet("tensor_from_row.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
+  ],
+  [
+    "mtoc_tensor_from_matrix",
+    loadSnippet("tensor_from_matrix.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
+  ],
+  [
+    "mtoc_tensor_from_row_complex",
+    loadSnippet("tensor_from_row_complex.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_complex",
+    ]),
+  ],
+  [
+    "mtoc_tensor_from_matrix_complex",
+    loadSnippet("tensor_from_matrix_complex.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_complex",
+    ]),
+  ],
+  [
+    "mtoc_tensor_copy",
+    loadSnippet("tensor_copy.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
+  ],
+  [
+    "mtoc_tensor_copy_complex",
+    loadSnippet("tensor_copy_complex.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_complex",
+    ]),
+  ],
+  ["mtoc_tensor_free", loadSnippet("tensor_free.h", ["mtoc_tensor_t"])],
+  ["mtoc_tensor_assign", loadSnippet("tensor_assign.h", ["mtoc_tensor_t"])],
   ["mtoc_disp_tensor", MTOC_DISP_TENSOR],
   ["mtoc_disp_tensor_complex", MTOC_DISP_TENSOR_COMPLEX],
   ["mtoc_check_shape", loadSnippet("check_shape.h", ["mtoc_tensor_t"])],
