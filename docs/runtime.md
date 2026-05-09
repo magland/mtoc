@@ -153,21 +153,51 @@ correctness over performance.
 
 ## Cleanup
 
-Every `mtoc_tensor_*` allocation is paired with `mtoc_tensor_free` at
-scope exit:
+Every tensor variable is released as soon as it is no longer needed,
+not deferred to end-of-scope. Codegen drives this off a backward
+"future-touch" dataflow over the IR (see
+`src/codegen/liveness.ts`): for each statement `s`, it computes the
+set of tensor variables that may be touched (read or written) at any
+successor of `s`. A tensor `v` is "dead-after `s`" when `v` is in
+`s`'s top-level uses-or-defs but NOT in its future-touch set — i.e.
+`s` was its last touch on this scope's CFG. The codegen emits
+`mtoc_tensor_free(&v);` immediately after `s`'s C output for every
+dead-after `v`.
 
-- the implicit fall-through return at the end of `main()`,
-- the implicit fall-through return at the end of every user function,
-- every explicit `IRStmt.ReturnFromFunction` early-return inside a
-  function body.
+Two consequences worth calling out:
 
-The free walk includes both function-body locals (`assignedVars`) and
-every multi-element tensor parameter — under copy-on-arg-pass the
-callee owns each tensor argument, so its release is the callee's
-responsibility. Free order is sorted by C identifier so generated C
-stays deterministic. The free is unconditional — the predecl above
-is also unconditional, even when the variable's first source-level
-assignment is inside an `if` branch.
+- **A reassignment counts as a "future touch".** If `v`'s next
+  statement-level interaction is `v = …;`, the early free at the
+  previous use is suppressed — the reassignment lowers to
+  `mtoc_tensor_assign(&v, …)`, which already releases the prior
+  buffer.
+- **Loop-body cross-iteration uses keep tensors live.** The
+  fixpoint over the body's "after-body-last" set means a tensor read
+  inside a `for` / `while` body but allocated outside is always live
+  across iterations; its early free lands after the loop closes, not
+  inside the body.
+
+A scope-exit free walk remains as a safety net: every multi-element
+tensor binding in `assignedVars` (plus owned tensor parameters under
+copy-on-arg-pass) gets a closing `mtoc_tensor_free(&v);` at every
+scope exit — the implicit fall-through return at the end of `main()`,
+the implicit fall-through return at the end of every user function,
+and every explicit `IRStmt.ReturnFromFunction` early-return inside a
+function body. The walk consults a per-path `freedTensors` tracker
+and skips any name already freed earlier on the linear flow (so
+unconditionally dead tensors don't get a redundant scope-exit free
+emit). Path tracking is conservative at branches: only vars freed
+on EVERY arm of an `If` graduate to the post-`If` freed set, and
+loops never graduate vars freed inside their bodies (the loop may
+have iterated zero times). Vars freed in only some arms still have
+their scope-exit free emitted as a backstop; `mtoc_tensor_free` is
+idempotent on a zeroed struct, so the runtime double-call is a
+no-op.
+
+Free order at every scope-exit site is sorted by C identifier so
+generated C stays deterministic. Predecls are unconditional, even
+when a variable's first source-level assignment is inside an `if`
+branch.
 
 **Shape-mismatch trap (`mtoc_check_shape`).** With the coarse dim lattice
 the type system no longer catches same-category shape mismatches like
