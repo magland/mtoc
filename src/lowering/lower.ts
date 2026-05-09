@@ -357,9 +357,15 @@ export class Lowerer {
    *
    * For each variable that appears in ANY arm's env, we unify its type
    * across every arm. If an arm doesn't have the variable, that arm
-   * fell through without assigning it — the runtime sees the predeclared
-   * default (0.0 in our codegen), which has sign `zero`. So we unify
-   * with `scalarDouble("zero")` for those arms.
+   * fell through without assigning it — the runtime sees the codegen-
+   * predeclared default for that variable's category: `0.0` (sign zero)
+   * for numeric, `mtoc_string_empty()` for string. We pick the absent
+   * default to match: if every arm that *did* assign the variable made
+   * it a string, the absent default is `STRING`; otherwise it's
+   * `scalarDouble("zero")`. This keeps the merge well-typed for non-
+   * numeric values while preserving the existing zero-default behavior
+   * for numerics. Mixed-kind merges (some string, some numeric) still
+   * fall through to the unify→Unknown error path below.
    *
    * Used for if/elseif/else and as the "ran-once-or-never" merge for
    * while/for loops. Single-pass: doesn't iterate to fixpoint, so loops
@@ -371,15 +377,23 @@ export class Lowerer {
     span: Span,
     construct: string
   ): Map<string, MType> {
-    const ZERO = scalarDouble("zero");
     const result = new Map<string, MType>();
     const allKeys = new Set<string>();
     for (const e of envs) for (const k of e.keys()) allKeys.add(k);
 
     for (const k of allKeys) {
+      const present: MType[] = [];
+      for (const e of envs) {
+        const t = e.get(k);
+        if (t !== undefined) present.push(t);
+      }
+      const absentDefault: MType = present.every(isString)
+        ? STRING
+        : scalarDouble("zero");
+
       let unified: MType | undefined;
       for (const e of envs) {
-        const t = e.get(k) ?? ZERO;
+        const t = e.get(k) ?? absentDefault;
         unified = unified ? unify(unified, t) : t;
       }
       if (unified?.kind === "Unknown") {

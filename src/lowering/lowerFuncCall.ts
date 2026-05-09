@@ -63,6 +63,9 @@ export function lowerFuncCall(
   // String fast-paths: `length(s) == 1`, `numel(s) == 1` per numbl
   // semantics (a numbl `string` is a scalar handle, not a char
   // vector). Fold to a NumLit at lowering — no runtime helper needed.
+  // Lower the arg once and reuse it on the fall-through path so
+  // expression-level side effects (e.g. recording fresh assignments)
+  // aren't applied twice.
   if ((e.name === "length" || e.name === "numel") && e.args.length === 1) {
     const arg = this.lowerExpr(e.args[0]);
     if (isString(arg.ty)) {
@@ -73,8 +76,7 @@ export function lowerFuncCall(
         span: e.span,
       };
     }
-    // Fall through to the regular builtin path with the lowered arg.
-    return lowerBuiltinCall.call(this, e.name, e.args, e.span);
+    return lowerBuiltinCallWithArgs.call(this, e.name, [arg], e.span);
   }
   return lowerBuiltinCall.call(this, e.name, e.args, e.span);
 }
@@ -89,6 +91,24 @@ export function lowerBuiltinCall(
   argExprs: Expr[],
   span: Span
 ): IRExpr {
+  return lowerBuiltinCallWithArgs.call(
+    this,
+    name,
+    argExprs.map(a => this.lowerExpr(a)),
+    span
+  );
+}
+
+/** Same as `lowerBuiltinCall` but consumes already-lowered args. Used
+ *  by callers that needed to peek at an arg's type before deciding
+ *  which builtin path to take (e.g. `length`/`numel` string folding).
+ *  Re-lowering would replay any lowering side effects. */
+export function lowerBuiltinCallWithArgs(
+  this: Lowerer,
+  name: string,
+  args: IRExpr[],
+  span: Span
+): IRExpr {
   const builtin = getBuiltin(name);
   if (!builtin) {
     throw new UnsupportedConstruct(
@@ -96,13 +116,12 @@ export function lowerBuiltinCall(
       span
     );
   }
-  if (argExprs.length !== builtin.params.length) {
+  if (args.length !== builtin.params.length) {
     throw new UnsupportedConstruct(
-      `${name} expects ${builtin.params.length} argument(s), got ${argExprs.length}`,
+      `${name} expects ${builtin.params.length} argument(s), got ${args.length}`,
       span
     );
   }
-  const args = argExprs.map(a => this.lowerExpr(a));
   // Per-arg shape + complex-domain + sign-domain validation, all driven
   // by ParamConstraint. Order matters: the complex-domain check runs
   // before the sign-domain check so a complex arg fails with "cannot
