@@ -1,25 +1,29 @@
 /**
  * Backward dataflow over the lowered IR computing per-statement
- * "future-touch" sets for tensor-typed variables. A tensor `v`'s
- * future-touch set at statement `s` is the union of vars touched (read
- * OR written) by any successor of `s` in the structured CFG. Drives
- * the "early free" emission in `emit.ts`: a tensor `v` whose last
- * touch is statement `s` (i.e. `v` is in `(uses ∪ defs)(s)` but NOT
- * in `futureTouchOut(s)`) gets a `mtoc_tensor_free(&v);` immediately
- * after `s`'s C output, rather than waiting for scope exit.
+ * "future-touch" sets for owned-heap-value variables — currently
+ * multi-element tensors and strings (see `isOwned` in types.ts). An
+ * owned `v`'s future-touch set at statement `s` is the union of vars
+ * touched (read OR written) by any successor of `s` in the structured
+ * CFG. Drives the "early free" emission in `emit.ts`: an owned `v`
+ * whose last touch is statement `s` (i.e. `v` is in
+ * `(uses ∪ defs)(s)` but NOT in `futureTouchOut(s)`) gets a free
+ * call (`mtoc_tensor_free` / `mtoc_string_free`, picked from `v`'s
+ * type) immediately after `s`'s C output, rather than waiting for
+ * scope exit.
  *
  * Why "touch" (uses ∪ defs) rather than standard liveness (just uses,
  * with kill on def)? A reassignment `v = …;` lowers to
- * `mtoc_tensor_assign(&v, …)`, which already releases the prior
- * buffer. So if `v`'s next statement-level interaction is a
- * reassignment, the early free at the previous use would be redundant
- * — better to let `mtoc_tensor_assign` handle it. The future-touch
- * set captures exactly that: a redef counts as a future touch and
- * suppresses the early-free emission, just like a future use does.
+ * `mtoc_tensor_assign(&v, …)` / `mtoc_string_assign(&v, …)`, both of
+ * which already release the prior buffer. So if `v`'s next statement-
+ * level interaction is a reassignment, the early free at the previous
+ * use would be redundant — better to let the assign helper handle it.
+ * The future-touch set captures exactly that: a redef counts as a
+ * future touch and suppresses the early-free emission, just like a
+ * future use does.
  *
- * Only tensor (multi-element numeric) variables are tracked; scalar
- * `double` / `double _Complex` locals live in C automatic storage and
- * have no heap to release.
+ * Only owned variables are tracked; scalar `double` /
+ * `double _Complex` locals live in C automatic storage and have no
+ * heap to release.
  *
  * The IR is structured (no goto), so the analysis is structural
  * recursion. Loops (`While`, `For`) are resolved by fixpoint over the
@@ -29,7 +33,7 @@
  *
  * Conservative model:
  *   - The fall-through end of a function body has future-touch ∅
- *     (the scalar return value is stored in a non-tensor `outputCName`).
+ *     (the scalar return value is stored in a non-owned `outputCName`).
  *   - The end of `main` has future-touch ∅.
  *   - A `ReturnFromFunction` jumps to the function exit — future
  *     touch ∅ (no further statements run on this path).
@@ -38,10 +42,10 @@
  */
 
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
-import { isMultiElement, isNumeric } from "../lowering/types.js";
+import { isOwned } from "../lowering/types.js";
 
 /** Per-statement future-touch sets, keyed by the IRStmt object
- *  reference. Each entry holds the set of tensor C-names that may be
+ *  reference. Each entry holds the set of owned C-names that may be
  *  touched (read or written) at any successor of the statement. */
 export type FutureTouchMap = ReadonlyMap<IRStmt, ReadonlySet<string>>;
 
@@ -53,36 +57,36 @@ interface TouchCtx {
    *  header — drives one more iteration plus the exit path). */
   readonly continueOut: ReadonlySet<string>;
   /** Future touches reachable from a `ReturnFromFunction`. Always
-   *  empty for tensor liveness — function returns are scalars. Kept
-   *  as a field so the recursion threads through it cleanly in case
-   *  we ever support tensor returns. */
+   *  empty for owned-value liveness today — function returns are
+   *  scalars. Kept as a field so the recursion threads through it
+   *  cleanly in case we ever support owned-value returns. */
   readonly returnOut: ReadonlySet<string>;
   /** Mutated map of per-statement future-touch sets (the analysis
    *  output). */
   readonly futureTouchOut: Map<IRStmt, ReadonlySet<string>>;
 }
 
-/** Tensor C-names referenced by an IR expression. Only multi-element
- *  numeric `Var` nodes contribute; scalars and literals do not. */
-export function collectTensorVarsInExpr(e: IRExpr, out: Set<string>): void {
+/** Owned C-names referenced by an IR expression. Only owned `Var`
+ *  nodes contribute; scalars and literals do not. */
+export function collectOwnedVarsInExpr(e: IRExpr, out: Set<string>): void {
   switch (e.kind) {
     case "Var":
-      if (isNumeric(e.ty) && isMultiElement(e.ty)) out.add(e.cName);
+      if (isOwned(e.ty)) out.add(e.cName);
       return;
     case "Binary":
-      collectTensorVarsInExpr(e.left, out);
-      collectTensorVarsInExpr(e.right, out);
+      collectOwnedVarsInExpr(e.left, out);
+      collectOwnedVarsInExpr(e.right, out);
       return;
     case "Unary":
-      collectTensorVarsInExpr(e.operand, out);
+      collectOwnedVarsInExpr(e.operand, out);
       return;
     case "Call":
-      for (const a of e.args) collectTensorVarsInExpr(a, out);
+      for (const a of e.args) collectOwnedVarsInExpr(a, out);
       return;
     case "TensorLit":
       for (const row of e.elements)
         for (const c of row) {
-          collectTensorVarsInExpr(c, out);
+          collectOwnedVarsInExpr(c, out);
         }
       return;
     case "NumLit":
@@ -92,37 +96,37 @@ export function collectTensorVarsInExpr(e: IRExpr, out: Set<string>): void {
   }
 }
 
-/** Top-level tensor uses for a statement — the tensor vars read by the
+/** Top-level owned uses for a statement — the owned vars read by the
  *  statement at its own level, NOT including its body (control-flow
  *  body uses are accounted for in the body's per-stmt future-touch
  *  results). Used by `emit.ts` to compute "free after this stmt"
  *  candidates as `(uses(s) ∪ defs(s)) - futureTouchOut(s)`. */
-export function topLevelTensorUses(s: IRStmt): Set<string> {
+export function topLevelOwnedUses(s: IRStmt): Set<string> {
   const out = new Set<string>();
   switch (s.kind) {
     case "Assign":
-      collectTensorVarsInExpr(s.rhs, out);
+      collectOwnedVarsInExpr(s.rhs, out);
       return out;
     case "ExprStmt":
-      collectTensorVarsInExpr(s.expr, out);
+      collectOwnedVarsInExpr(s.expr, out);
       return out;
     case "Disp":
-      collectTensorVarsInExpr(s.arg, out);
+      collectOwnedVarsInExpr(s.arg, out);
       return out;
     case "Error":
-      collectTensorVarsInExpr(s.arg, out);
+      collectOwnedVarsInExpr(s.arg, out);
       return out;
     case "If":
-      collectTensorVarsInExpr(s.cond, out);
-      for (const eif of s.elseifs) collectTensorVarsInExpr(eif.cond, out);
+      collectOwnedVarsInExpr(s.cond, out);
+      for (const eif of s.elseifs) collectOwnedVarsInExpr(eif.cond, out);
       return out;
     case "While":
-      collectTensorVarsInExpr(s.cond, out);
+      collectOwnedVarsInExpr(s.cond, out);
       return out;
     case "For":
-      collectTensorVarsInExpr(s.start, out);
-      collectTensorVarsInExpr(s.step, out);
-      collectTensorVarsInExpr(s.end, out);
+      collectOwnedVarsInExpr(s.start, out);
+      collectOwnedVarsInExpr(s.step, out);
+      collectOwnedVarsInExpr(s.end, out);
       return out;
     case "Break":
     case "Continue":
@@ -131,12 +135,12 @@ export function topLevelTensorUses(s: IRStmt): Set<string> {
   }
 }
 
-/** Top-level tensor defs for a statement — only an `Assign` to a
- *  tensor-typed variable contributes. The assigned C-name is the
+/** Top-level owned defs for a statement — only an `Assign` to an
+ *  owned-typed variable contributes. The assigned C-name is the
  *  variable's predeclared identifier (in main / function scope). */
-export function topLevelTensorDefs(s: IRStmt): Set<string> {
+export function topLevelOwnedDefs(s: IRStmt): Set<string> {
   const out = new Set<string>();
-  if (s.kind === "Assign" && isNumeric(s.ty) && isMultiElement(s.ty)) {
+  if (s.kind === "Assign" && isOwned(s.ty)) {
     out.add(s.cName);
   }
   return out;
@@ -181,8 +185,8 @@ function touchStmt(
     case "Disp":
     case "Error": {
       const out = new Set(futureAfter);
-      unionInto(out, topLevelTensorUses(s));
-      unionInto(out, topLevelTensorDefs(s));
+      unionInto(out, topLevelOwnedUses(s));
+      unionInto(out, topLevelOwnedDefs(s));
       return out;
     }
     case "If": {
@@ -202,7 +206,7 @@ function touchStmt(
       );
       const out = new Set(futureAfter);
       for (const a of armIns) unionInto(out, a);
-      unionInto(out, topLevelTensorUses(s));
+      unionInto(out, topLevelOwnedUses(s));
       return out;
     }
     case "While":
@@ -213,7 +217,7 @@ function touchStmt(
       // Either way, body[last]'s future-touch set must include the
       // touches in the next iteration plus `futureAfter`.
       let bodyAfter = new Set<string>(futureAfter);
-      // Lattice is finite (subsets of all tensor vars); fixpoint
+      // Lattice is finite (subsets of all owned vars); fixpoint
       // always converges. Cap iterations defensively to surface bugs
       // rather than hang.
       for (let iter = 0; iter < 64; iter++) {
@@ -225,15 +229,15 @@ function touchStmt(
         const bodyIn = touchSeq(s.body, bodyAfter, innerCtx);
         // body[last]'s future-touch set = condUses ∪ touchIn(body[0])
         // ∪ futureAfter. (For `For`, condUses is start/step/end —
-        // scalars in our subset, so empty for tensor liveness.)
+        // scalars in our subset, so empty for owned-value liveness.)
         const newBodyAfter = new Set<string>(futureAfter);
         unionInto(newBodyAfter, bodyIn);
-        unionInto(newBodyAfter, topLevelTensorUses(s));
+        unionInto(newBodyAfter, topLevelOwnedUses(s));
         if (setEquals(newBodyAfter, bodyAfter)) break;
         bodyAfter = newBodyAfter;
       }
       const out = new Set(bodyAfter);
-      unionInto(out, topLevelTensorUses(s));
+      unionInto(out, topLevelOwnedUses(s));
       return out;
     }
     case "Break":
@@ -246,8 +250,8 @@ function touchStmt(
 }
 
 /** Compute per-statement future-touch sets for a body of statements.
- *  The body's fall-through future-touch is `EMPTY` for tensor
- *  liveness — no tensor outlives `main` or a function body. */
+ *  The body's fall-through future-touch is `EMPTY` for owned-value
+ *  liveness — no owned value outlives `main` or a function body. */
 export function computeFutureTouches(
   stmts: ReadonlyArray<IRStmt>
 ): FutureTouchMap {

@@ -17,6 +17,7 @@ import type {
 import {
   cTypeFor,
   isMultiElement,
+  isOwned,
   isScalarComplex,
   isScalarReal,
   isNumeric,
@@ -35,8 +36,8 @@ import {
 } from "./runtime.js";
 import {
   computeFutureTouches,
-  topLevelTensorDefs,
-  topLevelTensorUses,
+  topLevelOwnedDefs,
+  topLevelOwnedUses,
   type FutureTouchMap,
 } from "./liveness.js";
 
@@ -212,17 +213,20 @@ interface EmitState {
   /** assignedVars of the scope currently being emitted (main's vars
    *  while emitting `prog.stmts`, or the function's vars while
    *  emitting a function body). Used by the scope-exit cleanup helper
-   *  to know which tensor backings to free at `return` sites. */
+   *  to know which heap backings to free at `return` sites, and by
+   *  `emitEarlyFrees` to look up an owned var's type so it can pick
+   *  between `mtoc_tensor_free` and `mtoc_string_free`. */
   currentScopeVars: ReadonlyMap<string, VarBinding> | null;
   /** Per-statement future-touch sets for the scope currently being
-   *  emitted. Drives the "early free" walk: a tensor `v` whose last
+   *  emitted. Drives the "early free" walk: an owned `v` whose last
    *  touch is statement `s` (i.e. `v` is in `(uses ∪ defs)(s)` but
-   *  NOT in `futureTouchOut(s)`) gets a `mtoc_tensor_free(&v);`
-   *  immediately after the statement's C output. Null at the very
-   *  top before any scope is entered. */
+   *  NOT in `futureTouchOut(s)`) gets a free call (tensor or string,
+   *  picked from `v`'s type) immediately after the statement's C
+   *  output. Null at the very top before any scope is entered. */
   futureTouches: FutureTouchMap | null;
-  /** Tensor C-names that have already been freed on the current
-   *  linear emission path. Drives two things:
+  /** Owned C-names (tensors and strings; see `isOwned`) that have
+   *  already been freed on the current linear emission path. Drives
+   *  two things:
    *    - the scope-exit / `ReturnFromFunction` walk skips any var
    *      already in this set (avoids the redundant double-free emit),
    *    - branch merges in `If` take the intersection of the
@@ -231,7 +235,7 @@ interface EmitState {
    *  Loop bodies snapshot-and-restore around themselves: vars freed
    *  inside the body don't graduate to the post-loop freed set,
    *  because the loop may have iterated zero times. */
-  freedTensors: Set<string>;
+  freedOwned: Set<string>;
 }
 
 /** Build the small facade view passed to `BuiltinSig.emit` closures.
@@ -637,43 +641,68 @@ function analyzeStmt(state: EmitState, s: IRStmt): void {
   }
 }
 
-/** Tensor C-names that should be freed immediately after `s`, computed
- *  from the future-touch set produced by the dataflow pass. A name is
- *  "dead-after" iff it appears in `s`'s top-level uses or defs but is
- *  NOT touched (read or written) at any successor — i.e. `s` was its
- *  last touch on this level. Returns sorted (stable C output) and
- *  excludes names already freed on this linear path. */
+/** Owned C-names (tensors and strings) that should be freed
+ *  immediately after `s`, computed from the future-touch set produced
+ *  by the dataflow pass. A name is "dead-after" iff it appears in
+ *  `s`'s top-level uses or defs but is NOT touched (read or written)
+ *  at any successor — i.e. `s` was its last touch on this level.
+ *  Returns sorted (stable C output) and excludes names already freed
+ *  on this linear path. */
 function deadAfterStmt(state: EmitState, s: IRStmt): string[] {
   if (state.futureTouches === null) return [];
   const futureTouchOut = state.futureTouches.get(s);
   if (futureTouchOut === undefined) return [];
-  const touched = topLevelTensorUses(s);
-  for (const d of topLevelTensorDefs(s)) touched.add(d);
+  const touched = topLevelOwnedUses(s);
+  for (const d of topLevelOwnedDefs(s)) touched.add(d);
   const out: string[] = [];
   for (const v of touched) {
     if (futureTouchOut.has(v)) continue;
-    if (state.freedTensors.has(v)) continue;
+    if (state.freedOwned.has(v)) continue;
     out.push(v);
   }
   out.sort();
   return out;
 }
 
-/** Emit `mtoc_tensor_free(&v);` lines for every name in `vars`, mark
- *  them as freed on the current linear path, and activate the helper
- *  snippet on first use. The caller has already filtered against the
- *  current `freedTensors` set (see `deadAfterStmt`); this just emits
- *  and updates state. */
+/** Emit a free line for every name in `vars`, picking
+ *  `mtoc_tensor_free` for multi-element tensors and
+ *  `mtoc_string_free` for strings, mark them as freed on the current
+ *  linear path, and activate the matching helper snippet on first use.
+ *  The caller has already filtered against the current `freedOwned`
+ *  set (see `deadAfterStmt`); this just emits and updates state. */
 function emitEarlyFrees(
   state: EmitState,
   level: number,
   vars: ReadonlyArray<string>
 ): void {
   if (vars.length === 0) return;
-  useRuntimeByName(state, "mtoc_tensor_free");
+  if (state.currentScopeVars === null) {
+    throw new Error(
+      "codegen internal: emitEarlyFrees called outside an emission scope"
+    );
+  }
   for (const v of vars) {
-    pushStmt(state, level, `mtoc_tensor_free(&${v});`);
-    state.freedTensors.add(v);
+    const binding = state.currentScopeVars.get(v);
+    if (binding === undefined) {
+      throw new Error(
+        `codegen internal: early-free for unknown var '${v}'; ` +
+          `not in the current scope's free-on-exit set`
+      );
+    }
+    const ty = binding.ty;
+    if (isString(ty)) {
+      useRuntimeByName(state, "mtoc_string_free");
+      pushStmt(state, level, `mtoc_string_free(&${v});`);
+    } else if (isNumeric(ty) && isMultiElement(ty)) {
+      useRuntimeByName(state, "mtoc_tensor_free");
+      pushStmt(state, level, `mtoc_tensor_free(&${v});`);
+    } else {
+      throw new Error(
+        `codegen internal: early-free for non-owned var '${v}' ` +
+          `(${typeToString(ty)})`
+      );
+    }
+    state.freedOwned.add(v);
   }
 }
 
@@ -690,12 +719,12 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       //     loop that walks the RHS body once per slot, with multi-
       //     element `Var`s inside reading from `<varCName>.real[<iter>]`
       //     (see `emitExpr.Var`).
-      // Assigning to a tensor name re-installs its buffer via
-      // `mtoc_tensor_assign`, so the new lifetime starts here — drop
-      // the LHS from the freed set so a subsequent dead-after pass
-      // can free it again on its own terms.
-      if (isNumeric(s.ty) && isMultiElement(s.ty) && s.ty.elem === "double") {
-        state.freedTensors.delete(s.cName);
+      // Assigning to an owned name re-installs its buffer via
+      // `mtoc_tensor_assign` / `mtoc_string_assign`, so the new
+      // lifetime starts here — drop the LHS from the freed set so a
+      // subsequent dead-after pass can free it again on its own terms.
+      if (isOwned(s.ty)) {
+        state.freedOwned.delete(s.cName);
       }
       if (s.rhs.kind === "TensorLit") {
         emitTensorLitAssign(state, level, s.cName, s.rhs);
@@ -730,6 +759,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           rhsExpr = emitExpr(state, s.rhs, 0);
         }
         pushStmt(state, level, `mtoc_string_assign(&${s.cName}, ${rhsExpr});`);
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
       if (isNumeric(s.ty) && isMultiElement(s.ty) && s.ty.elem === "double") {
@@ -773,6 +803,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           level,
           `mtoc_disp_string(${emitExpr(state, s.arg, 0)});`
         );
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
       if (isScalarReal(ty)) {
@@ -820,7 +851,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
     }
 
     case "If": {
-      // Each arm is emitted with a snapshot of `freedTensors`; after
+      // Each arm is emitted with a snapshot of `freedOwned`; after
       // all arms finish, the post-If freed set is the intersection
       // (a var is "definitely freed" only if every arm freed it).
       // Implicit else (no `s.elseBody`) contributes the pre-If
@@ -828,26 +859,26 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // its intersection forces vars freed only in some arms back
       // out of the post-If freed set, and the scope-exit safety net
       // catches them.
-      const preFreed = new Set(state.freedTensors);
+      const preFreed = new Set(state.freedOwned);
       const armFreedSets: Set<string>[] = [];
 
       pushStmt(state, level, `if (${emitExpr(state, s.cond, 0)}) {`);
-      state.freedTensors = new Set(preFreed);
+      state.freedOwned = new Set(preFreed);
       for (const t of s.thenBody) emitStmt(state, level + 1, t);
-      armFreedSets.push(state.freedTensors);
+      armFreedSets.push(state.freedOwned);
 
       for (const eif of s.elseifs) {
         pushStmt(state, level, `} else if (${emitExpr(state, eif.cond, 0)}) {`);
-        state.freedTensors = new Set(preFreed);
+        state.freedOwned = new Set(preFreed);
         for (const t of eif.body) emitStmt(state, level + 1, t);
-        armFreedSets.push(state.freedTensors);
+        armFreedSets.push(state.freedOwned);
       }
 
       if (s.elseBody) {
         pushStmt(state, level, `} else {`);
-        state.freedTensors = new Set(preFreed);
+        state.freedOwned = new Set(preFreed);
         for (const t of s.elseBody) emitStmt(state, level + 1, t);
-        armFreedSets.push(state.freedTensors);
+        armFreedSets.push(state.freedOwned);
       } else {
         // Implicit fall-through arm freed nothing on top of `preFreed`.
         armFreedSets.push(preFreed);
@@ -860,7 +891,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         const next = armFreedSets[i];
         for (const v of merged) if (!next.has(v)) merged.delete(v);
       }
-      state.freedTensors = merged;
+      state.freedOwned = merged;
 
       // After the If, free anything in the cond that's now dead.
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
@@ -874,12 +905,12 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // mtoc_tensor_free is idempotent on a zeroed struct, so a
       // post-loop scope-exit free of the same var (via the safety
       // net) is sound.
-      const preFreed = new Set(state.freedTensors);
+      const preFreed = new Set(state.freedOwned);
       pushStmt(state, level, `while (${emitExpr(state, s.cond, 0)}) {`);
-      state.freedTensors = new Set(preFreed);
+      state.freedOwned = new Set(preFreed);
       for (const t of s.body) emitStmt(state, level + 1, t);
       pushStmt(state, level, `}`);
-      state.freedTensors = preFreed;
+      state.freedOwned = preFreed;
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
       break;
     }
@@ -927,7 +958,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         state,
         level,
         state.currentScopeVars,
-        state.freedTensors
+        state.freedOwned
       );
       pushStmt(state, level, `return ${s.outputCName};`);
       break;
@@ -951,10 +982,10 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // each iteration so it never advances past that last value.
       // Wrapped in a block so `_mtoc_*` helpers are scoped per-loop;
       // nested for-loops shadow them without collision.
-      // Linear-path freedTensors: snapshot/restore around the body
+      // Linear-path freedOwned: snapshot/restore around the body
       // for the same reason as `While` — body may iterate zero
       // times, so frees inside don't graduate to the post-loop set.
-      const preFreed = new Set(state.freedTensors);
+      const preFreed = new Set(state.freedOwned);
       pushStmt(state, level, `{`);
       pushStmt(state, level + 1, `double _mtoc_start = ${startStr};`);
       pushStmt(state, level + 1, `double _mtoc_end = ${endStr};`);
@@ -970,11 +1001,11 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         `for (long _mtoc_i = 0; _mtoc_i < _mtoc_n; _mtoc_i++) {`
       );
       pushStmt(state, level + 2, `${v} = _mtoc_start + ${stepStr} * _mtoc_i;`);
-      state.freedTensors = new Set(preFreed);
+      state.freedOwned = new Set(preFreed);
       for (const t of s.body) emitStmt(state, level + 2, t);
       pushStmt(state, level + 1, `}`);
       pushStmt(state, level, `}`);
-      state.freedTensors = preFreed;
+      state.freedOwned = preFreed;
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
       break;
     }
@@ -1446,7 +1477,7 @@ function emitFunctionBody(
   const outerLines = state.lines;
   const outerScopeVars = state.currentScopeVars;
   const outerLiveness = state.futureTouches;
-  const outerFreed = state.freedTensors;
+  const outerFreed = state.freedOwned;
   state.lines = [];
   // Predecls cover assignedVars only — params are declared by the C
   // signature. Scope-exit frees cover both: locals from the body and
@@ -1454,7 +1485,7 @@ function emitFunctionBody(
   const freeOnExit = functionFreeOnExitSet(fn);
   state.currentScopeVars = freeOnExit;
   state.futureTouches = computeFutureTouches(fn.body);
-  state.freedTensors = new Set();
+  state.freedOwned = new Set();
 
   emitDeclarations(state, 1, fn.assignedVars);
   for (const s of fn.body) emitStmt(state, 1, s);
@@ -1463,14 +1494,14 @@ function emitFunctionBody(
   // then return the output. Early-exit `return` paths emitted by
   // `IRStmt.ReturnFromFunction` carry their own copy of the free
   // preamble (see `emitStmt`).
-  emitScopeExitFrees(state, 1, freeOnExit, state.freedTensors);
+  emitScopeExitFrees(state, 1, freeOnExit, state.freedOwned);
   pushStmt(state, 1, `return ${fn.outputCName};`);
 
   const bodyLines = state.lines;
   state.lines = outerLines;
   state.currentScopeVars = outerScopeVars;
   state.futureTouches = outerLiveness;
-  state.freedTensors = outerFreed;
+  state.freedOwned = outerFreed;
   return { lines: bodyLines };
 }
 
@@ -1578,7 +1609,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     elemwiseLoopCounter: 0,
     currentScopeVars: null,
     futureTouches: null,
-    freedTensors: new Set(),
+    freedOwned: new Set(),
   };
 
   // One-pass pre-walk: activates runtime helpers referenced by the
@@ -1601,14 +1632,14 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   // variable that is read after the block.
   state.currentScopeVars = prog.assignedVars;
   state.futureTouches = computeFutureTouches(prog.stmts);
-  state.freedTensors = new Set();
+  state.freedOwned = new Set();
   emitDeclarations(state, 1, prog.assignedVars);
   for (const s of prog.stmts) emitStmt(state, 1, s);
   // Free every tensor backing allocated for top-level vars not
   // already released earlier on the linear path before `return 0;`.
   // (Process exit would reclaim it anyway, but the free keeps memory
   // tooling clean and matches the function-body pattern.)
-  emitScopeExitFrees(state, 1, prog.assignedVars, state.freedTensors);
+  emitScopeExitFrees(state, 1, prog.assignedVars, state.freedOwned);
   state.currentScopeVars = null;
   state.futureTouches = null;
 

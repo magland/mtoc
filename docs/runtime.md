@@ -153,40 +153,42 @@ correctness over performance.
 
 ## Cleanup
 
-Every tensor variable is released as soon as it is no longer needed,
-not deferred to end-of-scope. Codegen drives this off a backward
-"future-touch" dataflow over the IR (see
+Every owned-heap-value variable is released as soon as it is no
+longer needed, not deferred to end-of-scope. "Owned" today means a
+multi-element tensor or a string — anything for which `isOwned(t)`
+in `src/lowering/types.ts` returns true. Codegen drives this off a
+backward "future-touch" dataflow over the IR (see
 `src/codegen/liveness.ts`): for each statement `s`, it computes the
-set of tensor variables that may be touched (read or written) at any
-successor of `s`. A tensor `v` is "dead-after `s`" when `v` is in
+set of owned variables that may be touched (read or written) at any
+successor of `s`. An owned `v` is "dead-after `s`" when `v` is in
 `s`'s top-level uses-or-defs but NOT in its future-touch set — i.e.
-`s` was its last touch on this scope's CFG. The codegen emits
-`mtoc_tensor_free(&v);` immediately after `s`'s C output for every
-dead-after `v`.
+`s` was its last touch on this scope's CFG. The codegen emits a free
+call (`mtoc_tensor_free(&v);` for tensors, `mtoc_string_free(&v);`
+for strings, picked from `v`'s type via `currentScopeVars`)
+immediately after `s`'s C output for every dead-after `v`.
 
 Two consequences worth calling out:
 
 - **A reassignment counts as a "future touch".** If `v`'s next
   statement-level interaction is `v = …;`, the early free at the
   previous use is suppressed — the reassignment lowers to
-  `mtoc_tensor_assign(&v, …)`, which already releases the prior
-  buffer.
-- **Loop-body cross-iteration uses keep tensors live.** The
-  fixpoint over the body's "after-body-last" set means a tensor read
+  `mtoc_tensor_assign(&v, …)` / `mtoc_string_assign(&v, …)`, which
+  already releases the prior buffer.
+- **Loop-body cross-iteration uses keep owned values live.** The
+  fixpoint over the body's "after-body-last" set means an owned read
   inside a `for` / `while` body but allocated outside is always live
   across iterations; its early free lands after the loop closes, not
   inside the body.
 
-A scope-exit free walk remains as a safety net: every multi-element
-tensor binding in `assignedVars` (plus owned tensor parameters under
-copy-on-arg-pass) gets a closing `mtoc_tensor_free(&v);` at every
-scope exit — the implicit fall-through return at the end of `main()`,
-the implicit fall-through return at the end of every user function,
-and every explicit `IRStmt.ReturnFromFunction` early-return inside a
-function body. The walk consults a per-path `freedTensors` tracker
-and skips any name already freed earlier on the linear flow (so
-unconditionally dead tensors don't get a redundant scope-exit free
-emit). Path tracking is conservative at branches: only vars freed
+A scope-exit free walk remains as a safety net: every owned binding
+in `assignedVars` (plus owned tensor parameters under copy-on-arg-
+pass) gets a closing free at every scope exit — the implicit
+fall-through return at the end of `main()`, the implicit fall-through
+return at the end of every user function, and every explicit
+`IRStmt.ReturnFromFunction` early-return inside a function body. The
+walk consults a per-path `freedOwned` tracker and skips any name
+already freed earlier on the linear flow (so unconditionally dead
+values don't get a redundant scope-exit free emit). Path tracking is conservative at branches: only vars freed
 on EVERY arm of an `If` graduate to the post-`If` freed set, and
 loops never graduate vars freed inside their bodies (the loop may
 have iterated zero times). Vars freed in only some arms still have
@@ -269,10 +271,12 @@ through the same lifecycle pair as tensors:
 - `mtoc_error_string(s)` — backs the statement-only `error("...")`
   builtin. Writes the message to stderr, then `exit(1)`.
 
-Strings have no early-free liveness pass today — they just sit in the
-scope-exit free walk. `mtoc_string_free` is idempotent, and the owned
-flag means literal handles cost nothing to "free", so the conservative
-release is correct and cheap.
+Strings ride the same early-free liveness pass as tensors (see the
+"Cleanup" section): a string `v` whose last touch is statement `s`
+gets `mtoc_string_free(&v);` emitted immediately after `s`, and the
+scope-exit walk catches anything still alive at the end. The owned
+flag means literal handles cost nothing to "free" — `mtoc_string_free`
+is idempotent on a zeroed struct.
 
 ### String memory model
 

@@ -245,6 +245,16 @@ export function isMultiElement(t: MType): boolean {
   return isNumeric(t) && (dimIsNotOne(t.rows) || dimIsNotOne(t.cols));
 }
 
+/** True when the value of type `t` is backed by a heap allocation that
+ *  the generated code is responsible for releasing — currently
+ *  multi-element tensors and strings. Drives the "free at last use"
+ *  liveness pass, the scope-exit free walks, and the "owned-allocating
+ *  expression cannot appear nested" lowering check. New owned kinds
+ *  (cell arrays, structs, …) plug in here. */
+export function isOwned(t: MType): boolean {
+  return isMultiElement(t) || isString(t);
+}
+
 export function isScalarReal(t: MType): boolean {
   return isNumeric(t) && isScalar(t) && !t.isComplex;
 }

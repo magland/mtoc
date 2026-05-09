@@ -129,12 +129,13 @@ Responsibilities:
   alloc'd elementwise result (`mtoc_tensor_alloc` + a loop that fills
   the slots). Every tensor argument to a user-function call is also
   wrapped in `mtoc_tensor_copy(...)` so the callee owns its
-  parameter. `mtoc_tensor_free(&<name>)` is emitted as soon as a
-  tensor is no longer needed — driven by a backward "future-touch"
-  dataflow over the IR (`src/codegen/liveness.ts`) — and a scope-exit
-  free walk before every `return` site picks up anything not freed
-  early on the linear path. Cleanup is exercised by every test, not
-  just large ones.
+  parameter. `mtoc_tensor_free(&<name>)` (or `mtoc_string_free` for
+  strings) is emitted as soon as the value is no longer needed —
+  driven by a backward "future-touch" dataflow over the IR
+  (`src/codegen/liveness.ts`) parameterized by the `isOwned` predicate
+  — and a scope-exit free walk before every `return` site picks up
+  anything not freed early on the linear path. Cleanup is exercised
+  by every test, not just large ones.
 - Emit user-function specializations ahead of `main`, each with a header
   comment showing the source span and the inferred type signature.
 - Map operators to C with a precedence-aware printer; nested unary operands

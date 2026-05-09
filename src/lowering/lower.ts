@@ -696,75 +696,76 @@ export class Lowerer {
 }
 
 /**
- * Reject a TensorLit anywhere inside an expression subtree. Used to
- * enforce the rule "TensorLit only at top level of Assign.rhs" — every
- * other position recurses through here.
+ * Owned-allocating expression kinds: expressions that produce a fresh
+ * heap-owned value at runtime and therefore can only appear at the
+ * top of `Assign.rhs`, where the surrounding `mtoc_*_assign` takes
+ * ownership. Anywhere nested would leak the temporary buffer.
+ *
+ * - `tensor-lit`: every TensorLit allocates a fresh tensor.
+ * - `string-concat`: a string-typed `Binary` (`+`) calls
+ *   `mtoc_string_concat`, which returns an owned handle.
+ *
+ * `Var` is never an owned-allocating expression — it just reads an
+ * already-owned heap value; the read doesn't transfer ownership.
+ * Similarly `StringLit` points at `.rodata` (zero allocation) and
+ * is fine anywhere.
  */
-function rejectNestedTensorLit(e: IRExpr): void {
-  switch (e.kind) {
-    case "TensorLit":
-      throw new UnsupportedConstruct(
-        `tensor literals are only supported as the right-hand side of an ` +
-          `assignment (not inside a larger expression)`,
-        e.span
+type OwnedExprKind = "tensor-lit" | "string-concat";
+
+function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
+  if (e.kind === "TensorLit") return "tensor-lit";
+  if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
+  return null;
+}
+
+function ownedExprMessage(kind: OwnedExprKind): string {
+  switch (kind) {
+    case "tensor-lit":
+      return (
+        "tensor literals are only supported as the right-hand side of an " +
+        "assignment (not inside a larger expression)"
       );
-    case "NumLit":
-    case "ImagLit":
-    case "StringLit":
-    case "Var":
-      return;
-    case "Binary":
-      rejectNestedTensorLit(e.left);
-      rejectNestedTensorLit(e.right);
-      return;
-    case "Unary":
-      rejectNestedTensorLit(e.operand);
-      return;
-    case "Call":
-      for (const a of e.args) rejectNestedTensorLit(a);
-      return;
+    case "string-concat":
+      return (
+        "string concatenation (`+`) is only supported as the top-level " +
+        "right-hand side of an assignment; assign intermediate " +
+        "concatenations to a variable first"
+      );
   }
 }
 
 /**
- * Reject any string-typed `Binary` (concat) buried inside another
- * expression. Concat allocates a fresh owned `mtoc_string_t`; without
- * a containing `Assign` to install it via `mtoc_string_assign`, the
- * buffer would leak. The rule mirrors the TensorLit-at-top rule:
- * a string concat is legal as the top-level RHS of an `Assign`, but
- * not nested inside another `Binary` / `Call` / `Unary`.
- *
- * StringLit is fine anywhere (it points at `.rodata`, no allocation).
- * String `Var` is fine (no allocation either).
+ * Reject any owned-allocating sub-expression — a TensorLit anywhere,
+ * or a string-typed `Binary` (concat) anywhere. The expression
+ * passed in is itself checked, so call sites that *do* permit a
+ * top-level owned producer (the supported `Assign.rhs` shapes)
+ * recurse into the operands directly instead of calling this helper
+ * on the whole RHS. Recurses through every other expression kind.
  */
-function rejectNestedStringBinary(e: IRExpr): void {
+function rejectNestedOwnedExpr(e: IRExpr): void {
+  const kind = classifyOwnedExpr(e);
+  if (kind !== null) {
+    throw new UnsupportedConstruct(ownedExprMessage(kind), e.span);
+  }
   switch (e.kind) {
-    case "Binary":
-      if (isString(e.ty)) {
-        throw new UnsupportedConstruct(
-          `string concatenation (\`+\`) is only supported as the top-level ` +
-            `right-hand side of an assignment; assign intermediate ` +
-            `concatenations to a variable first`,
-          e.span
-        );
-      }
-      rejectNestedStringBinary(e.left);
-      rejectNestedStringBinary(e.right);
-      return;
-    case "Unary":
-      rejectNestedStringBinary(e.operand);
-      return;
-    case "Call":
-      for (const a of e.args) rejectNestedStringBinary(a);
-      return;
-    case "TensorLit":
-      for (const row of e.elements)
-        for (const c of row) rejectNestedStringBinary(c);
-      return;
+    case "Var":
     case "NumLit":
     case "ImagLit":
     case "StringLit":
-    case "Var":
+      return;
+    case "Binary":
+      rejectNestedOwnedExpr(e.left);
+      rejectNestedOwnedExpr(e.right);
+      return;
+    case "Unary":
+      rejectNestedOwnedExpr(e.operand);
+      return;
+    case "Call":
+      for (const a of e.args) rejectNestedOwnedExpr(a);
+      return;
+    case "TensorLit":
+      // Unreachable — `classifyOwnedExpr` already returned
+      // "tensor-lit" above and we threw. Kept for exhaustiveness.
       return;
   }
 }
@@ -807,65 +808,55 @@ function validateStmts(stmts: ReadonlyArray<IRStmt>): void {
 
 function validateStmt(s: IRStmt): void {
   switch (s.kind) {
-    case "Assign":
-      if (s.rhs.kind === "TensorLit") {
-        // Top-level TensorLit at Assign.rhs is the one supported
-        // position. Cells were already required to be scalar-real.
-        for (const row of s.rhs.elements) {
-          for (const cell of row) rejectNestedTensorLit(cell);
+    case "Assign": {
+      // `Assign.rhs` is the one position that *permits* a top-level
+      // owned producer (TensorLit / string concat). Recurse into the
+      // operands of that producer; everything else gets the whole
+      // expression checked.
+      const top = classifyOwnedExpr(s.rhs);
+      if (top === "tensor-lit") {
+        // TensorLit cells were required to be scalar-real at lowering;
+        // still check none of them is itself an owned producer.
+        const tl = s.rhs as Extract<IRExpr, { kind: "TensorLit" }>;
+        for (const row of tl.elements) {
+          for (const cell of row) rejectNestedOwnedExpr(cell);
         }
+      } else if (top === "string-concat") {
+        const b = s.rhs as Extract<IRExpr, { kind: "Binary" }>;
+        rejectNestedOwnedExpr(b.left);
+        rejectNestedOwnedExpr(b.right);
       } else {
-        rejectNestedTensorLit(s.rhs);
+        rejectNestedOwnedExpr(s.rhs);
         if (isMultiElement(s.rhs.ty)) {
           rejectCallInTensorContext(s.rhs);
         }
-        // String concat at the top of `Assign.rhs` is the one
-        // supported position; deeper nesting would leak the inner
-        // owned buffer. Reject a string `Binary` anywhere inside,
-        // recursing into operands.
-        if (s.rhs.kind === "Binary") {
-          rejectNestedStringBinary(s.rhs.left);
-          rejectNestedStringBinary(s.rhs.right);
-        } else {
-          rejectNestedStringBinary(s.rhs);
-        }
       }
       return;
+    }
     case "ExprStmt":
-      rejectNestedTensorLit(s.expr);
-      rejectNestedStringBinary(s.expr);
+      rejectNestedOwnedExpr(s.expr);
       return;
     case "Disp":
-      rejectNestedTensorLit(s.arg);
-      rejectNestedStringBinary(s.arg);
-      return;
     case "Error":
-      rejectNestedTensorLit(s.arg);
-      rejectNestedStringBinary(s.arg);
+      rejectNestedOwnedExpr(s.arg);
       return;
     case "If":
-      rejectNestedTensorLit(s.cond);
-      rejectNestedStringBinary(s.cond);
+      rejectNestedOwnedExpr(s.cond);
       validateStmts(s.thenBody);
       for (const eif of s.elseifs) {
-        rejectNestedTensorLit(eif.cond);
-        rejectNestedStringBinary(eif.cond);
+        rejectNestedOwnedExpr(eif.cond);
         validateStmts(eif.body);
       }
       if (s.elseBody) validateStmts(s.elseBody);
       return;
     case "While":
-      rejectNestedTensorLit(s.cond);
-      rejectNestedStringBinary(s.cond);
+      rejectNestedOwnedExpr(s.cond);
       validateStmts(s.body);
       return;
     case "For":
-      rejectNestedTensorLit(s.start);
-      rejectNestedTensorLit(s.step);
-      rejectNestedTensorLit(s.end);
-      rejectNestedStringBinary(s.start);
-      rejectNestedStringBinary(s.step);
-      rejectNestedStringBinary(s.end);
+      rejectNestedOwnedExpr(s.start);
+      rejectNestedOwnedExpr(s.step);
+      rejectNestedOwnedExpr(s.end);
       validateStmts(s.body);
       return;
     case "Break":

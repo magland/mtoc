@@ -467,7 +467,7 @@ describe("early tensor frees", () => {
     // The early-return inside the if-then frees v before `return y;`.
     // v is also dead after the post-if `y = sum(v) * 2;` line, so a
     // SECOND free is emitted there. The implicit fall-through return
-    // sees v already in the freedTensors path-tracker and does NOT
+    // sees v already in the freedOwned path-tracker and does NOT
     // re-emit.
     const c = translate(
       "disp(pick(1));\n" +
@@ -852,5 +852,29 @@ describe("strings", () => {
     const c = translate('x = "hi";\ndisp(x);\nx = 42;\ndisp(x);\n');
     expect(c).toContain("mtoc_string_t x = mtoc_string_empty();");
     expect(c).toMatch(/double _mtoc_x__v\d+ = 0\.0;/);
+  });
+
+  it("frees a string immediately after its last touch (not at scope exit)", () => {
+    // After `c = a + b;`, `a` and `b` have no future touches. The
+    // shared "early free" liveness pass — same machinery as tensors —
+    // should emit `mtoc_string_free(&a); mtoc_string_free(&b);`
+    // between the assignment and `disp(c)`. `c` itself is freed
+    // after `disp(c)`.
+    const c = translate('a = "x";\nb = "y";\nc = a + b;\ndisp(c);\n');
+    const aFreeIdx = c.indexOf("mtoc_string_free(&a);");
+    const bFreeIdx = c.indexOf("mtoc_string_free(&b);");
+    const cFreeIdx = c.indexOf("mtoc_string_free(&c);");
+    const dispIdx = c.indexOf("mtoc_disp_string(c);");
+    expect(aFreeIdx).toBeGreaterThan(-1);
+    expect(bFreeIdx).toBeGreaterThan(-1);
+    expect(cFreeIdx).toBeGreaterThan(-1);
+    expect(aFreeIdx).toBeLessThan(dispIdx);
+    expect(bFreeIdx).toBeLessThan(dispIdx);
+    expect(dispIdx).toBeLessThan(cFreeIdx);
+    // Each var is freed exactly once on the linear path — no
+    // duplicate scope-exit free after the early free.
+    expect((c.match(/mtoc_string_free\(&a\);/g) ?? []).length).toBe(1);
+    expect((c.match(/mtoc_string_free\(&b\);/g) ?? []).length).toBe(1);
+    expect((c.match(/mtoc_string_free\(&c\);/g) ?? []).length).toBe(1);
   });
 });
