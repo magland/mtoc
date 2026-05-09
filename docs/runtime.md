@@ -69,13 +69,42 @@ Layout is **column-major** to match numbl / LAPACK. For a tensor of shape
 `(R, C)`, element `(r, c)` lives at `real[r + c * R]` (and, when complex,
 the imaginary part lives at `imag[r + c * R]`).
 
-For statically-known sizes (today's only mode), the codegen predeclares the
-backing storage as stack arrays (`double _mtoc_<name>_re[N]`, plus
-`_mtoc_<name>_im[N]` when complex) right next to the struct value
-(`mtoc_tensor_t <name> = { _mtoc_<name>_re, NULL, R, C };` for real;
-`{ _mtoc_<name>_re, _mtoc_<name>_im, R, C }` for complex). No heap
-allocation, no cleanup. When dynamic sizing arrives, the plan is to switch
-the storage path to a per-function arena — the struct shape stays the same.
+Backing storage is allocated on the **heap** for every tensor, by every
+emitted program — there is no stack-array fast path. The codegen predeclares
+each tensor as a single struct value whose `real` (and `imag`, when complex)
+fields are populated by an inline call to the `mtoc_alloc` runtime helper:
+
+```
+mtoc_tensor_t v = { mtoc_alloc(N * sizeof(double)), NULL, R, C };
+mtoc_tensor_t z = { mtoc_alloc(N * sizeof(double)),
+                    mtoc_alloc(N * sizeof(double)), R, C };
+```
+
+`mtoc_alloc` is a thin wrapper around `malloc` that aborts with a clear
+diagnostic on allocation failure (so the call site can drop the result
+straight into a struct initializer without a NULL check). Lives at
+`runtime/alloc.h`, registered as the `mtoc_alloc` snippet, and activated
+alongside `mtoc_tensor_t` whenever any tensor is declared.
+
+Going uniformly heap means every `.m` script — even ones that only ever
+use small tensors — exercises the production allocation path. The earlier
+stack-array model would have only kicked over to heap above an 8 MB stack
+budget, leaving the heap path bitrot-prone. Cross-runner coverage now
+comes "for free" from every existing test.
+
+**Cleanup.** Every `mtoc_alloc` is paired with a `free` at scope exit.
+Codegen emits `free(<v>.real)` (and `free(<v>.imag)` for complex tensors)
+immediately before each `return` in:
+
+- the implicit fall-through return at the end of `main()`,
+- the implicit fall-through return at the end of every user function,
+- every explicit `IRStmt.ReturnFromFunction` early-return inside a
+  function body.
+
+Free order matches declaration order (sorted by C identifier) so the
+generated C is deterministic. The free is unconditional — the malloc
+above is also unconditional, even when the variable's first source-level
+assignment is inside an `if` branch.
 
 `MTOC_RESTRICT` is a small macro defined alongside the struct: it expands to
 `__restrict__` under GCC/Clang and to nothing on compilers that don't
@@ -109,7 +138,10 @@ scalars are `double _Complex` (C99).
 ## Reserved name prefix
 
 Anything beginning with `_mtoc_` is reserved for the codegen — synthetic
-loop-counter names, per-tensor backing-buffer names (`_mtoc_<name>_re`,
-`_mtoc_<name>_im`), and so on. The lowerer defensively rejects user
-identifiers starting with `_mtoc_` (numbl syntax already disallows leading
-underscores, but it's belt-and-suspenders).
+loop counters (`_mtoc_i`, `_mtoc_n`), elementwise staging temporaries
+(`_mtoc_t`), and split-binding names introduced by the lowerer
+(`_mtoc_<name>__v<N>`). The lowerer defensively rejects user identifiers
+starting with `_mtoc_` (numbl syntax already disallows leading underscores,
+but it's belt-and-suspenders). Tensor backing storage no longer has a
+named C identifier — `mtoc_alloc` returns the pointer directly into the
+struct initializer, so there's nothing to label.

@@ -71,6 +71,15 @@ export const MTOC_DISP_COMPLEX = loadSnippet("disp_complex.h", [
  */
 export const MTOC_TENSOR_STRUCT = loadSnippet("tensor.h");
 
+/**
+ * Heap allocation helper. Tensor storage is uniformly mallocked from
+ * the heap (so the codegen path is exercised by every test, not just
+ * large ones); this wrapper aborts with a clear diagnostic on
+ * allocation failure. Activated alongside MTOC_TENSOR_STRUCT whenever
+ * a tensor is declared.
+ */
+export const MTOC_ALLOC = loadSnippet("alloc.h");
+
 const MTOC_DISP_TENSOR = loadSnippet("disp_tensor.h", [
   "mtoc_format_double",
   "mtoc_tensor_t",
@@ -92,6 +101,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_format_complex", MTOC_FORMAT_COMPLEX],
   ["mtoc_disp_complex", MTOC_DISP_COMPLEX],
   ["mtoc_tensor_t", MTOC_TENSOR_STRUCT],
+  ["mtoc_alloc", MTOC_ALLOC],
   ["mtoc_disp_tensor", MTOC_DISP_TENSOR],
   ["mtoc_disp_tensor_complex", MTOC_DISP_TENSOR_COMPLEX],
   ["mtoc_mod", loadSnippet("mod.h")],

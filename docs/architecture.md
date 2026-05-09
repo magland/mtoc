@@ -115,7 +115,13 @@ Responsibilities:
 - Activate runtime helpers on demand (one walk; see "Runtime" below).
 - Predeclare every `assignedVars` entry at the top of `main()` and inside each
   function body (scalars as `double x = 0.0;`, real tensors as
-  `double _mtoc_<name>_re[N]; mtoc_tensor_t <name> = { _mtoc_<name>_re, NULL, R, C };`).
+  `mtoc_tensor_t <name> = { mtoc_alloc(N * sizeof(double)), NULL, R, C };`,
+  complex tensors as
+  `mtoc_tensor_t <name> = { mtoc_alloc(N * sizeof(double)), mtoc_alloc(N * sizeof(double)), R, C };`).
+  Tensor storage is uniformly heap-allocated via the `mtoc_alloc` helper;
+  paired `free(<name>.real)` (and `.imag` for complex) calls are emitted
+  before every `return` site so the cleanup path is exercised by every
+  test, not just large ones.
 - Emit user-function specializations ahead of `main`, each with a header
   comment showing the source span and the inferred type signature.
 - Map operators to C with a precedence-aware printer; nested unary operands

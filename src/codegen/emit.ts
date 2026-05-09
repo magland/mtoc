@@ -25,6 +25,7 @@ import {
 } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import {
+  MTOC_ALLOC,
   MTOC_DISP_COMPLEX,
   MTOC_DISP_DOUBLE,
   MTOC_TENSOR_STRUCT,
@@ -35,10 +36,10 @@ import {
 // Note: C-name mangling lives in lower.ts (`cNameFor`). Every IR.Var,
 // IR.Assign, IR.For, IR.ReturnFromFunction and IRFunction param /
 // output / assignedVars entry already carries the C identifier the
-// codegen emits — emit.ts consumes those fields directly. Synthetic
-// loop-counter names (`_mtoc_i`, `_mtoc_n`, etc.) and the per-tensor
-// `_mtoc_<cName>_re` (and future `_im`) buffer names are still
-// synthesized here.
+// codegen emits — emit.ts consumes those fields directly. The only
+// names synthesized here are scope-local helpers (`_mtoc_i`,
+// `_mtoc_n`, `_mtoc_t`, etc.) for loop counters and elementwise
+// staging temporaries.
 
 function formatNumLit(n: number): string {
   if (Number.isNaN(n)) return "NAN";
@@ -135,6 +136,11 @@ interface EmitState {
   /** Counter for synthetic loop-index names so nested elementwise
    *  loops don't shadow each other. */
   elemwiseLoopCounter: number;
+  /** assignedVars of the scope currently being emitted (main's vars
+   *  while emitting `prog.stmts`, or the function's vars while
+   *  emitting a function body). Used by the scope-exit cleanup helper
+   *  to know which tensor backings to free at `return` sites. */
+  currentScopeVars: ReadonlyMap<string, VarBinding> | null;
 }
 
 /** Build the small facade view passed to `BuiltinSig.emit` closures.
@@ -590,6 +596,17 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       break;
 
     case "ReturnFromFunction":
+      // Free every tensor backing in the enclosing function's scope
+      // before we return. `currentScopeVars` is set to `fn.assignedVars`
+      // by `emitFunctionBody`. Lowering only emits this kind inside a
+      // function body, so the field is always non-null here.
+      if (state.currentScopeVars === null) {
+        throw new Error(
+          "codegen internal: ReturnFromFunction reached emit outside a " +
+            "function scope; should have been rejected at lowering"
+        );
+      }
+      emitScopeExitFrees(state, level, state.currentScopeVars);
       pushStmt(state, level, `return ${s.outputCName};`);
       break;
 
@@ -782,13 +799,14 @@ function emitTensorLitAssign(
 
 /** Emit predeclarations for a {cName → VarBinding} table. Scalars
  *  become `double <cName> = 0.0;` (real) or `double _Complex <cName> = 0.0;`
- *  (complex). Multi-element real tensors get a stack-backed
- *  `mtoc_tensor_t <cName>` whose `real` points at a sibling
- *  `double _mtoc_<cName>_re[N]` buffer and whose `imag` is NULL.
- *  Multi-element complex tensors additionally allocate a parallel
- *  `double _mtoc_<cName>_im[N]` buffer and pass that as the struct's
- *  `imag` field. Activates the `mtoc_tensor_t` typedef snippet whenever
- *  any tensor is declared. */
+ *  (complex). Multi-element real tensors get an `mtoc_tensor_t <cName>`
+ *  whose `real` is heap-allocated via `mtoc_alloc(numel * sizeof(double))`
+ *  and whose `imag` is NULL. Multi-element complex tensors additionally
+ *  allocate a parallel `imag` buffer the same way. Activates the
+ *  `mtoc_tensor_t` typedef and `mtoc_alloc` helper snippets whenever
+ *  any tensor is declared. Cleanup is paired in `emitScopeExitFrees`,
+ *  which is invoked at every `return` site (script end, function end,
+ *  and `IRStmt.ReturnFromFunction`). */
 function emitDeclarations(
   state: EmitState,
   level: number,
@@ -817,28 +835,22 @@ function emitDeclarations(
         );
       }
       useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-      // Synthetic buffer names keyed off the C identifier (which is
-      // unique within the scope). The `_mtoc_` prefix is reserved by
-      // lower.ts so it can never collide with a user variable. `_re`
-      // and `_im` mirror numbl's split storage; `_im` is only emitted
-      // when the type is statically complex.
-      const reBuf = `_mtoc_${cName}_re`;
+      useRuntime(state, "mtoc_alloc", MTOC_ALLOC);
       const r = (ty.rows as { kind: "exact"; n: number }).n;
       const c = (ty.cols as { kind: "exact"; n: number }).n;
-      pushStmt(state, level, `double ${reBuf}[${numel}];`);
+      const reAlloc = `mtoc_alloc(${numel} * sizeof(double))`;
       if (ty.isComplex) {
-        const imBuf = `_mtoc_${cName}_im`;
-        pushStmt(state, level, `double ${imBuf}[${numel}];`);
+        const imAlloc = `mtoc_alloc(${numel} * sizeof(double))`;
         pushStmt(
           state,
           level,
-          `mtoc_tensor_t ${cName} = { ${reBuf}, ${imBuf}, ${r}, ${c} };`
+          `mtoc_tensor_t ${cName} = { ${reAlloc}, ${imAlloc}, ${r}, ${c} };`
         );
       } else {
         pushStmt(
           state,
           level,
-          `mtoc_tensor_t ${cName} = { ${reBuf}, NULL, ${r}, ${c} };`
+          `mtoc_tensor_t ${cName} = { ${reAlloc}, NULL, ${r}, ${c} };`
         );
       }
       continue;
@@ -849,23 +861,62 @@ function emitDeclarations(
   }
 }
 
+/** Emit `free(...)` lines for every multi-element tensor binding in
+ *  `vars`. Real tensors get one free for `<v>.real`; complex tensors
+ *  get a second for `<v>.imag` (which is NULL for real tensors, so
+ *  freeing it would be a wasted no-op). Iteration order matches
+ *  `emitDeclarations` (sorted by C identifier) so generated C stays
+ *  deterministic. Called at every scope-exit site — end of `main`,
+ *  end of each function body, and every `IRStmt.ReturnFromFunction`. */
+function emitScopeExitFrees(
+  state: EmitState,
+  level: number,
+  vars: ReadonlyMap<string, VarBinding>
+): void {
+  const cNames = [...vars.keys()].sort();
+  for (const key of cNames) {
+    const binding = vars.get(key)!;
+    const { ty, cName } = binding;
+    if (!(isNumeric(ty) && isMultiElement(ty) && ty.elem === "double")) {
+      continue;
+    }
+    pushStmt(state, level, `free(${cName}.real);`);
+    if (ty.isComplex) {
+      pushStmt(state, level, `free(${cName}.imag);`);
+    }
+  }
+}
+
 /** Emit the body of a user-defined function (predeclarations + body
- *  stmts + final return) into a fresh local-line buffer. */
+ *  stmts + scope-exit frees + final return) into a fresh local-line
+ *  buffer. The frees pair with `emitDeclarations`'s heap allocations:
+ *  every tensor local is freed before the implicit fall-through return,
+ *  and every `IRStmt.ReturnFromFunction` early exit picks up the same
+ *  free preamble (driven by `state.currentScopeVars`). */
 function emitFunctionBody(
   state: EmitState,
   fn: IRFunction
-): { lines: string[]; cReturn: string } {
+): { lines: string[] } {
   // Swap in a fresh `lines` buffer so the function's body lines don't
   // intermix with main's. Other state (runtime / needMath) is shared.
   const outerLines = state.lines;
+  const outerScopeVars = state.currentScopeVars;
   state.lines = [];
+  state.currentScopeVars = fn.assignedVars;
 
   emitDeclarations(state, 1, fn.assignedVars);
   for (const s of fn.body) emitStmt(state, 1, s);
+  // Implicit fall-through return at the end of the function: free every
+  // tensor backing, then return the output. Early-exit `return` paths
+  // emitted by `IRStmt.ReturnFromFunction` carry their own copy of the
+  // free preamble (see `emitStmt`).
+  emitScopeExitFrees(state, 1, fn.assignedVars);
+  pushStmt(state, 1, `return ${fn.outputCName};`);
 
   const bodyLines = state.lines;
   state.lines = outerLines;
-  return { lines: bodyLines, cReturn: `return ${fn.outputCName};` };
+  state.currentScopeVars = outerScopeVars;
+  return { lines: bodyLines };
 }
 
 /** Render the per-specialization header comment that goes above each
@@ -905,8 +956,8 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
   }
   const paramList = fn.params.map(p => `double ${p.cName}`).join(", ");
   const sig = `static double ${fn.mangledName}(${paramList || "void"}) {`;
-  const { lines, cReturn } = emitFunctionBody(state, fn);
-  return [...functionHeaderComment(fn), sig, ...lines, `  ${cReturn}`, "}"];
+  const { lines } = emitFunctionBody(state, fn);
+  return [...functionHeaderComment(fn), sig, ...lines, "}"];
 }
 
 /** Options for `emitC`. */
@@ -934,6 +985,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     lines: [],
     iterStack: [],
     elemwiseLoopCounter: 0,
+    currentScopeVars: null,
   };
 
   // One-pass pre-walk: activates runtime helpers referenced by the
@@ -954,8 +1006,14 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   // Predeclare every assigned variable at the top of main. Hoisting
   // keeps the C valid even when an `if` branch introduces a new
   // variable that is read after the block.
+  state.currentScopeVars = prog.assignedVars;
   emitDeclarations(state, 1, prog.assignedVars);
   for (const s of prog.stmts) emitStmt(state, 1, s);
+  // Free every tensor backing allocated for top-level vars before
+  // `return 0;`. (Process exit would reclaim it anyway, but the free
+  // keeps memory tooling clean and matches the function-body pattern.)
+  emitScopeExitFrees(state, 1, prog.assignedVars);
+  state.currentScopeVars = null;
 
   // Headers: explicit needs from user code, plus runtime-snippet
   // headers when those snippets are part of the output. With

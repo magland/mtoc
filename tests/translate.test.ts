@@ -130,13 +130,18 @@ describe("translate scalar example", () => {
     // allocates a fresh `_mtoc_v__v<N>` binding for the second
     // assignment so both can coexist in the same scope.
     const c = translate("v = [1 2 3];\ndisp(v);\nv = [1 2 3 4];\ndisp(v);\n");
-    expect(c).toMatch(/mtoc_tensor_t v = \{ _mtoc_v_re,/);
     expect(c).toMatch(
-      /mtoc_tensor_t _mtoc_v__v\d+ = \{ _mtoc__mtoc_v__v\d+_re,/
+      /mtoc_tensor_t v = \{ mtoc_alloc\(3 \* sizeof\(double\)\), NULL, 1, 3 \};/
+    );
+    expect(c).toMatch(
+      /mtoc_tensor_t _mtoc_v__v\d+ = \{ mtoc_alloc\(4 \* sizeof\(double\)\), NULL, 1, 4 \};/
     );
     // Both disps are emitted, on the two different bindings.
     expect(c).toMatch(/mtoc_disp_tensor\(v\);/);
     expect(c).toMatch(/mtoc_disp_tensor\(_mtoc_v__v\d+\);/);
+    // Each binding gets its own free at scope exit.
+    expect(c).toMatch(/free\(v\.real\);/);
+    expect(c).toMatch(/free\(_mtoc_v__v\d+\.real\);/);
   });
 
   it("splits a scalar→tensor top-level reassignment", () => {
@@ -183,6 +188,44 @@ describe("translate scalar example", () => {
     expect(e.name).toBe("UnsupportedConstruct");
     expect(e.span).toBeTruthy();
     expect(e.message).toMatch(/tensor literal/i);
+  });
+
+  it("emits free(<v>.real) before the implicit return of a function with a tensor local", () => {
+    // The function declares a tensor local; codegen mallocs its
+    // backing in the predeclaration and must free it before the
+    // function returns. Free comes immediately before `return`.
+    const c = translate(
+      "disp(sum_first());\n" +
+        "function r = sum_first()\n" +
+        "  v = [1 2 3];\n" +
+        "  r = sum(v);\n" +
+        "end\n"
+    );
+    // The function body has `free(v.real);\n  return r;` adjacent
+    // (modulo whitespace).
+    expect(c).toMatch(/free\(v\.real\);\s*\n\s*return r;/);
+  });
+
+  it("emits free(<v>.real) at every IRStmt.ReturnFromFunction early-exit site", () => {
+    // Each `return` keyword inside the function body lowers to its
+    // own ReturnFromFunction node, and each one must carry a copy of
+    // the free preamble for tensor locals in scope.
+    const c = translate(
+      "disp(pick(1));\n" +
+        "function y = pick(flag)\n" +
+        "  v = [10 20 30];\n" +
+        "  y = sum(v);\n" +
+        "  if flag > 0\n" +
+        "    return;\n" +
+        "  end\n" +
+        "  y = sum(v) * 2;\n" +
+        "end\n"
+    );
+    // At least two `free(v.real);` should appear inside the function
+    // body — one for the explicit `return` and one for the implicit
+    // fall-through return.
+    const frees = c.match(/free\(v\.real\);/g) ?? [];
+    expect(frees.length).toBeGreaterThanOrEqual(2);
   });
 
   it("rejects disp of a non-Var tensor expression at lowering", () => {
