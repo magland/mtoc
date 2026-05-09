@@ -16,7 +16,6 @@ import type {
 } from "../lowering/ir.js";
 import {
   cTypeFor,
-  isCharArray,
   isCharScalar,
   isMultiElement,
   isOwned,
@@ -30,15 +29,8 @@ import {
   type NumericType,
 } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
-import {
-  MTOC_CHAR_TENSOR_STRUCT,
-  MTOC_DISP_COMPLEX,
-  MTOC_DISP_DOUBLE,
-  MTOC_STRING_STRUCT,
-  MTOC_TENSOR_STRUCT,
-  RUNTIME_HELPERS,
-  type RuntimeSnippet,
-} from "./runtime.js";
+import { ownedOps } from "./ownedKinds.js";
+import { RUNTIME_HELPERS, type RuntimeSnippet } from "./runtime.js";
 import {
   computeFutureTouches,
   topLevelOwnedDefs,
@@ -292,6 +284,24 @@ function builtinEmitFacade(state: EmitState): BuiltinEmitState {
   };
 }
 
+/** Copy-on-arg-pass: wrap an owned-typed argument in its kind's `copy`
+ *  helper so the callee gets a freshly-owned value to manage. Tensors
+ *  (real / complex) and char arrays follow this protocol; strings
+ *  don't — they're not yet accepted as user-function args. Returns
+ *  `inner` unchanged for non-owned arg types. Activates the chosen
+ *  copy helper as a side effect. */
+function wrapOwnedArgCopy(
+  state: EmitState,
+  argTy: MType,
+  inner: string
+): string {
+  const owned = ownedOps(argTy);
+  if (owned === null || !isMultiElement(argTy)) return inner;
+  const helper = owned.copy(argTy);
+  useRuntimeByName(state, helper);
+  return `${helper}(${inner})`;
+}
+
 function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
   // Tensor-typed sub-expressions in scalar codegen contexts are caught
   // by the lowering-pass validator (lower.ts: `validateIR`). If one
@@ -322,7 +332,7 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       // Build a non-owning `mtoc_string_t` whose `data` field points
       // straight at a C string literal in `.rodata`. Cheap — no
       // allocation. Activates the typedef + the helper.
-      useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+      useRuntimeByName(state, "mtoc_string_t");
       useRuntimeByName(state, "mtoc_string_from_literal");
       const lit = formatStringLit(e.value);
       const len = stringLitByteLen(e.value);
@@ -374,7 +384,7 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       }
       // Multi-element char in non-iter context: build a non-owning
       // `mtoc_char_tensor_t` pointing at the string literal in .rodata.
-      useRuntime(state, "mtoc_char_tensor_t", MTOC_CHAR_TENSOR_STRUCT);
+      useRuntimeByName(state, "mtoc_char_tensor_t");
       useRuntimeByName(state, "mtoc_char_tensor_from_literal");
       const lit = formatStringLit(e.value);
       return `mtoc_char_tensor_from_literal(${lit}, ${e.value.length})`;
@@ -407,20 +417,7 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       const isUserCall = e.callee.kind === "userFunc";
       const argStrs = e.args.map(a => {
         const inner = emitExpr(state, a, 0);
-        if (isUserCall && isMultiElement(a.ty)) {
-          if (isCharArray(a.ty)) {
-            // Char-array args: callee owns a copy (same as tensor args).
-            useRuntimeByName(state, "mtoc_char_tensor_copy");
-            return `mtoc_char_tensor_copy(${inner})`;
-          }
-          const helper =
-            isNumeric(a.ty) && a.ty.isComplex
-              ? "mtoc_tensor_copy_complex"
-              : "mtoc_tensor_copy";
-          useRuntimeByName(state, helper);
-          return `${helper}(${inner})`;
-        }
-        return inner;
+        return isUserCall ? wrapOwnedArgCopy(state, a.ty, inner) : inner;
       });
       if (e.callee.kind === "userFunc") {
         return `${e.callee.mangled}(${argStrs.join(", ")})`;
@@ -439,7 +436,7 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
               `should have been rejected at lowering`
           );
         }
-        useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+        useRuntimeByName(state, "mtoc_string_t");
         useRuntimeByName(state, "mtoc_string_concat");
         const left = emitExpr(state, e.left, 0);
         const right = emitExpr(state, e.right, 0);
@@ -750,13 +747,13 @@ function deadAfterStmt(state: EmitState, s: IRStmt): string[] {
   return out;
 }
 
-/** Emit a free line for every name in `vars`, picking
- *  `mtoc_tensor_free` for multi-element double tensors,
- *  `mtoc_char_tensor_free` for char arrays, and `mtoc_string_free`
- *  for strings, mark them as freed on the current linear path, and
- *  activate the matching helper snippet on first use.
- *  The caller has already filtered against the current `freedOwned`
- *  set (see `deadAfterStmt`); this just emits and updates state. */
+/** Emit a free line for every name in `vars`, picking the appropriate
+ *  free helper from the owned-kind registry for each variable's type
+ *  (`mtoc_tensor_free` / `mtoc_char_tensor_free` / `mtoc_string_free`),
+ *  mark them as freed on the current linear path, and activate the
+ *  matching helper snippet on first use. The caller has already
+ *  filtered against the current `freedOwned` set (see
+ *  `deadAfterStmt`). */
 function emitEarlyFrees(
   state: EmitState,
   level: number,
@@ -776,22 +773,15 @@ function emitEarlyFrees(
           `not in the current scope's free-on-exit set`
       );
     }
-    const ty = binding.ty;
-    if (isString(ty)) {
-      useRuntimeByName(state, "mtoc_string_free");
-      pushStmt(state, level, `mtoc_string_free(&${v});`);
-    } else if (isCharArray(ty)) {
-      useRuntimeByName(state, "mtoc_char_tensor_free");
-      pushStmt(state, level, `mtoc_char_tensor_free(&${v});`);
-    } else if (isNumeric(ty) && isMultiElement(ty)) {
-      useRuntimeByName(state, "mtoc_tensor_free");
-      pushStmt(state, level, `mtoc_tensor_free(&${v});`);
-    } else {
+    const owned = ownedOps(binding.ty);
+    if (owned === null) {
       throw new Error(
         `codegen internal: early-free for non-owned var '${v}' ` +
-          `(${typeToString(ty)})`
+          `(${typeToString(binding.ty)})`
       );
     }
+    useRuntimeByName(state, owned.free);
+    pushStmt(state, level, `${owned.free}(&${v});`);
     state.freedOwned.add(v);
   }
 }
@@ -828,74 +818,44 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
-      if (isCharArray(s.ty)) {
-        // Char-array assignment goes through `mtoc_char_tensor_assign`,
-        // which frees the prior owned buffer and installs the new value.
-        // RHS forms:
-        //   - CharLit (multi-element): non-owning literal handle from
-        //     `mtoc_char_tensor_from_literal`; assign takes ownership.
-        //   - Var (char array): deep-copy via `mtoc_char_tensor_copy`
-        //     so the source stays usable.
-        useRuntime(state, "mtoc_char_tensor_t", MTOC_CHAR_TENSOR_STRUCT);
-        useRuntimeByName(state, "mtoc_char_tensor_assign");
-        let rhsExpr: string;
-        if (s.rhs.kind === "Var") {
-          useRuntimeByName(state, "mtoc_char_tensor_copy");
-          rhsExpr = `mtoc_char_tensor_copy(${s.rhs.cName})`;
-        } else {
-          rhsExpr = emitExpr(state, s.rhs, 0);
-        }
-        pushStmt(
-          state,
-          level,
-          `mtoc_char_tensor_assign(&${s.cName}, ${rhsExpr});`
-        );
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
       if (isScalarReal(s.ty) || isScalarComplex(s.ty)) {
         pushStmt(state, level, `${s.cName} = ${emitExpr(state, s.rhs, 0)};`);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
-      if (isString(s.ty)) {
-        // Every string assignment goes through `mtoc_string_assign`,
-        // which frees the prior owned buffer (or no-ops on a literal-
-        // pointing handle) and installs the new value in one step.
-        // The RHS shape we accept here mirrors what lowering admits:
-        //   - StringLit: literal handle (zero allocation).
-        //   - Var: deep-copy via `mtoc_string_copy` so the source
-        //     stays usable for later reads.
-        //   - Binary(Add, string, string): produces a fresh owned
-        //     handle via `mtoc_string_concat`.
-        useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
-        useRuntimeByName(state, "mtoc_string_assign");
-        let rhsExpr: string;
-        if (s.rhs.kind === "Var") {
-          useRuntimeByName(state, "mtoc_string_copy");
-          rhsExpr = `mtoc_string_copy(${s.rhs.cName})`;
-        } else {
-          // StringLit and string Binary route through the standard
-          // emitExpr path; both produce a stand-alone `mtoc_string_t`
-          // value (literal handle or freshly-concat'd owned handle).
-          rhsExpr = emitExpr(state, s.rhs, 0);
-        }
-        pushStmt(state, level, `mtoc_string_assign(&${s.cName}, ${rhsExpr});`);
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
-      if (isNumeric(s.ty) && isMultiElement(s.ty) && s.ty.elem === "double") {
-        // Tensor-by-name: `y = x;` collapses to a single helper call
-        // pair — `mtoc_tensor_assign(&y, mtoc_tensor_copy(x));`. The
-        // RHS-is-a-Var case is the simplest manifestation of "every
-        // manipulation copies"; non-trivial RHSs (Binary, Unary, …)
-        // build a fresh tensor via the elementwise loop below.
-        if (s.rhs.kind === "Var") {
-          emitTensorVarCopyAssign(state, level, s.cName, s.rhs);
+      const owned = ownedOps(s.ty);
+      if (owned !== null) {
+        // Owned-LHS assignment goes through the kind's `assign` helper,
+        // which frees the prior buffer (or no-ops on an empty/literal
+        // handle) and installs the new value in one step.
+        //
+        // The tensor case (multi-element double) splits on RHS kind:
+        // a non-Var, non-TensorLit RHS materializes elementwise via a
+        // per-slot loop. Strings and char arrays accept a Var
+        // (deep-copy) or any owned-producing expression directly
+        // (`StringLit`, `mtoc_string_concat(...)`,
+        // `mtoc_char_tensor_from_literal(...)`).
+        if (
+          isNumeric(s.ty) &&
+          isMultiElement(s.ty) &&
+          s.ty.elem === "double" &&
+          s.rhs.kind !== "Var"
+        ) {
+          emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
           break;
         }
-        emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
+        useRuntimeByName(state, owned.structSnippet);
+        useRuntimeByName(state, owned.assign);
+        let rhsExpr: string;
+        if (s.rhs.kind === "Var") {
+          const copyHelper = owned.copy(s.rhs.ty);
+          useRuntimeByName(state, copyHelper);
+          rhsExpr = `${copyHelper}(${s.rhs.cName})`;
+        } else {
+          rhsExpr = emitExpr(state, s.rhs, 0);
+        }
+        pushStmt(state, level, `${owned.assign}(&${s.cName}, ${rhsExpr});`);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
@@ -913,18 +873,18 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
 
     case "Disp": {
       const ty = s.arg.ty;
-      if (isString(ty)) {
-        // Handle is either `StringLit` (renders as
-        // `mtoc_string_from_literal(...)`) or `Var` (renders as the
-        // bare cName) — both produce an `mtoc_string_t` value to pass
-        // straight to the helper. No allocation for the literal path.
-        useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
-        useRuntimeByName(state, "mtoc_disp_string");
-        pushStmt(
-          state,
-          level,
-          `mtoc_disp_string(${emitExpr(state, s.arg, 0)});`
-        );
+      const owned = ownedOps(ty);
+      if (owned !== null) {
+        // Owned-kind disp: same shape across strings / char arrays /
+        // tensors — activate the typedef snippet and the kind-specific
+        // disp helper, pass the arg by value. The lowering pass
+        // restricts each kind's accepted arg shapes (Var or
+        // literal-handle for strings; Var-only for tensors); emitExpr
+        // renders each safely.
+        useRuntimeByName(state, owned.structSnippet);
+        const helper = owned.disp(ty);
+        useRuntimeByName(state, helper);
+        pushStmt(state, level, `${helper}(${emitExpr(state, s.arg, 0)});`);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
@@ -935,22 +895,8 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
-      if (isCharArray(ty)) {
-        // Char array disp: accepts both Var (renders as cName) and
-        // CharLit (renders as mtoc_char_tensor_from_literal(...)).
-        // `mtoc_disp_char_tensor` takes its argument by value, so
-        // either form is a valid C expression.
-        useRuntimeByName(state, "mtoc_disp_char_tensor");
-        pushStmt(
-          state,
-          level,
-          `mtoc_disp_char_tensor(${emitExpr(state, s.arg, 0)});`
-        );
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
       if (isScalarReal(ty)) {
-        useRuntime(state, "mtoc_disp_double", MTOC_DISP_DOUBLE);
+        useRuntimeByName(state, "mtoc_disp_double");
         // Non-variadic call — `int` operands auto-promote to `double`,
         // so no manual cast is needed (unlike `printf("%g", ...)`).
         pushStmt(
@@ -962,29 +908,12 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         break;
       }
       if (isScalarComplex(ty)) {
-        useRuntime(state, "mtoc_disp_complex", MTOC_DISP_COMPLEX);
+        useRuntimeByName(state, "mtoc_disp_complex");
         pushStmt(
           state,
           level,
           `mtoc_disp_complex(${emitExpr(state, s.arg, 0)});`
         );
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
-      if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
-        // The lowering pass requires tensor `disp` args to be a Var;
-        // anything else would have thrown at lowering with a span.
-        if (s.arg.kind !== "Var") {
-          throw new Error(
-            "codegen internal: non-Var tensor disp arg reached emit; " +
-              "should have been rejected at lowering"
-          );
-        }
-        const helper = ty.isComplex
-          ? "mtoc_disp_tensor_complex"
-          : "mtoc_disp_tensor";
-        useRuntimeByName(state, helper);
-        pushStmt(state, level, `${helper}(${s.arg.cName});`);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
@@ -1065,7 +994,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // free heap-owned tensors / strings before the call: the OS
       // reclaims everything on `exit`, and matching numbl's behavior
       // is what we care about for cross-runner parity.
-      useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
+      useRuntimeByName(state, "mtoc_string_t");
       useRuntimeByName(state, "mtoc_error_string");
       pushStmt(
         state,
@@ -1141,24 +1070,11 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // The call site never appears with `outputs.length === 1`
       // because that case routes to `Assign` / `ExprStmt(Call)` in
       // lowering (1-output is return-by-value).
-      const argStrs = s.args.map(a => {
-        const inner = emitExpr(state, a, 0);
-        // Copy-on-arg-pass for tensor args, mirroring the regular
-        // `Call` path in `emitExpr`.
-        if (isMultiElement(a.ty)) {
-          if (isCharArray(a.ty)) {
-            useRuntimeByName(state, "mtoc_char_tensor_copy");
-            return `mtoc_char_tensor_copy(${inner})`;
-          }
-          const helper =
-            isNumeric(a.ty) && a.ty.isComplex
-              ? "mtoc_tensor_copy_complex"
-              : "mtoc_tensor_copy";
-          useRuntimeByName(state, helper);
-          return `${helper}(${inner})`;
-        }
-        return inner;
-      });
+      // Copy-on-arg-pass for tensor / char-array args, mirroring the
+      // regular `Call` path in `emitExpr`.
+      const argStrs = s.args.map(a =>
+        wrapOwnedArgCopy(state, a.ty, emitExpr(state, a, 0))
+      );
       if (s.outputs.length === 0) {
         // Zero-output: simplest form — bare `<mangled>(args);`. No
         // discard temps, no surrounding block.
@@ -1370,30 +1286,6 @@ function collectMultiElementVarsByCName(
   }
 }
 
-/** Emit `<target> = <var>;` where `<var>` is a tensor variable. The
- *  cleanest manifestation of "copy on every manipulation": one helper
- *  call to copy the source, one helper call to consume-replace the
- *  target. Same shape regardless of real/complex (codegen picks the
- *  right `mtoc_tensor_copy{,_complex}` variant statically). */
-function emitTensorVarCopyAssign(
-  state: EmitState,
-  level: number,
-  cTarget: string,
-  src: Extract<IRExpr, { kind: "Var" }>
-): void {
-  useRuntimeByName(state, "mtoc_tensor_assign");
-  const isComplex = isNumeric(src.ty) && src.ty.isComplex;
-  const copyHelper = isComplex
-    ? "mtoc_tensor_copy_complex"
-    : "mtoc_tensor_copy";
-  useRuntimeByName(state, copyHelper);
-  pushStmt(
-    state,
-    level,
-    `mtoc_tensor_assign(&${cTarget}, ${copyHelper}(${src.cName}));`
-  );
-}
-
 /** Emit an Assign whose multi-element RHS is NOT a TensorLit and not
  *  a bare Var. Pattern: read shape from a deterministic shape-source
  *  `Var`, allocate a fresh tensor via `mtoc_tensor_alloc{,_complex}`
@@ -1422,7 +1314,7 @@ function emitTensorAssignFromExpr(
         `RHS contains no multi-element variable or char literal to read shape from`
     );
   }
-  useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
+  useRuntimeByName(state, "mtoc_tensor_t");
   useRuntimeByName(state, "mtoc_tensor_assign");
 
   const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
@@ -1562,7 +1454,7 @@ function emitTensorLitAssign(
   // row-uniformity check.
   const rows = lit.elements.length;
   const cols = rows > 0 ? lit.elements[0].length : 0;
-  useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
+  useRuntimeByName(state, "mtoc_tensor_t");
   useRuntimeByName(state, "mtoc_tensor_assign");
 
   if (!ty.isComplex) {
@@ -1668,23 +1560,21 @@ function emitDeclarations(
   for (const key of cNames) {
     const binding = vars.get(key)!;
     const { ty, cName } = binding;
+    // Owned kinds (string, char-array, multi-element double tensor)
+    // share one shape: predeclare a known-empty handle whose later
+    // re-assignments go through the kind's `assign` helper. The empty
+    // handle has `owned=0` (or NULL buffers), so a scope-exit free of
+    // an uninitialized var is a safe no-op.
+    const owned = ownedOps(ty);
+    if (owned !== null) {
+      useRuntimeByName(state, owned.structSnippet);
+      useRuntimeByName(state, owned.empty);
+      pushStmt(state, level, `${owned.cType} ${cName} = ${owned.empty}();`);
+      continue;
+    }
     if (isCharScalar(ty)) {
       // Scalar char: bare C `char`, zero-initialized to NUL.
       pushStmt(state, level, `char ${cName} = '\\0';`);
-      continue;
-    }
-    if (isCharArray(ty)) {
-      // Char-array predecl mirrors the tensor/string pattern: a
-      // known-empty handle that every assignment overwrites via
-      // `mtoc_char_tensor_assign`. The empty handle has `owned=0`
-      // so a scope-exit free of an uninitialized var is a safe no-op.
-      useRuntime(state, "mtoc_char_tensor_t", MTOC_CHAR_TENSOR_STRUCT);
-      useRuntimeByName(state, "mtoc_char_tensor_empty");
-      pushStmt(
-        state,
-        level,
-        `mtoc_char_tensor_t ${cName} = mtoc_char_tensor_empty();`
-      );
       continue;
     }
     if (isScalarReal(ty)) {
@@ -1693,22 +1583,6 @@ function emitDeclarations(
     }
     if (isScalarComplex(ty)) {
       pushStmt(state, level, `double _Complex ${cName} = 0.0;`);
-      continue;
-    }
-    if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
-      useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-      useRuntimeByName(state, "mtoc_tensor_empty");
-      pushStmt(state, level, `mtoc_tensor_t ${cName} = mtoc_tensor_empty();`);
-      continue;
-    }
-    if (isString(ty)) {
-      // String predecls mirror tensors: a known-empty handle that
-      // every assignment overwrites via `mtoc_string_assign`. Since
-      // `owned=0` on the empty handle, the scope-exit free / first
-      // reassignment's free is a safe no-op.
-      useRuntime(state, "mtoc_string_t", MTOC_STRING_STRUCT);
-      useRuntimeByName(state, "mtoc_string_empty");
-      pushStmt(state, level, `mtoc_string_t ${cName} = mtoc_string_empty();`);
       continue;
     }
     throw new Error(
@@ -1737,42 +1611,15 @@ function emitScopeExitFrees(
   alreadyFreed: Set<string>
 ): void {
   const cNames = [...vars.keys()].sort();
-  let tensorActivated = false;
-  let charTensorActivated = false;
-  let stringActivated = false;
   for (const key of cNames) {
     const binding = vars.get(key)!;
     const { ty, cName } = binding;
-    if (isCharArray(ty)) {
-      if (alreadyFreed.has(cName)) continue;
-      if (!charTensorActivated) {
-        useRuntimeByName(state, "mtoc_char_tensor_free");
-        charTensorActivated = true;
-      }
-      pushStmt(state, level, `mtoc_char_tensor_free(&${cName});`);
-      alreadyFreed.add(cName);
-      continue;
-    }
-    if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
-      if (alreadyFreed.has(cName)) continue;
-      if (!tensorActivated) {
-        useRuntimeByName(state, "mtoc_tensor_free");
-        tensorActivated = true;
-      }
-      pushStmt(state, level, `mtoc_tensor_free(&${cName});`);
-      alreadyFreed.add(cName);
-      continue;
-    }
-    if (isString(ty)) {
-      if (alreadyFreed.has(cName)) continue;
-      if (!stringActivated) {
-        useRuntimeByName(state, "mtoc_string_free");
-        stringActivated = true;
-      }
-      pushStmt(state, level, `mtoc_string_free(&${cName});`);
-      alreadyFreed.add(cName);
-      continue;
-    }
+    const owned = ownedOps(ty);
+    if (owned === null) continue;
+    if (alreadyFreed.has(cName)) continue;
+    useRuntimeByName(state, owned.free);
+    pushStmt(state, level, `${owned.free}(&${cName});`);
+    alreadyFreed.add(cName);
   }
 }
 
@@ -1941,8 +1788,6 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
   // release. The scope-exit free walk in `emitFunctionBody` adds
   // every multi-element tensor param to the free set.
   const paramParts: string[] = [];
-  let needsTensorTypedef = false;
-  let needsCharTensorTypedef = false;
   for (const p of fn.params) {
     const cTy = cTypeFor(p.ty);
     if (cTy === null) {
@@ -1951,8 +1796,11 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
           `unsupported type ${typeToString(p.ty)}`
       );
     }
-    if (isCharArray(p.ty)) needsCharTensorTypedef = true;
-    else if (isMultiElement(p.ty)) needsTensorTypedef = true;
+    // Activate the param's owned-kind typedef so its declaration is
+    // valid C. Scalar params have no struct typedef; the registry
+    // returns null for them.
+    const owned = ownedOps(p.ty);
+    if (owned !== null) useRuntimeByName(state, owned.structSnippet);
     if (isNumeric(p.ty) && p.ty.isComplex) state.needComplex.value = true;
     paramParts.push(`${cTy} ${p.cName}`);
   }
@@ -1971,12 +1819,6 @@ function emitFunction(state: EmitState, fn: IRFunction): string[] {
       if (isNumeric(o.ty) && o.ty.isComplex) state.needComplex.value = true;
       paramParts.push(`${cTy} *_mtoc_o${i}`);
     }
-  }
-  if (needsTensorTypedef) {
-    useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-  }
-  if (needsCharTensorTypedef) {
-    useRuntime(state, "mtoc_char_tensor_t", MTOC_CHAR_TENSOR_STRUCT);
   }
   const paramList = paramParts.join(", ");
   const sig = `static ${returnCTy} ${fn.mangledName}(${paramList || "void"}) {`;

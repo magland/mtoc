@@ -54,55 +54,36 @@ function loadSnippet(
   return { headers, code: bodyLines.join("\n") + "\n", deps };
 }
 
-const MTOC_FORMAT_DOUBLE = loadSnippet("format_double.h");
-export const MTOC_DISP_DOUBLE = loadSnippet("disp_double.h", [
-  "mtoc_format_double",
-]);
+// Each `loadSnippet(name, deps)` parses the inlined `.h` file's
+// `#include` lines and resolves a dependency list of other snippets
+// that must be activated first. Snippets are referenced by their
+// registry key (`mtoc_*` C identifier); call sites use
+// `useRuntimeByName(state, key)` and the activator pulls the dep
+// closure in transitively.
 
+const MTOC_FORMAT_DOUBLE = loadSnippet("format_double.h");
+const MTOC_DISP_DOUBLE = loadSnippet("disp_double.h", ["mtoc_format_double"]);
 const MTOC_FORMAT_COMPLEX = loadSnippet("format_complex.h", [
   "mtoc_format_double",
 ]);
-export const MTOC_DISP_COMPLEX = loadSnippet("disp_complex.h", [
+const MTOC_DISP_COMPLEX = loadSnippet("disp_complex.h", [
   "mtoc_format_complex",
 ]);
-
-/**
- * Tensor struct typedef. No function body, but lives in the same
- * snippet machinery so its definition appears above any helper that
- * consumes it. Multi-element tensor codegen activates this directly.
- */
-export const MTOC_TENSOR_STRUCT = loadSnippet("tensor.h");
-
-/**
- * String struct typedef. Like the tensor struct, no function body —
- * it's the seed every string runtime helper depends on. Activated
- * automatically wherever a string lives in the emitted program (at
- * predeclarations, at literals, at assigns, at disp / error).
- */
-export const MTOC_STRING_STRUCT = loadSnippet("string.h");
-
-/**
- * Heap allocation helper. Tensor storage is uniformly mallocked from
- * the heap (so the codegen path is exercised by every test, not just
- * large ones); this wrapper aborts with a clear diagnostic on
- * allocation failure. Activated alongside MTOC_TENSOR_STRUCT whenever
- * a tensor is declared.
- */
-export const MTOC_ALLOC = loadSnippet("alloc.h");
-
-/**
- * Char-tensor struct typedef. No function body, but lives in the same
- * snippet machinery so its definition appears above any helper that
- * consumes it. Multi-element char codegen activates this directly via
- * the char_tensor family in RUNTIME_HELPERS.
- */
-export const MTOC_CHAR_TENSOR_STRUCT = loadSnippet("char_tensor.h");
-
+/** Tensor struct typedef. Activated whenever a multi-element tensor
+ *  is declared, allocated, or freed. */
+const MTOC_TENSOR_STRUCT = loadSnippet("tensor.h");
+/** String struct typedef. Seed for every string helper. */
+const MTOC_STRING_STRUCT = loadSnippet("string.h");
+/** Heap-allocation helper. Aborts on malloc failure so call sites can
+ *  drop the result straight into a struct literal. */
+const MTOC_ALLOC = loadSnippet("alloc.h");
+/** Char-tensor struct typedef. Activated whenever a char-array value
+ *  is declared, allocated, or freed. */
+const MTOC_CHAR_TENSOR_STRUCT = loadSnippet("char_tensor.h");
 const MTOC_DISP_TENSOR = loadSnippet("disp_tensor.h", [
   "mtoc_format_double",
   "mtoc_tensor_t",
 ]);
-
 const MTOC_DISP_TENSOR_COMPLEX = loadSnippet("disp_tensor_complex.h", [
   "mtoc_format_complex",
   "mtoc_tensor_t",

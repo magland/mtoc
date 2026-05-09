@@ -151,6 +151,27 @@ analysis can prove no other reference exists) are an open roadmap
 item; the priority for the current generation is clarity and
 correctness over performance.
 
+## Owned-kind registry
+
+The C-side helpers each owned `MType` maps to (typedef, `empty`, `free`,
+`assign`, `copy`, `disp`) live in one table at
+[`src/codegen/ownedKinds.ts`](../src/codegen/ownedKinds.ts). `ownedOps(ty)`
+returns the row for any owned type — string, char-array, real-or-complex
+multi-element double tensor — or `null` for non-owned types.
+
+Every codegen site that used to switch on `(isString | isCharArray |
+isMultiElement)` to pick a helper is now a `ownedOps(ty).<role>` lookup:
+`emitDeclarations` / `emitScopeExitFrees` / `emitEarlyFrees`, the
+`Disp` and owned-LHS `Assign` arms of `emitStmt`, and the copy-on-arg-
+pass wrapper for tensor / char-array call arguments. Adding a new
+owned kind (logical-tensor, cell, struct, …) is one entry plus the
+matching `.h` files; the call sites pick it up automatically.
+
+The complex-vs-real split for `copy` and `disp` lives inside the
+registry's per-row closure (`copy: ty => isComplex ?
+"mtoc_tensor_copy_complex" : "mtoc_tensor_copy"`), so call sites stay
+type-uniform.
+
 ## Cleanup
 
 Every owned-heap-value variable is released as soon as it is no
