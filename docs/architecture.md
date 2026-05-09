@@ -65,7 +65,8 @@ Lowering does several jobs in one walk:
   `UnsupportedConstruct` (or `TypeError` for type-domain violations) with the
   offending span.
 - **Lazy specialization**: user-function calls trigger fresh body lowering keyed
-  by a SHA-256 of the canonical argument-type tuple. See `specialization.md`.
+  by an FNV-1a 32-bit hash of the canonical argument-type tuple. See
+  `specialization.md`.
 - **Branch handling**: the env is snapshotted at `if`/`while`/`for` entry,
   each branch lowers from the snapshot, and a `mergeBranchEnvs` step joins the
   per-branch envs at the merge point (using the predeclared-zero default for

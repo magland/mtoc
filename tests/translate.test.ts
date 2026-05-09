@@ -210,9 +210,8 @@ describe("translate scalar example", () => {
     } catch (e) {
       err = e;
     }
-    // Either passes (Binary tensor + tensor lowered to elementwise; we
-    // reject TensorLit nested inside Binary at lowering). Confirm the
-    // error has a span and the right name.
+    // We reject TensorLit nested inside Binary at lowering. Confirm
+    // the error has a span and the right name.
     expect(err).toBeInstanceOf(Error);
     const e = err as { name: string; message: string; span: unknown };
     expect(e.name).toBe("UnsupportedConstruct");
@@ -609,12 +608,12 @@ describe("elementwise shape check", () => {
 });
 
 describe("complex scalar codegen", () => {
-  // Cross-runner tests live in test_scripts/complex/; these vitest
-  // assertions cover the codegen shapes that exercise builtins or paths
-  // numbl's default JIT can't run today (and so can't be cross-checked
-  // byte-for-byte). They lock in the C we emit so the lowering+codegen
-  // doesn't quietly regress while we wait for numbl to grow JIT support
-  // for complex comparisons / logicals.
+  // Cross-runner tests in test_scripts/complex/ already verify
+  // byte-for-byte stdout against numbl. These vitest assertions
+  // additionally pin the *shape* of the emitted C — specific patterns
+  // (`creal(a) == 1.0`, `&&` expansion) that stdout comparison alone
+  // can't catch. They lock in the codegen so a refactor doesn't
+  // silently change the emitted form.
 
   it("emits creal/cimag-based equality on a complex/real mix", () => {
     const c = translate("a = 1 + 2i;\ndisp(a == 1);\n");

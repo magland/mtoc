@@ -19,7 +19,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { readdirSync, statSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { cpus } from "node:os";
 
 const execFileAsync = promisify(execFile);
@@ -166,6 +166,17 @@ function parseConcurrency(): number {
 }
 
 async function main(): Promise<void> {
+  if (!existsSync(numblCliPath)) {
+    console.error(
+      `Cross-runner needs numbl checked out as a sibling directory:\n` +
+        `  expected: ${numblCliPath}\n` +
+        `Either clone numbl beside this repo, or run\n` +
+        `  npx tsx scripts/sync_from_numbl.ts --apply\n` +
+        `to refresh vendored sources from a known location.`
+    );
+    process.exit(2);
+  }
+
   const argv = process.argv.slice(2);
   const scripts =
     argv.length > 0 ? argv.map(a => resolve(a)) : discoverScripts();

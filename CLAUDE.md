@@ -68,8 +68,8 @@ don't paper over it in mtoc.
 - Synthetic identifiers in generated C use the `_mtoc_` prefix (reserved).
   numbl syntax forbids leading underscores in identifiers; the lowerer also
   defensively rejects user names with that prefix.
-- Specialization mangling: `<funcName>__<8-hex>` where the hex is a SHA-256
-  prefix of the canonicalized argument-type tuple.
+- Specialization mangling: `<funcName>__<8-hex>` where the hex is the
+  FNV-1a 32-bit hash of the canonicalized argument-type tuple.
 
 ## Error attribution
 

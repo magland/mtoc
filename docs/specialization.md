@@ -11,7 +11,7 @@ monomorphized.
    local-function table. The remaining stmts form the script body.
 2. When the lowerer encounters a call to a user function, it lowers the
    arguments, computes their full canonical types, and hashes the tuple into a
-   short suffix (8 hex chars of SHA-256 of the canonicalized type list).
+   short suffix (8 hex chars of FNV-1a 32-bit of the canonicalized type list).
 3. The mangled name is `<funcName>__<hash>`. If a specialization with that name
    already exists in the cache, the call reuses it. Otherwise the lowerer
    recursively lowers the function body in a fresh scope, with each parameter

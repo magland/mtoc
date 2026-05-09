@@ -167,7 +167,7 @@ A handful of _structural_ refinements live alongside the lattice:
 
 `canonicalizeType` produces a deterministic field-ordered representation used
 to hash a function's argument-type tuple into a stable specialization name (8
-hex chars of SHA-256). Together with `typeToString`, it's driven by a
+hex chars of FNV-1a 32-bit). Together with `typeToString`, it's driven by a
 `NUMERIC_FIELDS` table — adding a new `NumericType` field means appending one
 table entry.
 

@@ -384,7 +384,10 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
       if (e.op === "Pow" || e.op === "ElemPow") {
         return `pow(${emitExpr(state, e.left, 0)}, ${emitExpr(state, e.right, 0)})`;
       }
-      throw new Error(`codegen: unsupported binary op ${e.op}`);
+      throw new Error(
+        `codegen internal: unsupported binary op ${e.op}; ` +
+          `should have been caught at lowering`
+      );
     }
 
     case "Unary": {
@@ -394,7 +397,12 @@ function emitExpr(state: EmitState, e: IRExpr, parentPrec: number): string {
         return `(!(creal(${s}) != 0.0 || cimag(${s}) != 0.0))`;
       }
       const cOp = UN_OP_C[e.op];
-      if (!cOp) throw new Error(`codegen: unsupported unary op ${e.op}`);
+      if (!cOp) {
+        throw new Error(
+          `codegen internal: unsupported unary op ${e.op}; ` +
+            `should have been caught at lowering`
+        );
+      }
       const p = precedence(e.op);
       // Parenthesize a nested unary operand to avoid C's `--`/`++` token
       // (e.g. `-(-x)` not `--x`, which would be a decrement).
@@ -927,7 +935,10 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
     case "For": {
       // Step is guaranteed to be a NumLit by lowering.
       if (s.step.kind !== "NumLit") {
-        throw new Error("codegen: for-loop step must be a NumLit");
+        throw new Error(
+          "codegen internal: for-loop step must be a NumLit; " +
+            "should have been caught at lowering"
+        );
       }
       const v = s.cVar;
       const startStr = emitExpr(state, s.start, 0);
@@ -1085,7 +1096,7 @@ function emitTensorAssignFromExpr(
     // RHS shape is genuinely runtime-only (e.g. a future builtin
     // returning a tensor) and the codegen path doesn't handle it yet.
     throw new Error(
-      `codegen: cannot determine runtime shape for elementwise ` +
+      `codegen internal: cannot determine runtime shape for elementwise ` +
         `assignment target '${cTarget}' (rhs ${typeToString(rhs.ty)}); ` +
         `RHS contains no multi-element variable to read shape from`
     );
@@ -1204,7 +1215,10 @@ function emitTensorLitAssign(
   lit: Extract<IRExpr, { kind: "TensorLit" }>
 ): void {
   if (!isNumeric(lit.ty)) {
-    throw new Error("codegen: tensor literal must produce a tensor type");
+    throw new Error(
+      "codegen internal: tensor literal must produce a tensor type; " +
+        "should have been caught at lowering"
+    );
   }
   const ty = lit.ty as NumericType;
   // The IR node carries the literal's row-major nested elements; cell
@@ -1344,7 +1358,8 @@ function emitDeclarations(
       continue;
     }
     throw new Error(
-      `codegen: unsupported declaration for '${cName}': ${typeToString(ty)}`
+      `codegen internal: unsupported declaration for '${cName}': ` +
+        `${typeToString(ty)}; should have been caught at lowering`
     );
   }
 }
