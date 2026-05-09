@@ -13,7 +13,8 @@ import {
   isScalar,
   isNumeric,
   joinSign,
-  matrixDouble,
+  numericType,
+  type DimInfo,
   type NumericType,
   type Sign,
   typeToString,
@@ -79,20 +80,23 @@ export function lowerTensorLiteral(
     }
     elements.push(loweredRow);
   }
+  // The literal's coarse dim shape: each axis is `one` if the literal
+  // has exactly that many cells in that axis, else `notOne`. The
+  // specific size is carried by the IR node's `elements` array;
+  // codegen reads `elements.length` / `elements[0].length` directly.
+  const rowsDim: DimInfo = numRows === 1 ? { kind: "one" } : { kind: "notOne" };
+  const colsDim: DimInfo = numCols === 1 ? { kind: "one" } : { kind: "notOne" };
   // Sign of the literal: the join of every real element's sign. If any
   // cell is complex, the result type's sign is meaningless.
   let ty: NumericType;
   if (isComplex) {
-    ty = {
-      ...matrixDouble(numRows, numCols, "unknown"),
-      isComplex: true,
-    };
+    ty = numericType(rowsDim, colsDim, true, "unknown");
   } else {
     let sign: Sign = elementSigns[0];
     for (let i = 1; i < elementSigns.length; i++) {
       sign = joinSign(sign, elementSigns[i]);
     }
-    ty = matrixDouble(numRows, numCols, sign);
+    ty = numericType(rowsDim, colsDim, false, sign);
   }
   return { kind: "TensorLit", elements, ty, span: e.span };
 }

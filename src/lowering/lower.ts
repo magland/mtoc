@@ -33,12 +33,12 @@ import type {
 } from "./ir.js";
 import {
   isMultiElement,
+  isScalar,
   isScalarReal,
   MType,
   scalarComplex,
   scalarDouble,
   signFromValue,
-  staticNumElements,
   typeToString,
   unify,
 } from "./types.js";
@@ -208,13 +208,30 @@ export class Lowerer {
     return this.currentBindingCName.get(name) ?? cNameFor(name);
   }
 
-  /** Determine whether the unified type can be represented by a single
-   *  predeclared C variable. Numeric types need both dims statically
-   *  exact (so codegen knows the buffer size); Unknown / Void can never
-   *  share storage. */
-  private static canShareStorage(t: MType): boolean {
-    if (t.kind !== "Numeric") return false;
-    return t.rows.kind === "exact" && t.cols.kind === "exact";
+  /** Determine whether `prev` and `next` can share a single predeclared
+   *  C variable. The C representation is determined by category:
+   *  scalar real (`double`), scalar complex (`double _Complex`), or
+   *  multi-element (`mtoc_tensor_t`). Two types share storage only if
+   *  they fall in the same category and agree on `isComplex` — codegen
+   *  picks ONE C type per binding, and a real-tensor predecl can't
+   *  hold a complex-tensor value. Specific size is no longer part of
+   *  the type; tensor reassignments at the same coarse shape free and
+   *  realloc the backing buffer at runtime. */
+  private static canShareStorage(prev: MType, next: MType): boolean {
+    if (prev.kind !== "Numeric" || next.kind !== "Numeric") return false;
+    if (prev.elem !== next.elem) return false;
+    if (prev.isComplex !== next.isComplex) return false;
+    const prevScalar = isScalar(prev);
+    const nextScalar = isScalar(next);
+    const prevMulti = isMultiElement(prev);
+    const nextMulti = isMultiElement(next);
+    // Both must classify into the same category. A type whose dims
+    // include `unknown` may be neither scalar nor multi-element here;
+    // such "could be either" types are forced to split (the C variable
+    // would be ambiguous between `double` and `mtoc_tensor_t`).
+    if (prevScalar && nextScalar) return true;
+    if (prevMulti && nextMulti) return true;
+    return false;
   }
 
   // ── Statements ────────────────────────────────────────────────────────
@@ -245,13 +262,16 @@ export class Lowerer {
    *    signature).
    *  - Compatible reassignment / first assignment — env updates,
    *    `assignedVars` updated under the existing cName (or a fresh one
-   *    for the first write), returns that cName.
-   *  - Incompatible reassignment — the unified type can't live in a
-   *    single C variable (different elem kinds, non-exact dims, etc.).
-   *    At `controlDepth === 0` we split: a fresh cName is allocated and
-   *    a new `assignedVars` entry created; the old binding stays for
-   *    earlier reads. Inside control flow we throw — Phase 2 will lift
-   *    that with liveness analysis. */
+   *    for the first write), returns that cName. After dim coarsening,
+   *    a tensor variable that gets reassigned at a different runtime
+   *    shape stays compatible (same coarse category) — codegen handles
+   *    the shape change via a free + realloc at the assignment site.
+   *  - Incompatible reassignment — the prev and new types can't live
+   *    in a single C variable (different category, e.g. scalar↔tensor
+   *    or real↔complex). At `controlDepth === 0` we split: a fresh
+   *    cName is allocated and a new `assignedVars` entry created; the
+   *    old binding stays for earlier reads. Inside control flow we
+   *    throw — Phase 2 will lift that with liveness analysis. */
   recordAssignment(name: string, ty: MType, span: Span): string {
     assertNotMtocReserved(name, span);
     // env tracks the LATEST type at the current program point —
@@ -293,8 +313,11 @@ export class Lowerer {
     }
 
     const merged = unify(prevBinding.ty, ty);
-    if (Lowerer.canShareStorage(merged)) {
-      // Compatible — widen the existing binding's type in place.
+    if (Lowerer.canShareStorage(prevBinding.ty, ty)) {
+      // Compatible — widen the existing binding's type in place. The
+      // merged type stays consistent with the predeclared C variable's
+      // category (scalar/tensor, real/complex); shape-level coarsening
+      // (e.g. notOne ∨ unknown → unknown) doesn't change the C type.
       this.assignedVars.set(prevBinding.cName, {
         ty: merged,
         cName: prevBinding.cName,
@@ -311,10 +334,11 @@ export class Lowerer {
       return splitCName;
     }
 
-    // The merged-type Unknown branch and the non-exact-dims branch report
-    // different errors today; preserve that distinction so the existing
-    // "use a different name" guidance still kicks in for char/struct
-    // mismatches versus shape conflicts.
+    // The merged-type Unknown branch and the category-mismatch branch
+    // report different errors. `Unknown` from `unify` means an
+    // incompatibility the type system can't bridge (different elem
+    // kinds, etc.); the category-mismatch branch is for scalar↔tensor
+    // and real↔complex changes, where the C representation differs.
     if (merged.kind === "Unknown") {
       throw new TypeError(
         `'${name}' was previously ${typeToString(prevBinding.ty)} and is now ` +
@@ -326,10 +350,10 @@ export class Lowerer {
     }
     throw new UnsupportedConstruct(
       `'${name}' was previously ${typeToString(prevBinding.ty)} and is now ` +
-        `being assigned ${typeToString(ty)}; mtoc requires a fixed shape ` +
-        `across all assignments to a tensor variable inside control flow. ` +
-        `Use a different name for the new value, or hoist the reassignment ` +
-        `outside the surrounding if/while/for.`,
+        `being assigned ${typeToString(ty)}; mtoc requires a single C ` +
+        `category (scalar/tensor, real/complex) for a variable inside ` +
+        `control flow. Use a different name for the new value, or hoist the ` +
+        `reassignment outside the surrounding if/while/for.`,
       span
     );
   }
@@ -412,25 +436,6 @@ export class Lowerer {
 
       case "Assign": {
         const rhs = this.lowerExpr(s.expr);
-        // Reject non-exact dims up front: codegen needs a statically
-        // known numel to emit a stack-backed `mtoc_tensor_t`, and a
-        // multi-element RHS without exact dims has nowhere safe to
-        // land. We surface this at lowering time so the user sees a
-        // span. (TensorLit always has exact dims by construction.)
-        // Done before recordAssignment so this never produces a
-        // never-emit-able split binding.
-        if (
-          isMultiElement(rhs.ty) &&
-          rhs.kind !== "TensorLit" &&
-          staticNumElements(rhs.ty) === null
-        ) {
-          throw new UnsupportedConstruct(
-            `assignment to '${s.name}' produces a tensor with non-exact ` +
-              `dimensions (${typeToString(rhs.ty)}); mtoc requires a ` +
-              `statically-known shape for tensor results`,
-            s.span
-          );
-        }
         const cName = this.recordAssignment(s.name, rhs.ty, s.span);
         return {
           kind: "Assign",

@@ -14,17 +14,21 @@
 export type ElemKind = "double";
 
 /**
- * What we know about a single tensor dimension.
+ * What we know about a single tensor dimension. The lattice is
+ * intentionally coarse: we only track whether the axis is a scalar
+ * broadcast (`one`) or not (`notOne`), or whether we don't know yet
+ * (`unknown`). The specific size is runtime data — codegen reads it
+ * off the `mtoc_tensor_t.rows` / `.cols` fields.
  *
- *   exact n  — fully known, including n=1.
+ *   one      — statically exactly 1 (broadcast axis).
  *   notOne   — provably not 1 (admits 0 for empty tensors and any n≥2);
  *              specific size unknown. The signal `lowerBinary`'s
- *              scalar-vs-matmul dispatch actually cares about: is this
- *              axis a scalar broadcast or not?
+ *              scalar-vs-broadcast dispatch actually cares about: is
+ *              this axis a scalar broadcast or not?
  *   unknown  — nothing known (might be 1, might not).
  */
 export type DimInfo =
-  | { kind: "exact"; n: number }
+  | { kind: "one" }
   | { kind: "notOne" }
   | { kind: "unknown" };
 
@@ -85,8 +89,8 @@ export const SCALAR_DOUBLE: NumericType = {
   kind: "Numeric",
   elem: "double",
   isComplex: false,
-  rows: { kind: "exact", n: 1 },
-  cols: { kind: "exact", n: 1 },
+  rows: { kind: "one" },
+  cols: { kind: "one" },
   sign: "unknown",
 };
 
@@ -102,55 +106,56 @@ export function scalarComplex(): NumericType {
     kind: "Numeric",
     elem: "double",
     isComplex: true,
-    rows: { kind: "exact", n: 1 },
-    cols: { kind: "exact", n: 1 },
+    rows: { kind: "one" },
+    cols: { kind: "one" },
     sign: "unknown",
   };
 }
 
-/** Construct a row-vector type with cols known exactly. */
-export function rowVecDouble(
-  cols: number,
-  sign: Sign = "unknown"
-): NumericType {
+/** Construct a row-vector type. The cols dim is `notOne` (i.e.
+ *  provably ≠ 1); the specific size is runtime data and lives on
+ *  `mtoc_tensor_t.cols` at runtime. */
+export function rowVecDouble(sign: Sign = "unknown"): NumericType {
   return {
     kind: "Numeric",
     elem: "double",
     isComplex: false,
-    rows: { kind: "exact", n: 1 },
-    cols: { kind: "exact", n: cols },
+    rows: { kind: "one" },
+    cols: { kind: "notOne" },
     sign,
   };
 }
 
-/** Construct a column-vector type with rows known exactly. */
-export function colVecDouble(
-  rows: number,
-  sign: Sign = "unknown"
-): NumericType {
+/** Construct a column-vector type. Rows dim is `notOne`; specific
+ *  size is runtime data. */
+export function colVecDouble(sign: Sign = "unknown"): NumericType {
   return {
     kind: "Numeric",
     elem: "double",
     isComplex: false,
-    rows: { kind: "exact", n: rows },
-    cols: { kind: "exact", n: 1 },
+    rows: { kind: "notOne" },
+    cols: { kind: "one" },
     sign,
   };
 }
 
-/** Construct a matrix type with rows × cols known exactly. */
-export function matrixDouble(
-  rows: number,
-  cols: number,
+/** Build a `NumericType` from explicit dim shapes — the general
+ *  factory used by lowerings that compute their own row/col `DimInfo`
+ *  (e.g. `lowerTensorLiteral`). Sign is forced to "unknown" when
+ *  `isComplex` is true (the type-system invariant). */
+export function numericType(
+  rows: DimInfo,
+  cols: DimInfo,
+  isComplex: boolean = false,
   sign: Sign = "unknown"
 ): NumericType {
   return {
     kind: "Numeric",
     elem: "double",
-    isComplex: false,
-    rows: { kind: "exact", n: rows },
-    cols: { kind: "exact", n: cols },
-    sign,
+    isComplex,
+    rows,
+    cols,
+    sign: isComplex ? "unknown" : sign,
   };
 }
 
@@ -160,23 +165,16 @@ export function isNumeric(t: MType): t is NumericType {
   return t.kind === "Numeric";
 }
 
-/** Statically known to equal exactly `n`. `dimIsOne` is the n=1
- *  specialization; this stays for callers that need to pin a specific
- *  size (n>1). */
-export function dimIsExactly(d: DimInfo, n: number): boolean {
-  return d.kind === "exact" && d.n === n;
-}
-
 /** Statically known to be exactly 1 — i.e. broadcastable in this axis. */
 export function dimIsOne(d: DimInfo): boolean {
-  return d.kind === "exact" && d.n === 1;
+  return d.kind === "one";
 }
 
-/** Statically known to NOT be 1 — exact-non-1 or `notOne`. Admits
- *  empty (n=0) and any n≥2 alike; what matters for dispatch is just
- *  "is this a scalar broadcast in this axis or not?" */
+/** Statically known to NOT be 1. Admits empty (n=0) and any n≥2 alike;
+ *  what matters for dispatch is just "is this a scalar broadcast in
+ *  this axis or not?" */
 export function dimIsNotOne(d: DimInfo): boolean {
-  return (d.kind === "exact" && d.n !== 1) || d.kind === "notOne";
+  return d.kind === "notOne";
 }
 
 // Note on shape predicates: these return plain `boolean`, not type
@@ -225,11 +223,14 @@ export function isScalarComplex(t: MType): boolean {
   return isNumeric(t) && isScalar(t) && t.isComplex;
 }
 
-/** Element count when both dims are statically exact, else null. */
+/** Statically known element count, else null. After the dim coarsening
+ *  the only shape with a statically known count is the all-`one`
+ *  shape — i.e. a scalar (count=1). Every other shape's element count
+ *  is runtime data (read off `mtoc_tensor_t.rows * .cols`). */
 export function staticNumElements(t: MType): number | null {
   if (!isNumeric(t)) return null;
-  if (t.rows.kind !== "exact" || t.cols.kind !== "exact") return null;
-  return t.rows.n * t.cols.n;
+  if (isScalar(t)) return 1;
+  return null;
 }
 
 /** The C type used to represent values of this MType in the generated
@@ -358,27 +359,14 @@ export function signDiv(a: Sign, b: Sign): Sign {
 
 // joinDim — least upper bound on the DimInfo lattice. Symmetric.
 //
-//   exact n  ∨ exact n                          → exact n
-//   exact n  ∨ exact m  (n ≠ m, both ≠ 1)       → notOne
-//   exact n  ∨ exact m  (one of them is 1)      → unknown
-//   exact 1  ∨ notOne                           → unknown
-//   exact n  ∨ notOne   (n ≠ 1)                 → notOne
-//   notOne   ∨ notOne                           → notOne
-//   unknown  ∨ _                                → unknown
+//   one      ∨ one      → one
+//   notOne   ∨ notOne   → notOne
+//   one      ∨ notOne   → unknown
+//   unknown  ∨ _        → unknown
 function joinDim(a: DimInfo, b: DimInfo): DimInfo {
   if (a.kind === "unknown" || b.kind === "unknown") return { kind: "unknown" };
-  if (a.kind === "exact" && b.kind === "exact") {
-    if (a.n === b.n) return a;
-    if (a.n !== 1 && b.n !== 1) return { kind: "notOne" };
-    return { kind: "unknown" };
-  }
-  // From here, exactly one of a/b is `notOne` and the other is either
-  // `exact` or `notOne`.
-  if (a.kind === "notOne" && b.kind === "notOne") return { kind: "notOne" };
-  const exact =
-    a.kind === "exact" ? a : (b as Extract<DimInfo, { kind: "exact" }>);
-  if (exact.n === 1) return { kind: "unknown" };
-  return { kind: "notOne" };
+  if (a.kind === b.kind) return a;
+  return { kind: "unknown" };
 }
 
 // ── NumericType field template ───────────────────────────────────────────
@@ -500,8 +488,25 @@ function arithSign(op: ArithKind, a: Sign, b: Sign): Sign {
   }
 }
 
-function dimsEqualExact(a: DimInfo, b: DimInfo): boolean {
-  return a.kind === "exact" && b.kind === "exact" && a.n === b.n;
+/** Pointwise dim compatibility for tensor⊙tensor arithmetic. The only
+ *  categorical incompatibility under the coarse lattice is `one` vs
+ *  `notOne` — provably-1 against provably-not-1 in the same axis;
+ *  that's the rowVec-vs-colVec broadcast case mtoc doesn't support
+ *  yet. Anything involving `unknown` admits a runtime match (the
+ *  type system can't disprove it). Same-kind pairs are compatible. */
+function dimAccept(a: DimInfo, b: DimInfo): boolean {
+  if (a.kind === "one" && b.kind === "notOne") return false;
+  if (a.kind === "notOne" && b.kind === "one") return false;
+  return true;
+}
+
+/** Most-refined of two compatible dims. Assumes `dimAccept(a,b)`. */
+function dimMeet(a: DimInfo, b: DimInfo): DimInfo {
+  if (a.kind === b.kind) return a;
+  if (a.kind === "unknown") return b;
+  if (b.kind === "unknown") return a;
+  // Per dimAccept's contract, the (one, notOne) pair never gets here.
+  return { kind: "unknown" };
 }
 
 /**
@@ -511,10 +516,13 @@ function dimsEqualExact(a: DimInfo, b: DimInfo): boolean {
  *  - scalar ⊙ scalar       → scalar
  *  - scalar ⊙ tensor       → tensor (same shape as the tensor)  — broadcast
  *  - tensor ⊙ scalar       → tensor (same shape as the tensor)  — broadcast
- *  - tensor ⊙ tensor       → only if dims match exactly. Today we
- *                            require both rows and both cols to be
- *                            exact and equal. Returns a tensor of
- *                            that shape.
+ *  - tensor ⊙ tensor       → if dims are pointwise compatible
+ *                            (see `dimAccept`), the result takes the
+ *                            most-refined dim per axis. Categorical
+ *                            mismatches (rowVec + colVec, etc.) reject.
+ *                            Specific size matching is runtime data —
+ *                            not checked here; codegen will pick that
+ *                            up in a follow-up stage.
  *
  * For `Mul`/`Div`, tensor⊙tensor is *not* element-wise in MATLAB —
  * it's matrix multiply / matrix divide. We do not support those yet,
@@ -541,8 +549,8 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
       kind: "Numeric",
       elem: a.elem,
       isComplex,
-      rows: { kind: "exact", n: 1 },
-      cols: { kind: "exact", n: 1 },
+      rows: { kind: "one" },
+      cols: { kind: "one" },
       sign,
     };
   }
@@ -564,15 +572,15 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   // `Mul`/`Div` in the abstract kind too, so we accept those here for
   // same-shape and reject in the lowerer's path that distinguishes
   // `Mul` from `ElemMul`.
-  if (!dimsEqualExact(a.rows, b.rows) || !dimsEqualExact(a.cols, b.cols)) {
+  if (!dimAccept(a.rows, b.rows) || !dimAccept(a.cols, b.cols)) {
     return { kind: "Unknown" };
   }
   return {
     kind: "Numeric",
     elem: a.elem,
     isComplex,
-    rows: a.rows,
-    cols: a.cols,
+    rows: dimMeet(a.rows, b.rows),
+    cols: dimMeet(a.cols, b.cols),
     sign,
   };
 }
@@ -606,7 +614,7 @@ export function canonicalizeType(t: MType): unknown {
 }
 
 function dimToString(d: DimInfo): string {
-  if (d.kind === "exact") return `${d.n}`;
+  if (d.kind === "one") return "1";
   if (d.kind === "notOne") return "≠1";
   return "?";
 }

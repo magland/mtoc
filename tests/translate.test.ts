@@ -66,10 +66,14 @@ describe("translate scalar example", () => {
     );
   });
 
-  it("accepts a row-vector literal (statically-sized)", () => {
+  it("accepts a row-vector literal (dynamic-shape allocation)", () => {
     const c = translate("v = [1 2 3]; disp(v);");
-    expect(c).toContain("mtoc_tensor_t v");
-    expect(c).toContain("v.real[0] = 1.0;");
+    // Predeclared empty; populated and sized at the assignment site.
+    expect(c).toContain("mtoc_tensor_t v = { NULL, NULL, 0, 0 };");
+    expect(c).toContain("_mtoc_new[0] = 1.0;");
+    expect(c).toContain("v.real = _mtoc_new;");
+    expect(c).toContain("v.rows = 1;");
+    expect(c).toContain("v.cols = 3;");
     expect(c).toContain("mtoc_disp_tensor(v);");
   });
 
@@ -125,23 +129,24 @@ describe("translate scalar example", () => {
     );
   });
 
-  it("splits a top-level shape-changing reassignment into two C variables", () => {
-    // v gets two distinct shapes at script top level; the lowerer
-    // allocates a fresh `_mtoc_v__v<N>` binding for the second
-    // assignment so both can coexist in the same scope.
+  it("does not split a tensor reassignment at a different runtime shape", () => {
+    // After dim coarsening, `[1 2 3]` and `[1 2 3 4]` share the same
+    // coarse type (row vector with `cols: notOne`); the second
+    // assignment frees the previous backing and reallocs in place
+    // rather than introducing a fresh `_mtoc_v__v<N>` binding.
     const c = translate("v = [1 2 3];\ndisp(v);\nv = [1 2 3 4];\ndisp(v);\n");
-    expect(c).toMatch(
-      /mtoc_tensor_t v = \{ mtoc_alloc\(3 \* sizeof\(double\)\), NULL, 1, 3 \};/
-    );
-    expect(c).toMatch(
-      /mtoc_tensor_t _mtoc_v__v\d+ = \{ mtoc_alloc\(4 \* sizeof\(double\)\), NULL, 1, 4 \};/
-    );
-    // Both disps are emitted, on the two different bindings.
-    expect(c).toMatch(/mtoc_disp_tensor\(v\);/);
-    expect(c).toMatch(/mtoc_disp_tensor\(_mtoc_v__v\d+\);/);
-    // Each binding gets its own free at scope exit.
-    expect(c).toMatch(/free\(v\.real\);/);
-    expect(c).toMatch(/free\(_mtoc_v__v\d+\.real\);/);
+    expect(c).toContain("mtoc_tensor_t v = { NULL, NULL, 0, 0 };");
+    // No split binding.
+    expect(c).not.toMatch(/_mtoc_v__v/);
+    // Both assignments allocate fresh storage and free the previous one.
+    const allocs =
+      c.match(/_mtoc_new = mtoc_alloc\(\d+ \* sizeof\(double\)\);/g) ?? [];
+    expect(allocs.length).toBeGreaterThanOrEqual(2);
+    const frees = c.match(/free\(v\.real\);/g) ?? [];
+    // Two reassignment-site frees plus the scope-exit free.
+    expect(frees.length).toBe(3);
+    expect(c).toMatch(/v\.cols = 3;/);
+    expect(c).toMatch(/v\.cols = 4;/);
   });
 
   it("splits a scalar→tensor top-level reassignment", () => {
@@ -150,10 +155,14 @@ describe("translate scalar example", () => {
     expect(c).toMatch(/mtoc_tensor_t _mtoc_x__v\d+ /);
   });
 
-  it("still rejects shape-changing reassignment inside control flow", () => {
+  it("still rejects category-changing reassignment inside control flow", () => {
+    // After dim coarsening, two row-vector literals share the same
+    // coarse type, so swapping them inside an `if` is now valid (the
+    // codegen handles the realloc). A scalar↔tensor change still
+    // crosses C categories, so it remains rejected with a span.
     let err: unknown;
     try {
-      translate("v = [1 2 3];\nif 1\n  v = [1 2 3 4];\nend\n");
+      translate("v = 1;\nif 1\n  v = [1 2 3];\nend\n");
     } catch (e) {
       err = e;
     }
@@ -161,7 +170,7 @@ describe("translate scalar example", () => {
     const e = err as { name: string; message: string; span: unknown };
     expect(e.name).toBe("UnsupportedConstruct");
     expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/inside control flow|hoist/i);
+    expect(e.message).toMatch(/control flow|hoist|category/i);
   });
 
   it("does not split when reassigning to a compatible type", () => {
@@ -281,10 +290,10 @@ describe("translate scalar example", () => {
     expect(e.message).toContain("'v'");
   });
 
-  it("emits two distinct specializations when called with two shapes", () => {
-    // Same function called with a 1x3 and a 1x4 arg — each shape lands
-    // on its own mangled hash and so produces a separate static
-    // function body in the emitted C.
+  it("emits a single specialization for two row-vector shapes", () => {
+    // After the dim coarsening, calls with a 1x3 and a 1x4 row-vector
+    // arg both canonicalize to `cols: notOne` — the specific size is
+    // runtime data — so they share a single mangled specialization.
     const c = translate(
       "function s = total(v)\n" +
         "  s = sum(v);\n" +
@@ -297,7 +306,7 @@ describe("translate scalar example", () => {
     const sigRe = /static double total__([0-9a-f]+)\(mtoc_tensor_t v\)/g;
     const hashes = new Set<string>();
     for (const m of c.matchAll(sigRe)) hashes.add(m[1]);
-    expect(hashes.size).toBe(2);
+    expect(hashes.size).toBe(1);
   });
 });
 
@@ -465,8 +474,8 @@ describe("type system invariants", () => {
     kind: "Numeric",
     elem: "double",
     isComplex: true,
-    rows: { kind: "exact", n: 1 },
-    cols: { kind: "exact", n: 1 },
+    rows: { kind: "one" },
+    cols: { kind: "one" },
     sign,
   });
 

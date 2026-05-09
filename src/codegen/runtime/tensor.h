@@ -8,15 +8,18 @@
  * touch the imag side. There is no runtime branch on `imag != NULL`.
  *
  * Scalars never use this struct — real scalars are bare `double`,
- * complex scalars are `double _Complex`. Anything with rows*cols > 1
- * (or with a non-exact dim) gets one `mtoc_tensor_t` value. The data
- * buffers are column-major to match MATLAB / LAPACK.
+ * complex scalars are `double _Complex`. Anything the type system
+ * classifies as multi-element (any axis is `notOne`) gets one
+ * `mtoc_tensor_t` value. The data buffers are column-major to match
+ * MATLAB / LAPACK.
  *
- * For statically-sized tensors today, `real` (and `imag`, when
- * complex) point at stack-allocated arrays declared next to the
- * struct — no heap allocation, no cleanup. When dynamic-size support
- * arrives we will fall back to an arena per call frame; the struct
- * shape stays the same.
+ * Storage is heap-allocated via `mtoc_alloc` at every assignment
+ * site. The struct is predeclared with `real = imag = NULL` and
+ * `rows = cols = 0`; the first assignment populates them, and
+ * subsequent reassignments at a different runtime shape free the
+ * previous buffers and alloc fresh ones. `free` of the predeclared
+ * NULLs is a no-op (well-defined by C), so the cleanup path is
+ * uniform for first and subsequent assignments alike.
  *
  * The `MTOC_RESTRICT` qualifier on the buffer pointers tells the
  * compiler that distinct `mtoc_tensor_t` values' buffers do not

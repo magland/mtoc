@@ -50,29 +50,42 @@ type predicate would have TS narrow `NumericType` to `never` in the false
 branch, which is wrong. Callers needing `NumericType` narrowing should
 `isNumeric(t)` first.
 
-A small set of constructor helpers (`scalarDouble`, `rowVecDouble`,
-`colVecDouble`, `matrixDouble`) keeps lowering call sites short.
+A small set of constructor helpers (`scalarDouble`, `scalarComplex`,
+`rowVecDouble`, `colVecDouble`, and the general `numericType(rows, cols, …)`)
+keeps lowering call sites short. The vec/scalar variants no longer take a
+numeric `n` — dims are categorical and the row/col arity is `one` or `notOne`.
 
 ## DimInfo
 
 ```
 DimInfo =
-  | { kind: "exact"; n }          // statically known size (including n=1)
-  | { kind: "notOne" }            // provably not 1; specific size unknown
-                                  //   (admits empty n=0 and any n≥2)
+  | { kind: "one" }               // statically exactly 1 (broadcast axis)
+  | { kind: "notOne" }            // provably not 1; specific size is runtime
+                                  //   data (admits empty n=0 and any n≥2)
   | { kind: "unknown" }           // nothing known — could be 1, could not be
 ```
 
-The `notOne` rung is the lattice signal `lowerBinary`'s scalar-vs-matmul
-dispatch (and the shape predicates) actually care about: is this axis a scalar
-broadcast or not? It lets a partially-known shape decide instead of falling
-through to a conservative reject.
+The lattice is intentionally coarse: it tracks only what's invariant under
+runtime variation. A row vector's `cols` axis is `notOne` (≥ 2 or 0) regardless
+of whether the actual length is 3 or 4; the size lives on
+`mtoc_tensor_t.cols` at runtime. `lowerBinary`'s scalar-vs-broadcast dispatch
+(and the shape predicates) only ever care about the categorical question
+"is this axis a scalar broadcast?" — which the three-state lattice answers
+directly.
 
-Today every successfully-codegen'd tensor has both dims `exact` (dynamic-size
-tensors aren't supported yet — the lowerer surfaces a clear error when a
-type-merge would widen past `exact`). `notOne` shows up at lattice joins and
-will become reachable to codegen once partial-shape inputs (function params,
-slice results) are wired through.
+Codegen consumes the coarse dims to pick the C representation
+(`isScalar` ⇒ `double` / `double _Complex`; `isMultiElement` ⇒
+`mtoc_tensor_t`). Specific row/col counts are read from
+`mtoc_tensor_t.rows` / `.cols` at runtime — for tensor literals, the
+lowering pass attaches the source-level cell counts to the IR's
+`TensorLit.elements`, and codegen emits those as static integers at
+the assignment site.
+
+Specialization-key collapse falls out of this. Two calls
+`total([1 2 3])` and `total([1 2 3 4])` canonicalize to the same
+argument-type tuple (`one × notOne` row vector) and so share a single
+emitted `total__<hash>` function body. The runtime size flows through
+the `mtoc_tensor_t` struct.
 
 ## Sign
 
@@ -105,7 +118,10 @@ A handful of _structural_ refinements live alongside the lattice:
   "this variable can't share one C storage location" error.
 - **`arithResult(op, a, b)`** — result of `+ - * /` (and elementwise
   variants). Handles scalar⊙scalar, scalar↔tensor broadcast, and tensor⊙tensor
-  with matching exact dims. Reserved for the future: tensor⊙tensor with `*` /
+  with pointwise dim-compatible inputs. Categorical mismatches (e.g. rowVec +
+  colVec) are rejected at lowering; specific runtime sizes are NOT checked at
+  lowering — they're runtime data and a future stage will add an
+  `mtoc_check_shape` helper. Reserved for the future: tensor⊙tensor with `*` /
   `/` (matrix multiply / divide) is an explicit unsupported case in lowering.
 - **`mergeBranchEnvs(envs, span, construct)`** — joins multiple post-arm envs
   at an `if`/`while`/`for` exit. Variables present in only some arms unify

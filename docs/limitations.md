@@ -25,10 +25,23 @@ workaround or a roadmap note.
 
 ## Tensors
 
-- **Dimensions must be statically exact.** `v = [1 2 3]` works; `v = zeros(N,
-M)` with runtime `N`/`M` doesn't yet (the lowering surfaces a clear error).
-  Dynamic sizing is the next major tensor milestone — its plan is a
-  per-function arena allocator that keeps the `mtoc_tensor_t` shape unchanged.
+- **Tensor dims are categorical, not exact.** The type lattice tracks
+  whether an axis is `one` (broadcast), `notOne` (≥2 or 0), or `unknown`;
+  the specific size lives at runtime on `mtoc_tensor_t.rows` / `.cols`.
+  This collapses specializations across same-shape-category calls
+  (`total([1 2 3])` and `total([1 2 3 4])` share one mangled function)
+  and lets a tensor variable take on different runtime shapes via free +
+  realloc at the assignment site.
+- **No runtime shape-mismatch check yet.** Categorical mismatches
+  (rowVec + colVec) are rejected at lowering, but a same-category
+  pair with different runtime sizes (e.g. `[1 2 3] + [4 5]`) is
+  accepted at lowering and produces undefined behavior or a crash at
+  runtime. A follow-up stage will add an `mtoc_check_shape` runtime
+  helper that traps the mismatch with a clear diagnostic.
+- **Builtins for runtime-shape allocation aren't here yet.**
+  `zeros(N, M)`, `ones(N, M)`, etc. with a runtime size still raise
+  `UnsupportedConstruct`. The codegen path for dynamic-shape allocation
+  is in place — only the builtin signatures and runtime helpers remain.
 - **Tensor sub-expressions only at `Assign` RHS.** `disp(a + b)` and
   `sum(a .* a)` fail with a clear "assign to a temp first" message.
   Auto-materialization of tensor temporaries during lowering is a known TODO.

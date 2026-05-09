@@ -20,7 +20,6 @@ import {
   isScalarComplex,
   isScalarReal,
   isNumeric,
-  staticNumElements,
   typeToString,
   type NumericType,
 } from "../lowering/types.js";
@@ -509,7 +508,7 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         break;
       }
       if (isNumeric(s.ty) && isMultiElement(s.ty) && s.ty.elem === "double") {
-        emitElemwiseLoop(state, level, s.cName, s.rhs);
+        emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
         break;
       }
       throw new Error(
@@ -650,35 +649,88 @@ function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   }
 }
 
-/** Emit a per-element loop that walks an `Assign`'s multi-element
- *  RHS once per slot. The body expression is rendered with the loop's
- *  iter name pushed onto `state.iterStack` so multi-element `Var`s
- *  inside it read `<varCName>.real[<iter>]` (see `emitExpr.Var`).
- *  Scalar `Var`s and `NumLit`s broadcast unchanged. The loop is
- *  wrapped in a `{}` block so `_mtoc_n` is scoped per Assign; the
- *  iter name itself is fresh per call (counter on EmitState) so
- *  nested elementwise loops never shadow each other. */
-function emitElemwiseLoop(
+/** Walk an IR expression and return the first multi-element `Var`
+ *  encountered — the "shape source" for an elementwise assign whose
+ *  RHS isn't a TensorLit. After the dim coarsening, the assignment-
+ *  site allocation reads its size and rows/cols from this Var at
+ *  runtime. Returns null if no multi-element Var is reachable; in
+ *  practice every multi-element non-TensorLit RHS that the lowerer
+ *  accepts contains at least one such Var (TensorLit is rejected
+ *  nested, and Calls don't return tensors). */
+function findShapeSourceVar(
+  e: IRExpr
+): Extract<IRExpr, { kind: "Var" }> | null {
+  switch (e.kind) {
+    case "Var":
+      return isMultiElement(e.ty) ? e : null;
+    case "Binary": {
+      const left = findShapeSourceVar(e.left);
+      if (left) return left;
+      return findShapeSourceVar(e.right);
+    }
+    case "Unary":
+      return findShapeSourceVar(e.operand);
+    case "Call":
+      for (const a of e.args) {
+        const v = findShapeSourceVar(a);
+        if (v) return v;
+      }
+      return null;
+    case "NumLit":
+    case "ImagLit":
+    case "TensorLit":
+      return null;
+  }
+}
+
+/** Emit an Assign whose multi-element RHS is NOT a TensorLit. Pattern:
+ *  read shape from a deterministic shape-source `Var`, allocate a
+ *  fresh staging buffer (so reads from the target inside the body
+ *  see the OLD buffer — important when the RHS aliases the target,
+ *  e.g. `M = M + 1`), evaluate the body into the staging buffer,
+ *  free the previous backing, then swap. Wrapped in `{}` so the
+ *  staging-buffer locals are scoped per Assign. */
+function emitTensorAssignFromExpr(
   state: EmitState,
   level: number,
   cTarget: string,
   rhs: IRExpr
 ): void {
-  const numel = staticNumElements(rhs.ty);
-  if (numel === null) {
-    // Lowering rejects non-exact dims for multi-element Assign RHSs,
-    // so reaching here means the lowerer let one through.
+  const src = findShapeSourceVar(rhs);
+  if (src === null) {
+    // The lowerer accepts every multi-element non-TensorLit RHS by
+    // construction; if we couldn't find a Var to read shape off, the
+    // RHS shape is genuinely runtime-only (e.g. a future builtin
+    // returning a tensor) and the codegen path doesn't handle it yet.
     throw new Error(
-      `codegen internal: elementwise assign target '${cTarget}' has ` +
-        `non-exact dims (${typeToString(rhs.ty)}); should have been ` +
-        `rejected at lowering`
+      `codegen: cannot determine runtime shape for elementwise ` +
+        `assignment target '${cTarget}' (rhs ${typeToString(rhs.ty)}); ` +
+        `RHS contains no multi-element variable to read shape from`
     );
   }
+  useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
+  useRuntime(state, "mtoc_alloc", MTOC_ALLOC);
+
   const iterId = state.elemwiseLoopCounter++;
   const iterName = iterId === 0 ? "_mtoc_i" : `_mtoc_i${iterId}`;
   const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
+
   pushStmt(state, level, `{`);
-  pushStmt(state, level + 1, `long _mtoc_n = ${numel};`);
+  pushStmt(state, level + 1, `long _mtoc_rows = ${src.cName}.rows;`);
+  pushStmt(state, level + 1, `long _mtoc_cols = ${src.cName}.cols;`);
+  pushStmt(state, level + 1, `long _mtoc_n = _mtoc_rows * _mtoc_cols;`);
+  pushStmt(
+    state,
+    level + 1,
+    `double *_mtoc_new = mtoc_alloc(_mtoc_n * sizeof(double));`
+  );
+  if (isComplex) {
+    pushStmt(
+      state,
+      level + 1,
+      `double *_mtoc_new_im = mtoc_alloc(_mtoc_n * sizeof(double));`
+    );
+  }
   pushStmt(
     state,
     level + 1,
@@ -688,34 +740,36 @@ function emitElemwiseLoop(
   const bodyStr = emitExpr(state, rhs, 0);
   state.iterStack.pop();
   if (isComplex) {
-    // Complex elementwise body: stash through a `double _Complex`
-    // temp so the body is evaluated once, then split with creal /
-    // cimag into the parallel real / imag buffers. Real-typed
-    // sub-exprs in the body promote to complex via C99 implicit rules.
     pushStmt(state, level + 2, `double _Complex _mtoc_t = ${bodyStr};`);
-    pushStmt(
-      state,
-      level + 2,
-      `${cTarget}.real[${iterName}] = creal(_mtoc_t);`
-    );
-    pushStmt(
-      state,
-      level + 2,
-      `${cTarget}.imag[${iterName}] = cimag(_mtoc_t);`
-    );
+    pushStmt(state, level + 2, `_mtoc_new[${iterName}] = creal(_mtoc_t);`);
+    pushStmt(state, level + 2, `_mtoc_new_im[${iterName}] = cimag(_mtoc_t);`);
   } else {
-    pushStmt(state, level + 2, `${cTarget}.real[${iterName}] = ${bodyStr};`);
+    pushStmt(state, level + 2, `_mtoc_new[${iterName}] = ${bodyStr};`);
   }
   pushStmt(state, level + 1, `}`);
+  // Free the previous backing buffers (NULL on first assignment, valid
+  // on subsequent reassignments). Both `free(NULL)` and `free` of a
+  // valid buffer are well-defined.
+  pushStmt(state, level + 1, `free(${cTarget}.real);`);
+  if (isComplex) {
+    pushStmt(state, level + 1, `free(${cTarget}.imag);`);
+  }
+  pushStmt(state, level + 1, `${cTarget}.real = _mtoc_new;`);
+  if (isComplex) {
+    pushStmt(state, level + 1, `${cTarget}.imag = _mtoc_new_im;`);
+  }
+  pushStmt(state, level + 1, `${cTarget}.rows = _mtoc_rows;`);
+  pushStmt(state, level + 1, `${cTarget}.cols = _mtoc_cols;`);
   pushStmt(state, level, `}`);
 }
 
-/** Emit element-by-element column-major writes for a tensor literal
- *  assignment. The target's storage was set up by predeclaration, so
- *  we just write into `<name>.real[idx]` (and, for a complex literal,
- *  `<name>.imag[idx]`). The literal's element rows are nested
- *  row-major as written in source — we re-order to column-major when
- *  computing the linear index. */
+/** Emit a tensor-literal assignment. After the dim coarsening, the
+ *  predeclared `mtoc_tensor_t` carries NULL buffers / 0 dims; the
+ *  assignment site allocates a fresh staging buffer, populates it
+ *  in column-major order, then frees the previous backing and swaps.
+ *  Using a staging buffer (rather than writing directly to
+ *  `<target>.real`) keeps cell expressions that read from the target
+ *  (e.g. `M = [1, sum(M)]`) seeing the OLD buffer until the swap. */
 function emitTensorLitAssign(
   state: EmitState,
   level: number,
@@ -726,13 +780,29 @@ function emitTensorLitAssign(
     throw new Error("codegen: tensor literal must produce a tensor type");
   }
   const ty = lit.ty as NumericType;
-  if (ty.rows.kind !== "exact" || ty.cols.kind !== "exact") {
-    throw new Error(
-      `codegen: tensor literal with non-exact dims (got ${typeToString(ty)})`
+  // The IR node carries the literal's row-major nested elements; cell
+  // counts come straight off that array (independent of the type's
+  // coarse dim shape). Columns are uniform by lowerTensorLiteral's
+  // row-uniformity check.
+  const rows = lit.elements.length;
+  const cols = rows > 0 ? lit.elements[0].length : 0;
+  const numel = rows * cols;
+  useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
+  useRuntime(state, "mtoc_alloc", MTOC_ALLOC);
+
+  pushStmt(state, level, `{`);
+  pushStmt(
+    state,
+    level + 1,
+    `double *_mtoc_new = mtoc_alloc(${numel} * sizeof(double));`
+  );
+  if (ty.isComplex) {
+    pushStmt(
+      state,
+      level + 1,
+      `double *_mtoc_new_im = mtoc_alloc(${numel} * sizeof(double));`
     );
   }
-  const rows = ty.rows.n;
-  const cols = ty.cols.n;
   for (let c = 0; c < cols; c++) {
     for (let r = 0; r < rows; r++) {
       const cellExpr = lit.elements[r][c];
@@ -740,8 +810,8 @@ function emitTensorLitAssign(
       if (!ty.isComplex) {
         pushStmt(
           state,
-          level,
-          `${target}.real[${idx}] = ${emitExpr(state, cellExpr, 0)};`
+          level + 1,
+          `_mtoc_new[${idx}] = ${emitExpr(state, cellExpr, 0)};`
         );
         continue;
       }
@@ -754,22 +824,23 @@ function emitTensorLitAssign(
       //     temporary `double _Complex` and use creal / cimag. This
       //     covers nested complex Binary/Unary/Var cells.
       // Real-typed but not-NumLit cells (e.g. `x` where x is real
-      // scalar) write the cell expression to `.real` and 0 to `.imag`.
+      // scalar) write the cell expression to `_mtoc_new` and 0 to
+      // `_mtoc_new_im`.
       if (cellExpr.kind === "NumLit") {
         pushStmt(
           state,
-          level,
-          `${target}.real[${idx}] = ${formatNumLit(cellExpr.value)};`
+          level + 1,
+          `_mtoc_new[${idx}] = ${formatNumLit(cellExpr.value)};`
         );
-        pushStmt(state, level, `${target}.imag[${idx}] = 0.0;`);
+        pushStmt(state, level + 1, `_mtoc_new_im[${idx}] = 0.0;`);
         continue;
       }
       if (cellExpr.kind === "ImagLit") {
-        pushStmt(state, level, `${target}.real[${idx}] = 0.0;`);
+        pushStmt(state, level + 1, `_mtoc_new[${idx}] = 0.0;`);
         pushStmt(
           state,
-          level,
-          `${target}.imag[${idx}] = ${formatNumLit(cellExpr.value)};`
+          level + 1,
+          `_mtoc_new_im[${idx}] = ${formatNumLit(cellExpr.value)};`
         );
         continue;
       }
@@ -778,10 +849,10 @@ function emitTensorLitAssign(
         // Real scalar expression; promotes to (cell, 0i).
         pushStmt(
           state,
-          level,
-          `${target}.real[${idx}] = ${emitExpr(state, cellExpr, 0)};`
+          level + 1,
+          `_mtoc_new[${idx}] = ${emitExpr(state, cellExpr, 0)};`
         );
-        pushStmt(state, level, `${target}.imag[${idx}] = 0.0;`);
+        pushStmt(state, level + 1, `_mtoc_new_im[${idx}] = 0.0;`);
         continue;
       }
       // Generic complex cell: stash into a temp and split with
@@ -789,22 +860,35 @@ function emitTensorLitAssign(
       // adjacent cells don't collide.
       const tmp = `_mtoc_t${state.elemwiseLoopCounter++}`;
       const cellStr = emitExpr(state, cellExpr, 0);
-      pushStmt(state, level, `{`);
-      pushStmt(state, level + 1, `double _Complex ${tmp} = ${cellStr};`);
-      pushStmt(state, level + 1, `${target}.real[${idx}] = creal(${tmp});`);
-      pushStmt(state, level + 1, `${target}.imag[${idx}] = cimag(${tmp});`);
-      pushStmt(state, level, `}`);
+      pushStmt(state, level + 1, `{`);
+      pushStmt(state, level + 2, `double _Complex ${tmp} = ${cellStr};`);
+      pushStmt(state, level + 2, `_mtoc_new[${idx}] = creal(${tmp});`);
+      pushStmt(state, level + 2, `_mtoc_new_im[${idx}] = cimag(${tmp});`);
+      pushStmt(state, level + 1, `}`);
     }
   }
+  // Free the previous backings (NULL on first assignment) and swap in
+  // the freshly populated buffers + new dims.
+  pushStmt(state, level + 1, `free(${target}.real);`);
+  if (ty.isComplex) {
+    pushStmt(state, level + 1, `free(${target}.imag);`);
+  }
+  pushStmt(state, level + 1, `${target}.real = _mtoc_new;`);
+  if (ty.isComplex) {
+    pushStmt(state, level + 1, `${target}.imag = _mtoc_new_im;`);
+  }
+  pushStmt(state, level + 1, `${target}.rows = ${rows};`);
+  pushStmt(state, level + 1, `${target}.cols = ${cols};`);
+  pushStmt(state, level, `}`);
 }
 
 /** Emit predeclarations for a {cName → VarBinding} table. Scalars
  *  become `double <cName> = 0.0;` (real) or `double _Complex <cName> = 0.0;`
- *  (complex). Multi-element real tensors get an `mtoc_tensor_t <cName>`
- *  whose `real` is heap-allocated via `mtoc_alloc(numel * sizeof(double))`
- *  and whose `imag` is NULL. Multi-element complex tensors additionally
- *  allocate a parallel `imag` buffer the same way. Activates the
- *  `mtoc_tensor_t` typedef and `mtoc_alloc` helper snippets whenever
+ *  (complex). Multi-element tensors are predeclared empty
+ *  (`mtoc_tensor_t <cName> = { NULL, NULL, 0, 0 };`); the assignment
+ *  site allocates `<cName>.real` (and `<cName>.imag` for complex) and
+ *  populates `.rows` / `.cols` from the actual runtime shape, freeing
+ *  any prior backing. Activates the `mtoc_tensor_t` typedef whenever
  *  any tensor is declared. Cleanup is paired in `emitScopeExitFrees`,
  *  which is invoked at every `return` site (script end, function end,
  *  and `IRStmt.ReturnFromFunction`). */
@@ -828,32 +912,8 @@ function emitDeclarations(
       continue;
     }
     if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
-      const numel = staticNumElements(ty);
-      if (numel === null) {
-        throw new Error(
-          `codegen internal: variable '${cName}' has dynamic dimensions ` +
-            `(${typeToString(ty)}); should have been rejected at lowering`
-        );
-      }
       useRuntime(state, "mtoc_tensor_t", MTOC_TENSOR_STRUCT);
-      useRuntime(state, "mtoc_alloc", MTOC_ALLOC);
-      const r = (ty.rows as { kind: "exact"; n: number }).n;
-      const c = (ty.cols as { kind: "exact"; n: number }).n;
-      const reAlloc = `mtoc_alloc(${numel} * sizeof(double))`;
-      if (ty.isComplex) {
-        const imAlloc = `mtoc_alloc(${numel} * sizeof(double))`;
-        pushStmt(
-          state,
-          level,
-          `mtoc_tensor_t ${cName} = { ${reAlloc}, ${imAlloc}, ${r}, ${c} };`
-        );
-      } else {
-        pushStmt(
-          state,
-          level,
-          `mtoc_tensor_t ${cName} = { ${reAlloc}, NULL, ${r}, ${c} };`
-        );
-      }
+      pushStmt(state, level, `mtoc_tensor_t ${cName} = { NULL, NULL, 0, 0 };`);
       continue;
     }
     throw new Error(

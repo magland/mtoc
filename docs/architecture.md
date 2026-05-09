@@ -75,13 +75,16 @@ Lowering does several jobs in one walk:
   reassignment inside a branch falls through to an error rather than the
   variable-splitting path (next bullet).
 - **Variable splitting**: at top level (`controlDepth === 0`), if a
-  reassignment's new type can't share a single C variable with the prior
-  binding (Unknown unify, or non-exact dims after widening), the lowerer
-  allocates a fresh `_mtoc_<cName>__v<N>` C identifier and starts a new
-  `assignedVars` entry. Subsequent reads of the same MATLAB name resolve
-  to the new binding via `currentBindingCName`. Inside control flow the
-  same conflict throws, with a message pointing the user at hoisting or
-  renaming.
+  reassignment's new type can't share a single C variable with the
+  prior binding (different category — scalar↔tensor or real↔complex),
+  the lowerer allocates a fresh `_mtoc_<cName>__v<N>` C identifier and
+  starts a new `assignedVars` entry. Subsequent reads of the same
+  MATLAB name resolve to the new binding via `currentBindingCName`.
+  Two assignments at the same coarse type (e.g. two row vectors at
+  different runtime sizes) DO share storage — the codegen handles the
+  shape change at the assignment site via free + realloc. Inside
+  control flow the category-change conflict throws, with a message
+  pointing the user at hoisting or renaming.
 - **C-name mangling**: every `IRExpr.Var` / `IRStmt.Assign` / `IRFunction` param
   / loop-counter carries a `cName` field computed once via `cNameFor`. Codegen
   never re-mangles. The synthetic prefix `_mtoc_` is reserved.
@@ -114,14 +117,17 @@ Responsibilities:
 
 - Activate runtime helpers on demand (one walk; see "Runtime" below).
 - Predeclare every `assignedVars` entry at the top of `main()` and inside each
-  function body (scalars as `double x = 0.0;`, real tensors as
-  `mtoc_tensor_t <name> = { mtoc_alloc(N * sizeof(double)), NULL, R, C };`,
-  complex tensors as
-  `mtoc_tensor_t <name> = { mtoc_alloc(N * sizeof(double)), mtoc_alloc(N * sizeof(double)), R, C };`).
-  Tensor storage is uniformly heap-allocated via the `mtoc_alloc` helper;
-  paired `free(<name>.real)` (and `.imag` for complex) calls are emitted
-  before every `return` site so the cleanup path is exercised by every
-  test, not just large ones.
+  function body. Scalars: `double x = 0.0;` (real) or
+  `double _Complex z = 0.0;` (complex). Tensors are predeclared empty —
+  `mtoc_tensor_t v = { NULL, NULL, 0, 0 };` — and the assignment site
+  allocates the backing buffer via `mtoc_alloc`, populates `.rows` /
+  `.cols` from the runtime shape, and frees the previous backing
+  before installing the new one. (`free(NULL)` is well-defined, so the
+  first assignment's free is a no-op and subsequent reassignments
+  reclaim the prior buffer in place — even at a different shape.)
+  Paired `free(<name>.real)` (and `.imag` for complex) calls are
+  emitted before every `return` site so the cleanup path is exercised
+  by every test, not just large ones.
 - Emit user-function specializations ahead of `main`, each with a header
   comment showing the source span and the inferred type signature.
 - Map operators to C with a precedence-aware printer; nested unary operands
