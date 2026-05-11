@@ -2,15 +2,23 @@
  * Unary-expression lowering. Folds literal-targeted unaries at lowering
  * time (so `-3` lowers as `NumLit(-3)`, not `Unary(Minus, NumLit(3))`)
  * and propagates the sign lattice on tensor operands.
+ *
+ * `NonConjugateTranspose` (`.'`) takes a separate path: scalar inputs
+ * fold to the operand (transpose is identity on scalars); 2-D tensor
+ * inputs lower to a synthetic `Call` IR node carrying a one-shot
+ * `BuiltinSig` that emits `mtoc_tensor_transpose(...)` (or its complex
+ * sibling). The `producesOwnedDirectly` flag routes the Call through
+ * the same ANF / owned-LHS Assign pipeline as `reshape`.
  */
 
-import type { Expr, UnaryOperation as UnOp } from "../parser/index.js";
+import type { Expr, Span, UnaryOperation as UnOp } from "../parser/index.js";
 import { UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
   isHigherDim,
   isMultiElement,
   isNumeric,
+  isScalar,
   numericTypeND,
   scalarDouble,
   signFromValue,
@@ -18,12 +26,14 @@ import {
   type MType,
   typeToString,
 } from "./types.js";
+import type { BuiltinSig } from "../workspace/builtins.js";
 import type { Lowerer } from "./lower.js";
 
 const SUPPORTED_UN_OPS: ReadonlySet<UnOp> = new Set([
   "Plus",
   "Minus",
   "Not",
+  "NonConjugateTranspose",
 ] as UnOp[]);
 
 export function lowerUnary(
@@ -42,6 +52,9 @@ export function lowerUnary(
       `unary ${e.op} on ${typeToString(operand.ty)} is not yet supported`,
       e.span
     );
+  }
+  if (e.op === "NonConjugateTranspose") {
+    return lowerNonConjugateTranspose(operand, e.span);
   }
   // Complex `Plus`/`Minus` are valid scalar arithmetic (`+z` identity,
   // `-z` flips both parts). Complex `Not` is the toBool path: `~z` is
@@ -104,4 +117,71 @@ export function lowerUnary(
     }
   }
   return { kind: "Unary", op: e.op, operand, ty, span: e.span };
+}
+
+/** Lower `<operand>.'` for a numeric operand. Scalar inputs (including
+ *  complex and char scalars) fold to the operand unchanged — transpose
+ *  is the identity on a 1×1 value. Multi-element 2-D tensor inputs
+ *  lower to a `Call` to `mtoc_tensor_transpose` / its complex sibling.
+ *  N-D (ndim > 2) and char arrays are rejected — those numbl runtime
+ *  branches have unstable / underspecified behavior (char arrays are
+ *  returned unchanged in numbl today; cross-runner parity isn't
+ *  reachable until that's resolved upstream). */
+function lowerNonConjugateTranspose(operand: IRExpr, span: Span): IRExpr {
+  // Scalar (real, complex, or char): identity.
+  if (isScalar(operand.ty)) {
+    return { ...operand, span };
+  }
+  // Operand is numeric (lowerUnary already gated on that) and not a
+  // scalar, so it's a multi-element tensor.
+  if (!isNumeric(operand.ty)) {
+    throw new UnsupportedConstruct(
+      `.' on ${typeToString(operand.ty)} is not yet supported`,
+      span
+    );
+  }
+  if (operand.ty.elem === "char") {
+    throw new UnsupportedConstruct(
+      `.' on a char array is not yet supported`,
+      span
+    );
+  }
+  if (isHigherDim(operand.ty)) {
+    throw new UnsupportedConstruct(
+      `.' on a tensor with ndim > 2 is not yet supported`,
+      span
+    );
+  }
+  const [d0, d1] = operand.ty.dims;
+  const isComplex = operand.ty.isComplex;
+  const resultTy = numericTypeND([d1, d0], isComplex, operand.ty.sign);
+  const helper = isComplex
+    ? "mtoc_tensor_transpose_complex"
+    : "mtoc_tensor_transpose";
+  const sig: BuiltinSig = {
+    name: "transpose",
+    category: "expr",
+    params: [
+      {
+        shape: "tensor",
+        domain: null,
+        elem: "double",
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => resultTy,
+    emit: (argStrs, _argTys, state) => {
+      state.useRuntime(helper);
+      return `${helper}(${argStrs[0]})`;
+    },
+    producesOwnedDirectly: true,
+  };
+  return {
+    kind: "Call",
+    name: "transpose",
+    callee: { kind: "builtin", sig },
+    args: [operand],
+    ty: resultTy,
+    span,
+  };
 }

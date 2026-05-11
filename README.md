@@ -72,7 +72,8 @@ becomes IR. `BuiltinSig` closures (in call targets) are stubbed as
 
 The subset is growing iteratively. Roughly:
 
-- Scalars: arithmetic, comparisons, logicals, unary `+ - !`
+- Scalars: arithmetic, comparisons, logicals, unary `+ - !`,
+  non-conjugate transpose `.'` (identity on scalars)
 - Constants: `pi`, `eps`, `Inf`, `NaN`, `realmax`, `realmin`, `true`, `false`
 - Control flow: `if` / `elseif` / `else`, `while`, `for k = a:b` (and `a:s:b`),
   `break`, `continue`, `return`
@@ -137,6 +138,9 @@ The subset is growing iteratively. Roughly:
   [docs/limitations.md](docs/limitations.md)
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
+- Non-conjugate transpose `.'` on 2-D real / complex tensors. The imag
+  lane is reordered but not negated (that's `'` — conjugate transpose,
+  not yet wired). Char arrays and `ndim > 2` are rejected at lowering
 - Index reads:
   - **Scalar** on any multi-element tensor (real / complex / char):
     `v(i)`, `M(i, j)`, `T(i, j, k)`, `v(end)`, `M(end, end)`. Two
