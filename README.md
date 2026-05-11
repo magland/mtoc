@@ -101,6 +101,12 @@ The subset is growing iteratively. Roughly:
   and N-output functions can also be invoked as bare statements
   `foo(x);`. Tensor / char / string params are owned by the callee
   under copy-on-arg-pass — the body can reassign them freely
+- Function-file entry: a `.m` file with only function definitions
+  (no top-level script statements) is translated by treating the
+  first function's body as the script. The entry function must take
+  zero parameters; the remaining functions register as ordinary
+  locals callable from the entry. Matches numbl, which calls the
+  first function with no args when the file has no script body
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
 - Index reads:
