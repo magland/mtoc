@@ -125,6 +125,16 @@ The subset is growing iteratively. Roughly:
   zero parameters; the remaining functions register as ordinary
   locals callable from the entry. Matches numbl, which calls the
   first function with no args when the file has no script body
+- Cross-file user functions. A call like `helper(x)` resolves to the
+  primary function of a sibling `helper.m` in the same directory.
+  Resolution is delegated to numbl's vendored `functionResolve.ts`
+  (see [docs/architecture.md](docs/architecture.md)), so the
+  precedence and "filename wins" rules match numbl exactly. The CLI
+  auto-scans `dirname(entry)` for workspace files; the web IDE
+  treats every project file as a workspace sibling. Advanced cases
+  (`+pkg/`, `@Cls/`, `private/`, `import`) raise a clear
+  `UnsupportedConstruct` at the call site in v1 — see
+  [docs/limitations.md](docs/limitations.md)
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
 - Index reads:

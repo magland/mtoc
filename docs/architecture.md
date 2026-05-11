@@ -223,10 +223,12 @@ Helpers are activated on-demand; only what's used appears in the output.
 
 `translateProject(files, activeName, opts?)` is the single composed entry
 point used by both the CLI and the web IDE. It accepts a multi-file project
-(though only the active file is lowered today; cross-file resolution isn't
-wired) and returns `{c} | {error}` — never throws on user-program errors.
-Errors from all three stages (`SyntaxError`, `UnsupportedConstruct`,
-`TypeError`) are normalized into one `TranslateError` shape with optional
+and returns `{c} | {error}` — never throws on user-program errors.
+Cross-file resolution is live: a call to `helper(x)` in the entry file
+resolves to the primary function of a sibling `helper.m` per numbl's
+MATLAB-faithful rules (see "Workspace" below). Errors from all three
+stages (`SyntaxError`, `UnsupportedConstruct`, `TypeError`) are
+normalized into one `TranslateError` shape with optional
 `{startOffset, endOffset, fileName}` for editor-marker placement.
 
 ### CLI (`src/cli.ts`)
@@ -237,15 +239,59 @@ A thin shell over `translateProject`. Two subcommands:
 - `run <in.m>` — translate to a temp directory, invoke `cc` (or `$CC`), exec
   the binary, stream stdout/stderr through. Exit code propagates.
 
+When the CLI translates an entry file, it scans `dirname(entry)` for
+sibling `.m` workspace files using numbl's vendored `scanMFiles` (the
+same scan numbl's own CLI runs) and hands the file list to
+`translateProject`. Workspace-function names are derived from each
+file's basename by stripping the search-path prefix.
+
 ## Workspace (`src/workspace/`)
 
-A small registry layer sitting between the parser and the lowerer.
+A small registry layer sitting between the parser and the lowerer. The
+heavy lifting — function-name indexing, MATLAB precedence,
+`+pkg/`/`@Cls/`/`private/` directory recognition — is delegated to a
+vendored copy of numbl's resolver (`src/numbl-core/`, see below).
 
-- `Workspace` — file table, local-function table, `resolve(name)` which routes
-  to either the builtin registry or a user-function entry.
+- `Workspace` — thin adapter over numbl's `LoweringContext`. Tracks the
+  main file, the search paths used to derive workspace-function names,
+  and a side cache of `{name → source}` for codegen header comments.
+  `resolve(name, callSite, span)` delegates to
+  `numbl-core/functionResolve.ts::resolveFunction` and translates the
+  rich result back into mtoc's narrow `{kind: "userFunction" | "builtin"}`
+  shape. Unsupported kinds (class methods, private functions, JS user
+  functions, package-qualified calls) fail with a span-attributed
+  `UnsupportedConstruct` at the call site — the v1 fence-posts.
 - `builtins.ts` — typed builtin signature DSL (`BuiltinSig` with
   `params`, `result`, `emit`). See `builtins.md` and `extending.md`.
 - `constants.ts` — the `pi` / `eps` / `Inf` / `NaN` / `true` / `false` table.
+
+### Vendored numbl resolver (`src/numbl-core/`)
+
+A handful of numbl's own resolution sources are vendored verbatim and
+kept in sync via `scripts/sync_from_numbl.ts`:
+
+- `functionResolve.ts` — `resolveFunction(name, argTypes, callSite, index)`,
+  the pure pre-/post-condition function that turns a call name + caller
+  context into a `ResolvedTarget`.
+- `lowering/loweringContext.ts` — `LoweringContext` owns the
+  `WorkspaceRegistry` (workspace files, classes, private files, search
+  paths) and builds the `FunctionIndex` that drives resolution.
+- `lowering/classInfo.ts`, `lowering/itemTypes.ts`,
+  `lowering/constants.ts`, `workspace/types.ts`,
+  `runtime/specialBuiltinNames.ts`, `externalAccessDirective.ts` —
+  pulled along as transitive deps.
+- `src/numbl-cli/cli-scan.ts` — numbl's filesystem scan used by the
+  CLI to discover workspace files.
+
+Four tiny mtoc-owned shims sit at the import paths the vendored code
+reaches for but that point at numbl's interpreter/runtime (which mtoc
+doesn't have):
+`src/numbl-core/runtime/runtimeHelpers.ts` (just the `CallSite` type),
+`src/numbl-core/runtime/specialBuiltins.ts` (re-export),
+`src/numbl-core/interpreter/builtins/index.ts` (empty `IBuiltin`
+registry), and `src/numbl-core/helpers/registry.ts` (bridge to mtoc's
+own builtin name list). Sync skips them — they're listed in
+`MTOC_OWNED` in `sync_from_numbl.ts`.
 
 ## Why these splits
 

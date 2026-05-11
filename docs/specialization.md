@@ -10,8 +10,11 @@ monomorphized.
    during the first pass over the AST and registered in the workspace's
    local-function table. The remaining stmts form the script body.
 2. When the lowerer encounters a call to a user function, it lowers the
-   arguments, computes their full canonical types, and hashes the tuple into a
-   short suffix (8 hex chars of FNV-1a 32-bit of the canonicalized type list).
+   arguments, computes their full canonical types, and hashes
+   `{file, args}` (the function's source file path along with the
+   canonicalized type list) into a short suffix (8 hex chars of FNV-1a
+   32-bit). Salting by source file is what lets same-named subfunctions in
+   different `.m` files coexist without colliding on the hash.
 3. The mangled name is `<funcName>__<hash>`. If a specialization with that name
    already exists in the cache, the call reuses it. Otherwise the lowerer
    recursively lowers the function body in a fresh scope, with each parameter
@@ -131,6 +134,15 @@ span.
 - Tensor-valued parameters are supported (real or complex; borrowed by
   value as `mtoc_tensor_t`). Tensor params can be reassigned in the body
   via copy-on-arg-pass.
-- Local functions only — function files (one function per `.m` file) and
-  workspace-wide dispatch from numbl's `functionResolve.ts` aren't yet
-  inherited beyond the local-function case.
+- Workspace function files are supported. mtoc vendors numbl's
+  `functionResolve.ts` + `loweringContext.ts` (see
+  [architecture.md](architecture.md)) so cross-file `foo(...)` →
+  `foo.m` resolution matches numbl exactly, including the "filename
+  wins" rule (the first top-level function in a file is what
+  `<basename>(...)` calls, regardless of the declared function name).
+  Per-file specialization keys (the file-salted hash described above)
+  prevent same-named helpers in different files from colliding.
+  `+pkg/`, `@Cls/`, `private/`, and `import` are recognized by the
+  vendored indexer but raise `UnsupportedConstruct` at the call site
+  in v1 — the fence-posts make it easy to lift each restriction
+  independently.

@@ -57,7 +57,11 @@ export function lowerFuncCall(
     }
     return lowerIndexLoad.call(this, e.name, e.args, e.span);
   }
-  const target = this.shared.workspace.resolve(e.name);
+  const target = this.shared.workspace.resolve(
+    e.name,
+    { file: this.currentFile },
+    e.span
+  );
   if (!target) {
     throw new UnsupportedConstruct(
       `unresolved function or builtin '${e.name}'`,
@@ -65,7 +69,14 @@ export function lowerFuncCall(
     );
   }
   if (target.kind === "userFunction") {
-    return lowerUserCall.call(this, e.name, e.args, e.span);
+    return lowerUserCall.call(
+      this,
+      target.name,
+      target.ast,
+      target.file,
+      e.args,
+      e.span
+    );
   }
   // Statement-only builtins (today: `disp`, `error`) cannot appear at
   // expression position. Lowering of `ExprStmt(disp(...))` /
@@ -408,16 +419,11 @@ function validateDomain(
 export function lowerUserCall(
   this: Lowerer,
   name: string,
+  fnAst: FunctionStmt,
+  fnFile: string,
   argExprs: Expr[],
   span: Span
 ): IRExpr {
-  const fnAst = this.shared.workspace.localFunctions.get(name);
-  if (!fnAst) {
-    throw new UnsupportedConstruct(
-      `internal: workspace claimed '${name}' is a user function but no AST is registered`,
-      span
-    );
-  }
   if (fnAst.outputs.length === 0) {
     throw new UnsupportedConstruct(
       `function '${name}' has no outputs and cannot be used in an ` +
@@ -434,7 +440,14 @@ export function lowerUserCall(
       span
     );
   }
-  const spec = specializeUserCall.call(this, name, fnAst, argExprs, span);
+  const spec = specializeUserCall.call(
+    this,
+    name,
+    fnAst,
+    fnFile,
+    argExprs,
+    span
+  );
   return {
     kind: "Call",
     name,
@@ -465,6 +478,7 @@ export function lowerUserCall(
 export function lowerMultiAssignCall(
   this: Lowerer,
   fnAst: FunctionStmt,
+  fnFile: string,
   name: string,
   argExprs: Expr[],
   lvalues: ReadonlyArray<LValue>,
@@ -491,6 +505,7 @@ export function lowerMultiAssignCall(
     this,
     name,
     fnAst,
+    fnFile,
     argExprs,
     span
   );
@@ -574,6 +589,7 @@ export function specializeUserCall(
   this: Lowerer,
   name: string,
   fnAst: FunctionStmt,
+  fnFile: string,
   argExprs: Expr[],
   span: Span
 ): { args: IRExpr[]; mangledName: string; spec: IRFunction } {
@@ -594,7 +610,7 @@ export function specializeUserCall(
     }
   }
   const argTypes = args.map(a => a.ty);
-  const mangledName = mangleSpecName(name, argTypes);
+  const mangledName = mangleSpecName(name, fnFile, argTypes);
   let spec = this.shared.cache.get(mangledName);
   if (!spec) {
     if (this.shared.inFlight.has(mangledName)) {
@@ -603,7 +619,7 @@ export function specializeUserCall(
         span
       );
     }
-    spec = specialize.call(this, name, fnAst, argTypes, mangledName);
+    spec = specialize.call(this, name, fnAst, fnFile, argTypes, mangledName);
   }
   return { args, mangledName, spec };
 }
@@ -612,13 +628,27 @@ export function specializeUserCall(
  * Build the C identifier for a specialization.
  *
  * Hashes the full canonicalized argument-type tuple (every field of
- * every type, including sign). Two calls with identical type tuples
- * produce the same hash and so land on the same specialization; any
- * difference — sign, shape, complex, future fields — produces a
+ * every type, including sign) along with the function's source file.
+ * Two calls with identical (file, type-tuple) produce the same hash
+ * and so land on the same specialization; any difference — sign,
+ * shape, complex, future fields, OR source file — produces a
  * different specialization with its own emitted C function.
+ *
+ * Salting by file is what lets same-named helpers in different files
+ * coexist without colliding on the FNV-1a hash. Without it, a
+ * subfunction `helper` in `foo.m` and a different `helper` in `bar.m`
+ * would collapse onto one specialization when called with the same
+ * arg types.
  */
-function mangleSpecName(matlabName: string, argTypes: MType[]): string {
-  const canonical = JSON.stringify(argTypes.map(canonicalizeType));
+function mangleSpecName(
+  matlabName: string,
+  fnFile: string,
+  argTypes: MType[]
+): string {
+  const canonical = JSON.stringify({
+    file: fnFile,
+    args: argTypes.map(canonicalizeType),
+  });
   return `${matlabName}__${fnv1a32Hex(canonical)}`;
 }
 
@@ -649,6 +679,7 @@ function specialize(
   this: Lowerer,
   matlabName: string,
   fnAst: FunctionStmt,
+  fnFile: string,
   argTypes: MType[],
   mangledName: string
 ): IRFunction {
@@ -669,7 +700,8 @@ function specialize(
       this.shared,
       paramBindings,
       fnAst.outputs.slice(),
-      true
+      true,
+      fnFile
     );
     const body = inner.lowerStmts(fnAst.body);
     // After body lowering: every declared output must have an assigned
@@ -711,7 +743,7 @@ function specialize(
       });
     }
     const file = fnAst.span.file;
-    const source = this.shared.workspace.files.get(file)?.source ?? "";
+    const source = this.shared.workspace.sourceOf(file) ?? "";
     const sourceLocation = {
       file,
       startLine: offsetToLine(source, fnAst.span.start),

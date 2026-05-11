@@ -6,15 +6,20 @@
 import { readFileSync, writeFileSync, mkdirSync, mkdtempSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
-import { translateProject, type TranslateError } from "./translate.js";
+import {
+  translateProject,
+  type SourceFile,
+  type TranslateError,
+} from "./translate.js";
 import { parseMFile } from "./parser/index.js";
 import { Workspace } from "./workspace/workspace.js";
 import { lower } from "./lowering/lower.js";
 import { UnsupportedConstruct, TypeError } from "./lowering/errors.js";
 import { SyntaxError as ParseSyntaxError } from "./parser/errors.js";
 import { offsetToLine } from "./parser/sourceLoc.js";
+import { scanMFiles } from "./numbl-cli/cli-scan.js";
 import { startServer } from "../server/execution-service.js";
 
 function usage(): never {
@@ -95,14 +100,37 @@ function reportError(
   process.exit(1);
 }
 
+/** Build the project the CLI hands to `translateProject`: the entry
+ *  file plus every sibling `.m` (and `.numbl.js` / `.wasm`) under
+ *  `dirname(absInputPath)`, scanned with numbl's vendored
+ *  `scanMFiles`. All names are absolute paths so the vendored
+ *  resolver can derive workspace-function names by stripping the
+ *  search-path prefix. */
+function buildProjectFiles(
+  absInputPath: string,
+  entrySource: string
+): { files: SourceFile[]; searchPaths: string[] } {
+  const workspaceRoot = dirname(absInputPath);
+  const siblings = scanMFiles(workspaceRoot, absInputPath).filter(f =>
+    f.name.endsWith(".m")
+  );
+  const files: SourceFile[] = [
+    { name: absInputPath, source: entrySource },
+    ...siblings.map(f => ({ name: f.name, source: f.source })),
+  ];
+  return { files, searchPaths: [workspaceRoot] };
+}
+
 function compile(
   source: string,
-  inputName: string,
+  absInputPath: string,
   includeRuntime: boolean,
   inputPath: string
 ): string {
-  const result = translateProject([{ name: inputName, source }], inputName, {
+  const { files, searchPaths } = buildProjectFiles(absInputPath, source);
+  const result = translateProject(files, absInputPath, {
     includeRuntime,
+    searchPaths,
   });
   if (result.error) reportError(result.error, inputPath, source);
   return result.c!;
@@ -113,13 +141,14 @@ function cmdTranslate(args: string[]): void {
   if (positional.length < 1 || positional.length > 2) usage();
   const [inputPath, outputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
+  const absInputPath = resolve(inputPath);
   if (dumpIr) {
     if (noRuntime) {
       process.stderr.write(
         "mtoc: --no-runtime has no effect with --dump-ir (no C is emitted).\n"
       );
     }
-    const out = dumpIrAsJson(source, basename(inputPath), inputPath);
+    const out = dumpIrAsJson(source, absInputPath, inputPath);
     if (outputPath === undefined) {
       process.stdout.write(out);
       process.stdout.write("\n");
@@ -130,7 +159,7 @@ function cmdTranslate(args: string[]): void {
     writeFileSync(outputPath, out + "\n");
     return;
   }
-  const cSource = compile(source, basename(inputPath), !noRuntime, inputPath);
+  const cSource = compile(source, absInputPath, !noRuntime, inputPath);
   if (outputPath === undefined) {
     process.stdout.write(cSource);
     return;
@@ -143,24 +172,28 @@ function cmdTranslate(args: string[]): void {
 /** Lower the source and serialize the IR as JSON. Stubs `BuiltinSig`
  *  closures (functions can't go through `JSON.stringify`) by replacing
  *  the `sig` field with `"<builtin: name>"` so call sites stay
- *  readable. Throws via `reportError` on any user-facing error. */
+ *  readable. Throws via `reportError` on any user-facing error.
+ *
+ *  Note: `--dump-ir` lowers ONLY the entry file (no sibling-file
+ *  resolution). It's a debugging hook; multi-file dump support can
+ *  follow once we have a need for it. */
 function dumpIrAsJson(
   source: string,
-  inputName: string,
+  absInputPath: string,
   inputPath: string
 ): string {
-  const ws = new Workspace(inputName);
+  const ws = new Workspace(absInputPath);
   let ast;
   try {
-    ast = parseMFile(source, inputName);
-    ws.addFile({ name: inputName, source, ast });
+    ast = parseMFile(source, absInputPath);
+    ws.addFile({ name: absInputPath, source, ast });
   } catch (e) {
     if (e instanceof ParseSyntaxError) {
       reportError(
         {
           kind: "SyntaxError",
           message: e.message,
-          fileName: e.file ?? inputName,
+          fileName: e.file ?? absInputPath,
           startOffset: e.position,
           endOffset: e.position + 1,
         },
@@ -179,7 +212,7 @@ function dumpIrAsJson(
         {
           kind: e.name as "UnsupportedConstruct" | "TypeError",
           message: e.message,
-          fileName: e.span?.file ?? inputName,
+          fileName: e.span?.file ?? absInputPath,
           startOffset: e.span?.start,
           endOffset: e.span?.end,
         },
@@ -225,7 +258,8 @@ function cmdRun(args: string[]): void {
   }
   const [inputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
-  const cSource = compile(source, basename(inputPath), true, inputPath);
+  const absInputPath = resolve(inputPath);
+  const cSource = compile(source, absInputPath, true, inputPath);
 
   const dir = mkdtempSync(join(tmpdir(), "mtoc-"));
   const cFile = join(dir, "out.c");

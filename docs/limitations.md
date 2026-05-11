@@ -141,9 +141,22 @@ workaround or a roadmap note.
   bare-statement call form `foo(x);` also work. See `docs/specialization.md`
   for the full ABI.
 - **No anonymous functions / function handles** (`@(x) x*x`, `@sin`).
-- **No file-level functions** (one function per `.m` file). Today only local
-  functions defined within the same script work. numbl's wider workspace
-  resolution (private functions, packages, classes) isn't inherited.
+- **Cross-file user functions are supported via numbl's vendored resolver.**
+  A call like `helper(x)` resolves to the primary function of a sibling
+  `helper.m` in the same directory (numbl's "filename wins" rule applies —
+  the first top-level function is what `<basename>(...)` calls, regardless
+  of the declared function name). The CLI scans `dirname(entry)` for
+  workspace files; the web IDE treats every project file as a workspace
+  sibling.
+- **Advanced resolution is deferred.** `+pkg/` namespaces, `@Cls/` classes,
+  `private/` directories, `import` statements, and `.numbl.js` user
+  functions are all recognized by the vendored indexer but raise
+  `UnsupportedConstruct` with a clear span at the call site. They will
+  light up as mtoc grows; the fence-posts are at lowering time, not at
+  scan time, so the resolver's behavior continues to track numbl.
+- **Cross-file recursion** falls under the same rejection as intra-file
+  recursion — mtoc's specialization cache catches the cycle via its
+  mangled-name in-flight set.
 
 ## Source language
 

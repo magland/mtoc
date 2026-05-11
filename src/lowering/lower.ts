@@ -212,11 +212,19 @@ export class Lowerer {
    *  sibling files reach through this for user-call dispatch. */
   readonly shared: SharedSpecState;
 
+  /** Source file the current Lowerer scope lives in. Script-scope: the
+   *  workspace's `mainFile`. Function-scope: the file the function
+   *  being specialized was loaded from. Threaded through the
+   *  resolver's `CallSite` so cross-file local-function and private-
+   *  function visibility rules apply correctly. */
+  readonly currentFile: string;
+
   constructor(
     shared: SharedSpecState,
     paramBindings: Array<{ name: string; cName: string; ty: MType }> = [],
     outputVars: string[] = [],
-    isInsideFunction = false
+    isInsideFunction = false,
+    currentFile?: string
   ) {
     this.shared = shared;
     this.params = new Set(paramBindings.map(p => p.name));
@@ -226,6 +234,7 @@ export class Lowerer {
     }
     this.outputVars = outputVars;
     this.isInsideFunction = isInsideFunction;
+    this.currentFile = currentFile ?? shared.workspace.mainFile;
   }
 
   /** Run `fn` with `controlDepth` incremented; restored on exit. Used by
@@ -540,19 +549,35 @@ export class Lowerer {
         // and `error` produce dedicated `IRStmt.Disp` / `IRStmt.Error`
         // nodes without lower.ts hardcoding their names.
         if (s.expr.type === "FuncCall") {
-          const target = this.shared.workspace.resolve(s.expr.name);
-          if (target?.kind === "userFunction") {
-            const fnAst = this.shared.workspace.localFunctions.get(s.expr.name);
-            if (fnAst && fnAst.outputs.length !== 1) {
-              return lowerMultiAssignCall.call(
-                this,
-                fnAst,
-                s.expr.name,
-                s.expr.args,
-                [],
-                s.span
-              );
+          // Resolve to decide between the user-function `MultiAssignCall`
+          // route (0-output / N≥2-output) and the regular expression
+          // path. envLookup'd names (variable index) and builtins fall
+          // through to the regular path; their dispatch happens inside
+          // `lowerFuncCall`.
+          let userTarget: {
+            ast: import("../workspace/workspace.js").FunctionStmt;
+            file: string;
+          } | null = null;
+          if (this.envLookup(s.expr.name) === undefined) {
+            const target = this.shared.workspace.resolve(
+              s.expr.name,
+              { file: this.currentFile },
+              s.expr.span
+            );
+            if (target?.kind === "userFunction") {
+              userTarget = { ast: target.ast, file: target.file };
             }
+          }
+          if (userTarget && userTarget.ast.outputs.length !== 1) {
+            return lowerMultiAssignCall.call(
+              this,
+              userTarget.ast,
+              userTarget.file,
+              s.expr.name,
+              s.expr.args,
+              [],
+              s.span
+            );
           }
           const builtin = getBuiltin(s.expr.name);
           if (builtin?.lowerStmt) {
@@ -625,7 +650,11 @@ export class Lowerer {
             s.span
           );
         }
-        const target = this.shared.workspace.resolve(s.expr.name);
+        const target = this.shared.workspace.resolve(
+          s.expr.name,
+          { file: this.currentFile },
+          s.expr.span
+        );
         if (target?.kind !== "userFunction") {
           throw new UnsupportedConstruct(
             `multi-assign of '${s.expr.name}' is not supported ` +
@@ -634,17 +663,10 @@ export class Lowerer {
             s.span
           );
         }
-        const fnAst = this.shared.workspace.localFunctions.get(s.expr.name);
-        if (!fnAst) {
-          throw new UnsupportedConstruct(
-            `internal: workspace claimed '${s.expr.name}' is a user function ` +
-              `but no AST is registered`,
-            s.span
-          );
-        }
         return lowerMultiAssignCall.call(
           this,
-          fnAst,
+          target.ast,
+          target.file,
           s.expr.name,
           s.expr.args,
           s.lvalues,
@@ -1003,10 +1025,25 @@ export function lower(
     if (s.type === "Function") {
       workspace.registerLocalFunction(s);
       functionStmts.push(s);
+    } else if (s.type === "ClassDef") {
+      throw new UnsupportedConstruct(
+        `top-level 'classdef' in the entry file is not yet supported by mtoc`,
+        s.span
+      );
+    } else if (s.type === "Import") {
+      throw new UnsupportedConstruct(
+        `'import' statements are not yet supported by mtoc`,
+        "span" in s ? s.span : null
+      );
     } else {
       scriptBody.push(s);
     }
   }
+
+  // Build the function index now that main-file locals are registered
+  // and every workspace file has been added. Resolution and
+  // specialization below both depend on this.
+  workspace.finalize();
 
   // Function-file mode: a .m file with only function definitions and
   // no top-level script body is treated as if the first function were

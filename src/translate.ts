@@ -2,10 +2,11 @@
  * Single entry point for translating numbl source into C. Used by both
  * the CLI ([cli.ts](./cli.ts)) and the web IDE ([components/IDEWorkspace.tsx](../src/components/IDEWorkspace.tsx)).
  *
- * Multi-file projects are accepted, but only the named active file is
- * lowered today — mtoc's lowerer doesn't yet resolve calls across files.
- * Other files are still registered on the Workspace so future cross-file
- * resolution can light up without an API change.
+ * Multi-file projects: the named active file is the entry, and every
+ * other file in `files` is a sibling workspace file. A call like
+ * `helper(x)` from the entry resolves to the primary function of
+ * `helper.m` per numbl's resolution rules (vendored from
+ * `src/numbl-core/functionResolve.ts`).
  *
  * Errors are normalized into a single shape and returned (never thrown);
  * callers can render them inline without a try/catch dance.
@@ -19,7 +20,11 @@ import { UnsupportedConstruct, TypeError } from "./lowering/errors.js";
 import { SyntaxError as ParseSyntaxError } from "./parser/errors.js";
 
 export interface SourceFile {
-  /** File name used in error attribution (e.g. "main.m"). */
+  /** File name used in error attribution. For the web IDE this is a
+   *  flat name like `"main.m"`; for the CLI it is the absolute path
+   *  of the file on disk (so the vendored numbl resolver can strip
+   *  the workspace root and derive workspace-function names from the
+   *  basename). */
   name: string;
   source: string;
 }
@@ -46,6 +51,11 @@ export interface TranslateResult {
 export interface TranslateOptions {
   /** Inline runtime helper bodies into the C output (default true). */
   includeRuntime?: boolean;
+  /** Search paths for cross-file resolution. The CLI passes
+   *  `[dirname(absoluteEntry)]` so workspace-function names are
+   *  derived from the basename. The web IDE leaves this undefined —
+   *  flat file names are treated as already-relative. */
+  searchPaths?: ReadonlyArray<string>;
 }
 
 /**
@@ -68,7 +78,7 @@ export function translateProject(
     };
   }
 
-  const workspace = new Workspace(activeName);
+  const workspace = new Workspace(activeName, opts.searchPaths ?? []);
   let activeAst;
   try {
     for (const f of files) {

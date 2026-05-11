@@ -35,6 +35,27 @@ The naming convention: filenames must start with a letter (numbl's identifier
 rule for `.m` files). `arith_basic.m`, `for_step.m`, `tensor_lit_disp.m`, etc.
 — descriptive, no numeric prefixes.
 
+#### Multi-file cases (`test_scripts/multifile/<case>/`)
+
+Cross-file resolution tests live one directory deeper. Each case is a
+folder containing exactly one `main.m` (the entry) plus any helper
+`.m` files the entry calls into. The runner treats `main.m` as the
+entry — every other `.m` inside the case dir is skipped at discovery
+so it isn't invoked as its own entry. Both numbl's CLI and mtoc's CLI
+auto-scan the entry's parent dir for workspace files, so the helpers
+become visible to both runners without any extra flags.
+
+```
+test_scripts/multifile/
+  flat_helper/
+    main.m
+    sq.m
+  helper_calls_helper/
+    main.m
+    outer.m
+    inner.m
+```
+
 ### When a test diverges from numbl
 
 - If numbl is right and we're wrong → the divergence is a bug in mtoc's

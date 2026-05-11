@@ -31,13 +31,22 @@ const numblCliPath = resolve(repoRoot, "..", "numbl", "src", "cli.ts");
 const scriptsDir = join(repoRoot, "test_scripts");
 
 function discoverScripts(): string[] {
+  const multifileRoot = join(scriptsDir, "multifile");
   const found: string[] = [];
   const walk = (dir: string): void => {
     for (const entry of readdirSync(dir)) {
       const p = join(dir, entry);
       const st = statSync(p);
       if (st.isDirectory()) walk(p);
-      else if (st.isFile() && entry.endsWith(".m")) found.push(p);
+      else if (st.isFile() && entry.endsWith(".m")) {
+        // Multi-file test layout: `test_scripts/multifile/<case>/main.m`
+        // is the entry, sibling `.m` files in the same case dir are
+        // helpers that the entry calls into. The helpers must not be
+        // executed as entries themselves — both numbl and mtoc
+        // auto-scan the entry's parent dir to pick them up.
+        if (p.startsWith(multifileRoot + "/") && entry !== "main.m") continue;
+        found.push(p);
+      }
     }
   };
   walk(scriptsDir);
