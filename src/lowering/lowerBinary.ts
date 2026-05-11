@@ -17,6 +17,7 @@ import {
   arithResult,
   isCharArray,
   isCharScalar,
+  isMultiElement,
   isScalar,
   isScalarComplex,
   isScalarReal,
@@ -239,6 +240,54 @@ function lowerComparison(
       span: e.span,
     };
   }
+  // Element-wise tensor comparison: at least one side is a multi-element
+  // double-elem numeric (real or complex), and both sides are numeric
+  // double-elem (scalar or tensor). The result is a multi-element
+  // double tensor of 0.0/1.0 values shaped by the broadcast rule
+  // (handled by arithResult below).
+  //
+  // `&&` and `||` stay scalar-only — MATLAB defines them as short-
+  // circuit on scalar conditions; elementwise logical conjunction uses
+  // `&` / `|`, which the parser doesn't surface yet.
+  const isDoubleNumeric = (t: MType): boolean =>
+    isNumeric(t) && t.elem === "double";
+  if (
+    isDoubleNumeric(left.ty) &&
+    isDoubleNumeric(right.ty) &&
+    (isMultiElement(left.ty) || isMultiElement(right.ty))
+  ) {
+    if (e.op === "AndAnd" || e.op === "OrOr") {
+      throw new UnsupportedConstruct(
+        `${e.op === "AndAnd" ? "&&" : "||"} on tensor operands is not ` +
+          `supported (only scalars; use a scalar reduction first)`,
+        e.span
+      );
+    }
+    const shape = arithResult("Add", left.ty, right.ty);
+    if (!isNumeric(shape)) {
+      throw new UnsupportedConstruct(
+        `comparison ${e.op} on ${typeToString(left.ty)} and ` +
+          `${typeToString(right.ty)} produces an incompatible result type`,
+        e.span
+      );
+    }
+    const resultTy: NumericType = {
+      kind: "Numeric",
+      elem: "double",
+      isComplex: false,
+      rows: shape.rows,
+      cols: shape.cols,
+      sign: "nonnegative",
+    };
+    return {
+      kind: "Binary",
+      op: e.op,
+      left,
+      right,
+      ty: resultTy,
+      span: e.span,
+    };
+  }
   const ok = (t: IRExpr["ty"]): boolean =>
     isScalarReal(t) || isScalarComplex(t);
   if (!ok(left.ty) || !ok(right.ty)) {
@@ -258,19 +307,20 @@ function lowerComparison(
   };
 }
 
-/** Power ops: scalar-real end-to-end (codegen emits `pow()` inline).
- *  Complex `^` is not yet supported. */
+/** Power ops:
+ *    - `^` stays scalar-real only (matrix power is a separate codegen
+ *      path; we surface a clear message pointing at `.^`).
+ *    - `.^` is element-wise: scalar-real, or broadcastable real-elem
+ *      tensors. Complex is deferred for both forms — C99 has no
+ *      direct `cpow` integration in the runtime yet.
+ *  Codegen renders both as `pow(<left>, <right>)`; inside an iter loop
+ *  the operand strings already reduce to per-slot scalar reads, so the
+ *  same `emit` path covers tensor `.^` for free. */
 function lowerPow(
   e: Extract<Expr, { type: "Binary" }>,
   left: IRExpr,
   right: IRExpr
 ): IRExpr {
-  if (!isScalar(left.ty) || !isScalar(right.ty)) {
-    throw new UnsupportedConstruct(
-      `binary ${e.op} on tensors is not yet supported`,
-      e.span
-    );
-  }
   if (
     (isNumeric(left.ty) && left.ty.isComplex) ||
     (isNumeric(right.ty) && right.ty.isComplex)
@@ -280,12 +330,56 @@ function lowerPow(
       e.span
     );
   }
+  if (e.op === "Pow") {
+    if (!isScalar(left.ty) || !isScalar(right.ty)) {
+      throw new UnsupportedConstruct(
+        `binary ^ on tensors is not yet supported (matrix power; ` +
+          `use .^ for elementwise instead)`,
+        e.span
+      );
+    }
+    return {
+      kind: "Binary",
+      op: e.op,
+      left,
+      right,
+      ty: scalarDouble("unknown"),
+      span: e.span,
+    };
+  }
+  // ElemPow: scalar or broadcastable real tensors.
+  if (isScalar(left.ty) && isScalar(right.ty)) {
+    return {
+      kind: "Binary",
+      op: e.op,
+      left,
+      right,
+      ty: scalarDouble("unknown"),
+      span: e.span,
+    };
+  }
+  const shape = arithResult("Add", left.ty, right.ty);
+  if (!isNumeric(shape)) {
+    throw new UnsupportedConstruct(
+      `binary .^ on ${typeToString(left.ty)} and ${typeToString(right.ty)} ` +
+        `produces an incompatible result type`,
+      e.span
+    );
+  }
+  const resultTy: NumericType = {
+    kind: "Numeric",
+    elem: "double",
+    isComplex: false,
+    rows: shape.rows,
+    cols: shape.cols,
+    sign: "unknown",
+  };
   return {
     kind: "Binary",
     op: e.op,
     left,
     right,
-    ty: scalarDouble("unknown"),
+    ty: resultTy,
     span: e.span,
   };
 }

@@ -92,6 +92,13 @@ Lowering does several jobs in one walk:
 - **IR validation**: a small post-lowering walk (`validateIR`) catches structural
   invariants the codegen depends on (e.g., tensor literals only as `Assign`
   RHS) so codegen-time errors stay rare and "internal".
+- **Element-wise lift**: when every param of a builtin is `shape: "scalar"`
+  but the call site passes a multi-element tensor, lowering widens the
+  `Call`'s result type to the broadcast shape; codegen's existing
+  per-slot iter loop (the same one that drives tensor `+ - .* ./`)
+  renders the call once per element with each tensor arg collapsed to
+  `<v>.real[<iter>]`. See `docs/builtins.md` for details. `.^` and
+  comparison operators (`==`, `<`, etc.) ride the same path.
 
 ### IR walkers (`src/lowering/walk.ts`)
 

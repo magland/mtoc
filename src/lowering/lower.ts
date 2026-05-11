@@ -56,7 +56,11 @@ import { lowerFor } from "./lowerFor.js";
 import { lowerWhile } from "./lowerWhile.js";
 import { lowerBinary } from "./lowerBinary.js";
 import { lowerUnary } from "./lowerUnary.js";
-import { lowerFuncCall, lowerMultiAssignCall } from "./lowerFuncCall.js";
+import {
+  isElementwiseBuiltin,
+  lowerFuncCall,
+  lowerMultiAssignCall,
+} from "./lowerFuncCall.js";
 import { lowerIndexStore } from "./lowerIndexStore.js";
 import { lowerIndexSliceStore } from "./lowerIndexSliceStore.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
@@ -884,20 +888,30 @@ function rejectNestedOwnedExpr(e: IRExpr): void {
 }
 
 /**
- * Reject any `Call` node inside an expression subtree. Used to enforce
- * the rule "no function calls inside a multi-element tensor expression"
- * — codegen's elementwise loop has no way to materialize a Call result
- * yet.
+ * Reject `Call` nodes inside a multi-element tensor expression EXCEPT
+ * element-wise builtin calls — those render naturally inside the
+ * iter-loop because each arg's per-slot rendering produces a scalar C
+ * expression that the builtin's `emit` closure consumes unchanged
+ * (e.g. `sqrt(x.real[_mtoc_i])`).
+ *
+ * Reductions (`sum`, `length`, `numel`), user-function calls, and any
+ * builtin with a non-scalar param shape still reject — they need a
+ * full-tensor view of their argument, which can't be rendered inside
+ * the iter loop where multi-element `Var`s collapse to `.real[<iter>]`.
  */
 function rejectCallInTensorContext(e: IRExpr): void {
   forEachSubExpr(e, sub => {
-    if (sub.kind === "Call") {
-      throw new UnsupportedConstruct(
-        `function calls inside a multi-element tensor expression are not ` +
-          `yet supported (assign the call result to a name first)`,
-        sub.span
-      );
+    if (sub.kind !== "Call") return;
+    if (sub.callee.kind === "builtin" && isElementwiseBuiltin(sub.callee.sig)) {
+      return;
     }
+    throw new UnsupportedConstruct(
+      `function calls inside a multi-element tensor expression are not ` +
+        `yet supported here (only element-wise scalar builtins like ` +
+        `sqrt/sin/abs lift over tensors automatically; assign other ` +
+        `call results to a name first)`,
+      sub.span
+    );
   });
 }
 

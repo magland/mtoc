@@ -85,7 +85,18 @@ export function lowerUnary(
         ty = { ...operand.ty, sign: signNegate(operand.ty.sign) };
       }
     } else if (e.op === "Not") {
-      ty = scalarDouble("nonnegative");
+      // `~x` is element-wise on tensors. The result is always real
+      // double with sign=nonnegative (0.0/1.0); shape mirrors the
+      // operand so the iter-loop codegen materializes a same-shape
+      // result tensor.
+      ty = {
+        kind: "Numeric",
+        elem: "double",
+        isComplex: false,
+        rows: operand.ty.rows,
+        cols: operand.ty.cols,
+        sign: "nonnegative",
+      };
     }
   }
   return { kind: "Unary", op: e.op, operand, ty, span: e.span };
