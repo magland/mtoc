@@ -56,7 +56,7 @@ describe("vendored numbl resolveFunction", () => {
     );
     expect(target).not.toBeNull();
     expect(target!.kind).toBe("workspaceFunction");
-    if (target!.kind === "workspaceFunction") {
+    if (target?.kind === "workspaceFunction") {
       expect(target.name).toBe("sq");
     }
   });
@@ -79,7 +79,7 @@ describe("vendored numbl resolveFunction", () => {
       ctx.functionIndex
     );
     expect(target!.kind).toBe("localFunction");
-    if (target!.kind === "localFunction") {
+    if (target?.kind === "localFunction") {
       expect(target.source.from).toBe("main");
     }
   });
@@ -131,7 +131,7 @@ describe("vendored numbl resolveFunction", () => {
       ctx.functionIndex
     );
     expect(target!.kind).toBe("localFunction");
-    if (target!.kind === "localFunction") {
+    if (target?.kind === "localFunction") {
       expect(target.source.from).toBe("workspaceFile");
     }
   });
