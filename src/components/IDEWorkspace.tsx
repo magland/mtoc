@@ -85,14 +85,17 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
   }, [monaco]);
 
   // Pull file content into our text-decoded mirror once per file.
+  // Mark a file as loaded *after* setContents succeeds — adding it before the
+  // await could leave the file permanently locked out of the decoded mirror
+  // if the effect is cancelled mid-load.
   useEffect(() => {
     let cancelled = false;
     (async () => {
       for (const f of files) {
         if (loadedRef.current.has(f.id)) continue;
-        loadedRef.current.add(f.id);
         const data = await loadFileContent(f.id);
         if (cancelled) return;
+        loadedRef.current.add(f.id);
         setContents(prev => {
           const next = new Map(prev);
           next.set(f.id, fileText(data));

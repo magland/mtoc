@@ -57,7 +57,10 @@ connection-status icon (click it to open the execution-settings dialog).
 tables: `projects`, `files`, `fileContents`. The split keeps file metadata
 small and content blobs separately addressable. `useProjectFiles` in
 `src/hooks/` is the single API: file metadata in React state, content lazily
-loaded into a ref-cache, edits debounced 500 ms before hitting the DB.
+loaded into a ref-cache, edits debounced 500 ms per-file before hitting the
+DB. Pending writes are flushed on `visibilitychange → hidden`, `pagehide`,
+and hook unmount so a reload inside the debounce window doesn't lose typed
+content.
 
 `localStorage` key `mtoc_active_file_<projectName>` remembers which file was
 last open per project. (Distinct from numbl's `numbl_active_file_*` to avoid
