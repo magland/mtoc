@@ -196,6 +196,10 @@ export function useProjectFiles(projectName: string): UseProjectFilesResult {
       const cached = contentCacheRef.current.get(fileId);
       if (cached !== undefined) return cached;
       const data = await getFileContent(fileId);
+      // Don't clobber a cache entry that was written by the user (via
+      // updateFileContent) while the IDB read was in flight.
+      const afterFetch = contentCacheRef.current.get(fileId);
+      if (afterFetch !== undefined) return afterFetch;
       contentCacheRef.current.set(fileId, data);
       return data;
     },

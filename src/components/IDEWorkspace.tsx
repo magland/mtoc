@@ -97,6 +97,9 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
         if (cancelled) return;
         loadedRef.current.add(f.id);
         setContents(prev => {
+          // If the user has already typed into this file before the load
+          // resolved, prev already has the live content — don't clobber it.
+          if (prev.has(f.id)) return prev;
           const next = new Map(prev);
           next.set(f.id, fileText(data));
           return next;
@@ -205,13 +208,13 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
           <Splitter direction="vertical" initialSize={600} minSize={200}>
             <Splitter direction="horizontal" initialSize={420} minSize={120}>
               <Box sx={{ height: "100%", minHeight: 0 }}>
-                {!loading && active ? (
+                {!loading && active && contents.has(activeFileId) ? (
                   <Editor
                     key={activeFileId}
                     height="100%"
                     language="numbl"
                     path={active}
-                    value={activeContent}
+                    defaultValue={activeContent}
                     onChange={handleChange}
                     onMount={handleEditorMount}
                     options={{
@@ -224,7 +227,9 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
                   />
                 ) : (
                   <Box sx={{ p: 2, color: "text.secondary" }}>
-                    {loading ? "Loading…" : "No file selected"}
+                    {loading || (active && !contents.has(activeFileId))
+                      ? "Loading…"
+                      : "No file selected"}
                   </Box>
                 )}
               </Box>
