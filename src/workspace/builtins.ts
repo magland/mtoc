@@ -194,6 +194,23 @@ export interface BuiltinSig {
    *  `length(string)` → `NumLit(1)`, `length(charArray)` → struct
    *  field access). Returning `null` defers to the default. */
   lowerExpr?: BuiltinLowerExpr;
+  /** True when this builtin's `emit` closure renders a single C
+   *  expression that returns a freshly-owned tensor / string handle
+   *  (e.g. `mtoc_zeros_nd(...)`, `mtoc_size_vec(...)`, a user-function
+   *  call returning a struct-by-value tensor). Such Calls go straight
+   *  into `mtoc_<kind>_assign(&lhs, foo(args))` at an owned-LHS
+   *  Assign, and ANF / the IR validator recognize them as owned
+   *  producers that need hoisting out of nested positions.
+   *
+   *  False / unset for the default elementwise-lift path, where the
+   *  builtin's scalar sig is materialized over a tensor argument by
+   *  the iter-loop codegen (`emitTensorAssignFromExpr`).
+   *
+   *  When you synthesize a one-shot sig in a `lowerExpr` hook that
+   *  emits a tensor-returning runtime helper, set this flag — the
+   *  scalar-input-scalar-output param shape is otherwise
+   *  indistinguishable from an elementwise lift. */
+  producesOwnedDirectly?: boolean;
 }
 
 // ── Factory helpers ─────────────────────────────────────────────────────
@@ -912,6 +929,7 @@ const BUILTINS: BuiltinSig[] = [
       return `mtoc_size_vec(${args[0]})`;
     },
     lowerExpr: sizeLowerExpr,
+    producesOwnedDirectly: true,
   },
   {
     name: "ndims",
@@ -955,6 +973,108 @@ const BUILTINS: BuiltinSig[] = [
       );
     },
     lowerExpr: reshapeLowerExpr,
+    producesOwnedDirectly: true,
+  },
+
+  // ── Tensor constructors (zeros, ones, nan, inf, eye) ──────────────────
+  //
+  // All variadic over scalar real dim args:
+  //   - 0 args → scalar (zeros() → 0, ones()/eye() → 1, nan() → NaN,
+  //              inf() → +Inf), folded at lowering.
+  //   - 1 arg N → 2-D N×N (numbl's "square" convention).
+  //   - 2+ args → N-D tensor with the given shape (eye is 2-D-only
+  //               and rejects N > 2).
+  //
+  // Dim arg validation (NaN, non-integer, etc.) is left to numbl
+  // compatibility: mtoc passes whatever the user wrote, so an invalid
+  // dim leads to a runtime trap inside the helper or a buffer of
+  // garbage. The happy path (positive integer dims) matches numbl
+  // byte-for-byte.
+  variadicTensorCtor("zeros", "mtoc_zeros_nd", 0, "zero"),
+  variadicTensorCtor("ones", "mtoc_ones_nd", 1, "positive"),
+  variadicTensorCtor("nan", "mtoc_nan_nd", NaN, "unknown"),
+  variadicTensorCtor("NaN", "mtoc_nan_nd", NaN, "unknown"),
+  variadicTensorCtor("inf", "mtoc_inf_nd", Infinity, "positive"),
+  variadicTensorCtor("Inf", "mtoc_inf_nd", Infinity, "positive"),
+  {
+    name: "eye",
+    category: "expr",
+    params: [],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "codegen internal: eye must be lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: eyeLowerExpr,
+  },
+
+  // ── PRNG (rng, rand, randn) ───────────────────────────────────────────
+  //
+  // mtoc reproduces numbl's seeded RNG (xoshiro128** + splitmix32) so
+  // a program that calls `rng(seed)` before `rand` / `randn` gets
+  // byte-identical output from numbl and mtoc. Without a `rng()` call
+  // mtoc seeds with 0 (numbl falls back to `Math.random()`); the two
+  // are NOT compatible in that case.
+  //
+  // `rng(seed)` is a side-effecting call returning Void; mtoc accepts
+  // it at the statement position via `ExprStmt(Call(rng, seed))`.
+  {
+    name: "rng",
+    category: "expr",
+    params: [
+      {
+        shape: "scalar",
+        domain: null,
+        elem: "double",
+        complexDomain: "real-only",
+      },
+    ],
+    result: () => ({ kind: "Void" }),
+    emit: (argStrs, _argTys, state) => {
+      state.useRuntime("mtoc_rng");
+      return `mtoc_rng_seed(${argStrs[0]})`;
+    },
+  },
+  {
+    name: "rand",
+    category: "expr",
+    params: [],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "codegen internal: rand must be lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: (_ctx, args, span) =>
+      randLowerExpr(
+        "rand",
+        "mtoc_rng_random",
+        "mtoc_rand_nd",
+        "nonnegative",
+        args,
+        span
+      ),
+  },
+  {
+    name: "randn",
+    category: "expr",
+    params: [],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "codegen internal: randn must be lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: (_ctx, args, span) =>
+      randLowerExpr(
+        "randn",
+        "mtoc_rng_randn",
+        "mtoc_randn_nd",
+        "unknown",
+        args,
+        span
+      ),
   },
 ];
 
@@ -1101,6 +1221,7 @@ function sizeLowerExpr(
       state.useRuntime("mtoc_size_dim");
       return `mtoc_size_dim(${argStrs[0]}, ${argStrs[1]})`;
     },
+    // 2-arg `size(t, dim)` returns a scalar; no producesOwnedDirectly.
   };
   return {
     kind: "Call",
@@ -1226,12 +1347,265 @@ function reshapeLowerExpr(
         .join(", ");
       return `${helper}(${argStrs[0]}, ${ndim}, (long[]){${dimsList}})`;
     },
+    producesOwnedDirectly: true,
   };
   return {
     kind: "Call",
     name: "reshape",
     callee: { kind: "builtin", sig },
     args: [...args],
+    ty: resultTy,
+    span,
+  };
+}
+
+/** Factory for variadic tensor constructors with the shape API
+ *  `f()` / `f(N)` / `f(d1, d2, …, dN)`:
+ *   - 0 args folds to a scalar literal with the given fill value.
+ *   - 1 arg N folds to a 2-D N×N call (square convention).
+ *   - 2+ args emits a call to `mtoc_<helper>_nd(ndim, dims)`.
+ *  Used for `zeros`, `ones`, `nan`/`NaN`, `inf`/`Inf`. */
+function variadicTensorCtor(
+  name: string,
+  ndHelper: string,
+  scalarValue: number,
+  scalarSign: Sign
+): BuiltinSig {
+  return {
+    name,
+    category: "expr",
+    params: [],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        `codegen internal: ${name} must be lowered through its lowerExpr hook`
+      );
+    },
+    lowerExpr: (_ctx, args, span) =>
+      lowerVariadicTensorCtor(
+        name,
+        ndHelper,
+        scalarValue,
+        scalarSign,
+        args,
+        span
+      ),
+  };
+}
+
+function lowerVariadicTensorCtor(
+  name: string,
+  ndHelper: string,
+  scalarValue: number,
+  scalarSign: Sign,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr {
+  for (let i = 0; i < args.length; i++) {
+    if (!isScalarReal(args[i].ty)) {
+      throw new UnsupportedConstruct(
+        `${name}: dim arg #${i + 1} must be a real scalar ` +
+          `(got ${typeToString(args[i].ty)})`,
+        span
+      );
+    }
+  }
+  if (args.length === 0) {
+    // Scalar fold: `zeros()` → 0, `ones()` → 1, `nan()` → NaN, etc.
+    return {
+      kind: "NumLit",
+      value: scalarValue,
+      ty: scalarDouble(scalarSign),
+      span,
+    };
+  }
+  // 1-arg form means N×N; 2+ means N-D with the given shape.
+  const ndim = args.length === 1 ? 2 : args.length;
+  const dimArgs = args.length === 1 ? [args[0], args[0]] : args;
+  const resultDims: DimInfo[] = [];
+  for (let i = 0; i < ndim; i++) resultDims.push({ kind: "unknown" });
+  const resultTy = numericTypeND(resultDims, false, scalarSign);
+  const params: ParamConstraint[] = args.map(
+    (): ParamConstraint => ({
+      shape: "scalar",
+      domain: null,
+      elem: "double",
+      complexDomain: "real-only",
+    })
+  );
+  const sig: BuiltinSig = {
+    name,
+    category: "expr",
+    params,
+    result: () => resultTy,
+    emit: (argStrs, _argTys, state) => {
+      state.useRuntime(ndHelper);
+      // For the 1-arg form, duplicate the user-supplied dim — codegen
+      // can't share the resulting `(long)(...)` cast across both slots
+      // without a stash, so the dim expression is rendered twice.
+      // numbl's dim args are constrained to scalar real, and any
+      // tensor-typed sub-expr would have been ANF-hoisted out of the
+      // call's args, so this duplication has no nontrivial side
+      // effects (just a redundant `(long)(<scalar>)`).
+      const dimExprs = args.length === 1 ? [argStrs[0], argStrs[0]] : argStrs;
+      const dimsList = dimExprs.map(s => `(long)(${s})`).join(", ");
+      return `${ndHelper}(${ndim}, (long[]){${dimsList}})`;
+    },
+    producesOwnedDirectly: true,
+  };
+  return {
+    kind: "Call",
+    name,
+    callee: { kind: "builtin", sig },
+    args: [...dimArgs],
+    ty: resultTy,
+    span,
+  };
+}
+
+/** Expression-position lowering for `eye(...)`. `eye()` folds to
+ *  the scalar literal 1, `eye(n)` lowers as `eye(n, n)`, `eye(n, m)`
+ *  emits `mtoc_eye_2d(n, m)`. Rejects 3+ args — N-D identity has no
+ *  natural meaning. */
+function eyeLowerExpr(
+  _ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  if (args.length > 2) {
+    throw new UnsupportedConstruct(
+      `eye(...) takes 0, 1, or 2 args (got ${args.length})`,
+      span
+    );
+  }
+  for (let i = 0; i < args.length; i++) {
+    if (!isScalarReal(args[i].ty)) {
+      throw new UnsupportedConstruct(
+        `eye: dim arg #${i + 1} must be a real scalar ` +
+          `(got ${typeToString(args[i].ty)})`,
+        span
+      );
+    }
+  }
+  if (args.length === 0) {
+    return {
+      kind: "NumLit",
+      value: 1,
+      ty: scalarDouble("positive"),
+      span,
+    };
+  }
+  const dimArgs = args.length === 1 ? [args[0], args[0]] : args;
+  const resultTy = numericTypeND(
+    [{ kind: "unknown" }, { kind: "unknown" }],
+    false,
+    "nonnegative"
+  );
+  const params: ParamConstraint[] = args.map(
+    (): ParamConstraint => ({
+      shape: "scalar",
+      domain: null,
+      elem: "double",
+      complexDomain: "real-only",
+    })
+  );
+  const sig: BuiltinSig = {
+    name: "eye",
+    category: "expr",
+    params,
+    result: () => resultTy,
+    emit: (argStrs, _argTys, state) => {
+      state.useRuntime("mtoc_eye_2d");
+      const rStr = argStrs[0];
+      const cStr = args.length === 1 ? argStrs[0] : argStrs[1];
+      return `mtoc_eye_2d((long)(${rStr}), (long)(${cStr}))`;
+    },
+    producesOwnedDirectly: true,
+  };
+  return {
+    kind: "Call",
+    name: "eye",
+    callee: { kind: "builtin", sig },
+    args: [...dimArgs],
+    ty: resultTy,
+    span,
+  };
+}
+
+/** Expression-position lowering for `rand` / `randn`. The 0-arg form
+ *  emits the scalar runtime helper (a single PRNG draw); the
+ *  variadic forms allocate an N-D tensor and loop-fill with PRNG
+ *  draws. The 1-arg form `rand(N)` is lowered as `rand(N, N)` per
+ *  numbl's square convention. */
+function randLowerExpr(
+  name: string,
+  scalarHelper: string,
+  ndHelper: string,
+  scalarSign: Sign,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  for (let i = 0; i < args.length; i++) {
+    if (!isScalarReal(args[i].ty)) {
+      throw new UnsupportedConstruct(
+        `${name}: dim arg #${i + 1} must be a real scalar ` +
+          `(got ${typeToString(args[i].ty)})`,
+        span
+      );
+    }
+  }
+  if (args.length === 0) {
+    // Scalar draw: emit a Call that renders to `<scalarHelper>()`.
+    const sig: BuiltinSig = {
+      name,
+      category: "expr",
+      params: [],
+      result: () => scalarDouble(scalarSign),
+      emit: (_argStrs, _argTys, state) => {
+        state.useRuntime("mtoc_rng");
+        return `${scalarHelper}()`;
+      },
+    };
+    return {
+      kind: "Call",
+      name,
+      callee: { kind: "builtin", sig },
+      args: [],
+      ty: scalarDouble(scalarSign),
+      span,
+    };
+  }
+  const ndim = args.length === 1 ? 2 : args.length;
+  const dimArgs = args.length === 1 ? [args[0], args[0]] : args;
+  const resultDims: DimInfo[] = [];
+  for (let i = 0; i < ndim; i++) resultDims.push({ kind: "unknown" });
+  const resultTy = numericTypeND(resultDims, false, scalarSign);
+  const params: ParamConstraint[] = args.map(
+    (): ParamConstraint => ({
+      shape: "scalar",
+      domain: null,
+      elem: "double",
+      complexDomain: "real-only",
+    })
+  );
+  const sig: BuiltinSig = {
+    name,
+    category: "expr",
+    params,
+    result: () => resultTy,
+    emit: (argStrs, _argTys, state) => {
+      state.useRuntime(ndHelper);
+      const dimExprs = args.length === 1 ? [argStrs[0], argStrs[0]] : argStrs;
+      const dimsList = dimExprs.map(s => `(long)(${s})`).join(", ");
+      return `${ndHelper}(${ndim}, (long[]){${dimsList}})`;
+    },
+    producesOwnedDirectly: true,
+  };
+  return {
+    kind: "Call",
+    name,
+    callee: { kind: "builtin", sig },
+    args: [...dimArgs],
     ty: resultTy,
     span,
   };

@@ -848,13 +848,12 @@ function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
   if (e.kind === "IndexSlice") return "index-slice";
   if (e.kind === "Call" && isOwned(e.ty)) {
     if (e.callee.kind === "userFunc") return "user-call";
-    // Non-elementwise builtin Call that returns an owned tensor
-    // (e.g. `size(t)`, `reshape(t, …)`). Elementwise lifts use a
-    // scalar-only sig and don't allocate at the Call site; they're
-    // not owned producers in the ANF sense.
+    // Builtin Call flagged as a direct owned producer (`size`,
+    // `reshape`, `zeros`, `ones`, `eye`, ...). Elementwise lifts
+    // don't allocate at the Call site, so they don't carry the flag.
     if (
       e.callee.kind === "builtin" &&
-      !e.callee.sig.params.every(p => p.shape === "scalar")
+      e.callee.sig.producesOwnedDirectly === true
     ) {
       return "builtin-call";
     }

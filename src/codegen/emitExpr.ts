@@ -93,7 +93,7 @@ export function emitExpr(
     e.kind === "Call" &&
     (e.callee.kind === "userFunc" ||
       (e.callee.kind === "builtin" &&
-        !e.callee.sig.params.every(p => p.shape === "scalar")));
+        e.callee.sig.producesOwnedDirectly === true));
   if (
     state.iterStack.length === 0 &&
     e.kind !== "Var" &&

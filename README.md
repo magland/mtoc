@@ -94,6 +94,15 @@ The subset is growing iteratively. Roughly:
   / slicing on `ndim > 2` are gated with a clear "not yet
   supported" diagnostic (the elementwise codegen loop is still
   2-D-shaped).
+- Tensor constructors: `zeros(...)`, `ones(...)`, `eye(...)`,
+  `nan(...)` / `NaN(...)`, `inf(...)` / `Inf(...)` — variadic
+  shape API (`f()` returns the scalar fill, `f(N)` returns N×N,
+  `f(d1, d2, ..., dN)` returns N-D). `eye` is 2-D-only.
+- PRNG: `rand(...)`, `randn(...)`, `rng(seed)` — mtoc reproduces
+  numbl's xoshiro128\*\* + splitmix32 byte-for-byte after
+  `rng(seed)`. Without an explicit seed, mtoc defaults to seed 0
+  (numbl falls back to `Math.random()`); outputs only match when
+  both runtimes are seeded.
 - Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`,
   `assert(cond, msg)` (msg may be a string or char-array literal /
   variable; tensor-condition form is deferred)

@@ -33,16 +33,23 @@ workaround or a roadmap note.
   share one mangled function) and lets a tensor variable take on
   different runtime shapes via free + realloc at the assignment site.
 - **N-D tensors are constructible but not yet operand-eligible.**
-  `reshape(v, d1, d2, …, dN)` produces an N-D tensor, and `disp`,
-  `size`, `ndims`, `numel`, `length`, and another `reshape` work on
-  it. Arithmetic, indexing, slicing, and elementwise builtin lifts on
-  an N-D tensor (`A + 1` where `ndim(A) > 2`) are not yet supported —
-  the elementwise codegen loop is still 2-D-shaped. `MTOC_MAX_NDIM`
-  is 8.
-- **Builtins for runtime-shape allocation aren't here yet.**
-  `zeros(N, M)`, `ones(N, M)`, etc. with a runtime size still raise
-  `UnsupportedConstruct`. The codegen path for dynamic-shape allocation
-  is in place — only the builtin signatures and runtime helpers remain.
+  `reshape(v, d1, d2, …, dN)`, `zeros(d1, …, dN)`, `ones(...)`,
+  `nan(...)`, `inf(...)`, `rand(...)`, and `randn(...)` all produce
+  N-D tensors; `disp`, `size`, `ndims`, `numel`, `length`, and
+  another `reshape` work on them. Arithmetic, indexing, slicing, and
+  elementwise builtin lifts on an N-D tensor (`A + 1` where
+  `ndim(A) > 2`) are not yet supported — the elementwise codegen
+  loop is still 2-D-shaped. `MTOC_MAX_NDIM` is 8.
+- **PRNG byte-equivalence requires an explicit seed.** `rand`,
+  `randn`, and `rng(seed)` share xoshiro128\*\* + splitmix32 with
+  numbl, so post-seeded output is byte-identical. Without a
+  `rng(seed)` call, mtoc seeds with 0 while numbl falls back to
+  `Math.random()` — the two streams disagree. Cross-runner test
+  scripts using `rand` / `randn` should call `rng(<seed>)` first.
+- **`linspace`, `logspace`, `repmat`, `ndgrid`, `meshgrid` are
+  deferred.** The infrastructure for runtime-shape allocation is in
+  place (see the tensor-constructor builtins above) — adding these
+  is mechanical work matching numbl's exact formulas.
 - **Tensor sub-expressions only at `Assign` RHS — for _non_-owned
   expressions.** `disp(a + b)` and `sum(a .* a)` still fail with a
   "assign to a temp first" message: a Binary on two tensors produces a

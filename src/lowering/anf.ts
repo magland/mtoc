@@ -28,7 +28,6 @@
 
 import type { IRExpr, IRProgram, IRStmt, VarBinding } from "./ir.js";
 import { isOwned, isString, type MType } from "./types.js";
-import type { BuiltinSig } from "../workspace/builtins.js";
 
 /** Counter shared across the whole program so synthetic temp names
  *  stay deterministic and unique. Boxed in an object so passes can
@@ -47,26 +46,20 @@ export function isOwnedProducer(e: IRExpr): boolean {
   if (e.kind === "Binary" && isString(e.ty)) return true;
   if (e.kind === "Call" && isOwned(e.ty)) {
     if (e.callee.kind === "userFunc") return true;
-    // Builtin calls whose `result` type is owned but which AREN'T an
-    // elementwise lift of a scalar sig — e.g. `size(t)`, `reshape(t)`,
-    // future `zeros(N,M)`. These return a fully-formed owned value
-    // from a single C call and need ANF hoisting just like userFunc
-    // calls. (Elementwise lifts materialize per-slot via the parent
-    // Assign's iter loop, so they are NOT owned producers in the
-    // ANF sense.)
-    if (e.callee.kind === "builtin" && !isElementwiseBuiltinSig(e.callee.sig)) {
+    // Builtin calls flagged `producesOwnedDirectly` (e.g. `size(t)`,
+    // `reshape(t, …)`, `zeros(N, M)`) return a fully-formed owned
+    // value from a single C call and need ANF hoisting just like
+    // userFunc calls. Elementwise lifts materialize per-slot via the
+    // parent Assign's iter loop, so they are NOT owned producers in
+    // the ANF sense.
+    if (
+      e.callee.kind === "builtin" &&
+      e.callee.sig.producesOwnedDirectly === true
+    ) {
       return true;
     }
   }
   return false;
-}
-
-/** Local mirror of `lowerFuncCall.isElementwiseBuiltin` to keep this
- *  pass free of an import cycle through lowerFuncCall (which would
- *  transitively re-import from here via `lower.js`). The predicate
- *  is one line so the duplication cost is negligible. */
-function isElementwiseBuiltinSig(sig: BuiltinSig): boolean {
-  return sig.params.every(p => p.shape === "scalar");
 }
 
 /** Mutate `prog` in place, A-normalizing main's body and every

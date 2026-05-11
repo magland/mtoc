@@ -209,7 +209,7 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           s.rhs.kind === "Call" &&
           (s.rhs.callee.kind === "userFunc" ||
             (s.rhs.callee.kind === "builtin" &&
-              !s.rhs.callee.sig.params.every(p => p.shape === "scalar")));
+              s.rhs.callee.sig.producesOwnedDirectly === true));
         if (
           isNumeric(s.ty) &&
           isMultiElement(s.ty) &&

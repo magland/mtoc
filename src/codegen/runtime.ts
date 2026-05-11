@@ -139,6 +139,50 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     ]),
   ],
   [
+    "mtoc_zeros_nd",
+    loadSnippet("tensor_zeros.h", ["mtoc_tensor_t", "mtoc_tensor_alloc_nd"]),
+  ],
+  [
+    "mtoc_ones_nd",
+    loadSnippet("tensor_ones.h", ["mtoc_tensor_t", "mtoc_tensor_alloc_nd"]),
+  ],
+  [
+    "mtoc_nan_nd",
+    loadSnippet("tensor_nan.h", ["mtoc_tensor_t", "mtoc_tensor_alloc_nd"]),
+  ],
+  [
+    "mtoc_inf_nd",
+    loadSnippet("tensor_inf.h", ["mtoc_tensor_t", "mtoc_tensor_alloc_nd"]),
+  ],
+  [
+    "mtoc_eye_2d",
+    loadSnippet("tensor_eye.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
+  ],
+  // rng.h defines several related symbols (mtoc_rng_seed,
+  // mtoc_rng_random, mtoc_rng_randn) plus the shared static state.
+  // We register the whole block under one canonical key so an
+  // emitter that wants any of them activates the same snippet
+  // exactly once. Call sites use `state.useRuntime("mtoc_rng")`
+  // even when they emit `mtoc_rng_random()` / `mtoc_rng_seed(...)`
+  // / `mtoc_rng_randn()` in the rendered C.
+  ["mtoc_rng", loadSnippet("rng.h")],
+  [
+    "mtoc_rand_nd",
+    loadSnippet("tensor_rand.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_nd",
+      "mtoc_rng",
+    ]),
+  ],
+  [
+    "mtoc_randn_nd",
+    loadSnippet("tensor_randn.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_nd",
+      "mtoc_rng",
+    ]),
+  ],
+  [
     "mtoc_size_vec",
     loadSnippet("size_vec.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
   ],
