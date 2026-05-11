@@ -100,6 +100,37 @@ This runner is not part of the "definition of done" gate — it's a
 forward-progress signal. The cross-runner over `test_scripts/` and the
 vitest suite remain the binding regression checks.
 
+### Probe mode
+
+`--probe` ignores `numbl_tests.txt` and walks the entire numbl test
+corpus, classifying each test's outcome:
+
+- `PASS` — printed `SUCCESS` as the final stdout line.
+- `UNSUPPORTED` — mtoc raised `UnsupportedConstruct` (expected: a
+  feature mtoc hasn't grown into yet).
+- `TYPE_ERROR` / `SYNTAX_ERROR` — mtoc rejected the program at
+  lowering / parsing.
+- `COMPILE_ERROR` — C was emitted but the C compiler rejected it.
+- `RUNTIME_ERROR` — the compiled binary ran but exited non-zero
+  (assertion abort, segfault, …).
+- `NO_SUCCESS` — ran to completion but stdout didn't end with
+  `SUCCESS` (semantic divergence from numbl).
+- `TIMEOUT` — exceeded `MTOC_TEST_TIMEOUT_MS`.
+
+The headline output is the "translated-but-broken" bucket
+(`COMPILE_ERROR` / `RUNTIME_ERROR` / `NO_SUCCESS` / `TYPE_ERROR` /
+`SYNTAX_ERROR`) — tests where mtoc produced C but the result diverged
+from numbl. These are the actionable signal; `UNSUPPORTED` failures
+are noise here by design.
+
+```bash
+npm run probe:numbl                                 # full corpus
+npx tsx scripts/run_numbl_tests.ts --probe math/    # subtree filter
+```
+
+Probe mode always exits 0 — the breakdown is the result, not a
+pass/fail verdict.
+
 ## Adding a new feature: the typical loop
 
 1. Write a small `.m` test script under the relevant `test_scripts/<category>/`

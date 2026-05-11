@@ -20,6 +20,9 @@ control_flow/if_else.m
 control_flow/test_for_loop_var_value.m
 control_flow/while_loops.m
 functions/prototype_name_functions.m
+math/complex_log2_log10.m
 math/rounding.m
+math/test_angle_tensor.m
 math/test_mod_inf_large.m
+reduction/test_max_min_nan_twoarg.m
 variables/assignment.m
