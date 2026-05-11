@@ -1193,7 +1193,7 @@ function emitMultiSlotSliceRead(
   target: string,
   rhs: Extract<IRExpr, { kind: "IndexSlice" }>,
   base: Extract<IRExpr, { kind: "Var" }>,
-  baseTy: NumericType,
+  _baseTy: NumericType,
   isComplex: boolean
 ): void {
   const allocHelper = isComplex

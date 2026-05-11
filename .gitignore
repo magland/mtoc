@@ -7,3 +7,4 @@ tmp/
 coverage/
 /e1.c
 .husky/_/
+.claude
