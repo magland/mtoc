@@ -991,12 +991,33 @@ export function lower(
   // become entries in the workspace's local-function table; the
   // remaining stmts are the script body.
   const scriptBody: Stmt[] = [];
+  const functionStmts: Extract<Stmt, { type: "Function" }>[] = [];
   for (const s of ast.body) {
     if (s.type === "Function") {
       workspace.registerLocalFunction(s);
+      functionStmts.push(s);
     } else {
       scriptBody.push(s);
     }
+  }
+
+  // Function-file mode: a .m file with only function definitions and
+  // no top-level script body is treated as if the first function were
+  // the script entry. Mirrors numbl, which calls the first function
+  // with zero args and zero outputs. The function stays registered
+  // for cross-calls; its body is duplicated into the script position.
+  let bodyToLower: Stmt[] = scriptBody;
+  if (scriptBody.length === 0 && functionStmts.length > 0) {
+    const entry = functionStmts[0];
+    if (entry.params.length > 0) {
+      throw new UnsupportedConstruct(
+        `function '${entry.name}' is used as the script entry but has ` +
+          `parameters; mtoc cannot supply arguments when running a ` +
+          `function-only file`,
+        entry.span
+      );
+    }
+    bodyToLower = entry.body;
   }
 
   const shared: SharedSpecState = {
@@ -1006,7 +1027,7 @@ export function lower(
     inFlight: new Set(),
   };
   const top = new Lowerer(shared);
-  const stmts = top.lowerStmts(scriptBody);
+  const stmts = top.lowerStmts(bodyToLower);
   const prog: IRProgram = {
     assignedVars: top.getAssignedVars(),
     functions: shared.order,

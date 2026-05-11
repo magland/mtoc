@@ -114,6 +114,11 @@ Lowering does several jobs in one walk:
   `disp(helper(x))`, `[1 2] + 1`, `v(1:3) + 1`, `(a + b) + c`
   (strings), etc. all decompose into a sequence of well-formed
   Assigns automatically.
+- **Function-file entry**: when the source has no top-level script
+  statements but at least one function definition, `lower()` adopts
+  the first function's body as the script body. The function still
+  registers as a local so cross-calls work; the entry must take zero
+  parameters. Mirrors numbl's "first-function call with 0 args".
 
 ### IR walkers (`src/lowering/walk.ts`)
 
