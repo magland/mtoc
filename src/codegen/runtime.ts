@@ -120,6 +120,30 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     loadSnippet("tensor_alloc_complex.h", ["mtoc_tensor_t", "mtoc_alloc"]),
   ],
   [
+    "mtoc_tensor_alloc_nd",
+    loadSnippet("tensor_alloc_nd.h", ["mtoc_tensor_t", "mtoc_alloc"]),
+  ],
+  [
+    "mtoc_tensor_alloc_nd_complex",
+    loadSnippet("tensor_alloc_nd_complex.h", ["mtoc_tensor_t", "mtoc_alloc"]),
+  ],
+  [
+    "mtoc_tensor_reshape",
+    loadSnippet("tensor_reshape.h", ["mtoc_tensor_t", "mtoc_tensor_alloc_nd"]),
+  ],
+  [
+    "mtoc_tensor_reshape_complex",
+    loadSnippet("tensor_reshape_complex.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_nd_complex",
+    ]),
+  ],
+  [
+    "mtoc_size_vec",
+    loadSnippet("size_vec.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
+  ],
+  ["mtoc_size_dim", loadSnippet("size_dim.h", ["mtoc_tensor_t"])],
+  [
     "mtoc_tensor_from_row",
     loadSnippet("tensor_from_row.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
   ],
@@ -143,14 +167,11 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ],
   [
     "mtoc_tensor_copy",
-    loadSnippet("tensor_copy.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
+    loadSnippet("tensor_copy.h", ["mtoc_tensor_t", "mtoc_alloc"]),
   ],
   [
     "mtoc_tensor_copy_complex",
-    loadSnippet("tensor_copy_complex.h", [
-      "mtoc_tensor_t",
-      "mtoc_tensor_alloc_complex",
-    ]),
+    loadSnippet("tensor_copy_complex.h", ["mtoc_tensor_t", "mtoc_alloc"]),
   ],
   ["mtoc_tensor_free", loadSnippet("tensor_free.h", ["mtoc_tensor_t"])],
   ["mtoc_tensor_assign", loadSnippet("tensor_assign.h", ["mtoc_tensor_t"])],

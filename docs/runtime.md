@@ -57,11 +57,13 @@ Cycles are unsupported — keep the graph acyclic.
 Multi-element tensors are passed through C as a single `mtoc_tensor_t` struct:
 
 ```
+#define MTOC_MAX_NDIM 8
+
 typedef struct {
   double *MTOC_RESTRICT real;   /* always non-NULL */
   double *MTOC_RESTRICT imag;   /* NULL iff statically real */
-  long rows;
-  long cols;
+  int  ndim;
+  long dims[MTOC_MAX_NDIM];
 } mtoc_tensor_t;
 ```
 
@@ -71,9 +73,18 @@ The type system tracks `isComplex` statically, so codegen knows up front
 whether to touch the imag side — there is no runtime branch on
 `imag != NULL`.
 
+Shape is stored inline: `ndim` axes with sizes `dims[0..ndim-1]`. The
+minimum logical `ndim` is 2 (matching numbl) — a row vector is `{1, n}` and
+a column is `{n, 1}`. Keeping `dims` inline preserves the value-typed
+semantics of `mtoc_tensor_t`: copy / free / assign do a struct copy and
+touch only the two heap pointers, so the shape rides along for free.
+`MTOC_MAX_NDIM` caps the inline array at 8; constructors abort when an
+N-D allocation would exceed it.
+
 Layout is **column-major** to match numbl / LAPACK. For a tensor of shape
-`(R, C)`, element `(r, c)` lives at `real[r + c * R]` (and, when complex,
-the imaginary part lives at `imag[r + c * R]`).
+`(d0, d1, …)`, element `(i0, i1, …)` lives at
+`real[i0 + i1*d0 + i2*d0*d1 + …]` (and the imag part at the same offset
+in `imag` when complex).
 
 Backing storage is allocated on the **heap** for every tensor, by every
 emitted program — there is no stack-array fast path. Going uniformly heap
@@ -99,12 +110,15 @@ reads close to the numbl source. The full set lives under
 `src/codegen/runtime/tensor_*.h`:
 
 - `mtoc_tensor_empty()` — zero-initialized placeholder (`{NULL, NULL,
-0, 0}`). Returned at every predecl site so a tensor variable starts
+0, {0}}`). Returned at every predecl site so a tensor variable starts
   in a known state.
 - `mtoc_tensor_alloc(rows, cols)` /
   `mtoc_tensor_alloc_complex(rows, cols)` — allocate an uninitialized
-  tensor of the given shape. The workhorse for elementwise-result
-  construction.
+  2-D tensor of the given shape. The workhorse for elementwise-result
+  construction. Internally sets `ndim = 2`.
+- `mtoc_tensor_alloc_nd(ndim, dims)` /
+  `mtoc_tensor_alloc_nd_complex(ndim, dims)` — N-D variant used by
+  `reshape`. Aborts when `ndim > MTOC_MAX_NDIM`.
 - `mtoc_tensor_from_row(data, n)` /
   `mtoc_tensor_from_row_complex(re, im, n)` — build a 1×n tensor from
   a flat data pointer (typically a C99 compound literal).
@@ -112,7 +126,12 @@ reads close to the numbl source. The full set lives under
   `mtoc_tensor_from_matrix_complex(re, im, rows, cols)` — same, for a
   rows×cols matrix in column-major order.
 - `mtoc_tensor_copy(src)` / `mtoc_tensor_copy_complex(src)` — deep
-  copy. The receiver gets a freshly-owned tensor.
+  copy. The receiver gets a freshly-owned tensor with the source's
+  `ndim` and `dims` preserved.
+- `mtoc_tensor_reshape(src, ndim, dims)` /
+  `mtoc_tensor_reshape_complex(src, ndim, dims)` — reshape `src` to a
+  new shape. The element count must match `numel(src)`; aborts on
+  mismatch.
 - `mtoc_tensor_free(&t)` — release backing buffers and reset the
   struct. Shape-agnostic (real and complex use the same helper —
   `free(NULL)` is well-defined and the imag-side free is a no-op for

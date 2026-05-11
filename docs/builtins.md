@@ -198,10 +198,15 @@ as `STRING` and codegen emits `mtoc_string_concat(...)`.
 
 ## Caveats
 
-- The shape constraint `"any"` exists but is rarely used. Today only `disp`
-  uses it (its dispatch on scalar-vs-tensor lives in the `IRStmt.Disp` codegen,
-  not in the `emit` closure).
-- A future "tensor-returning" builtin (matrix `sum`, `min(tensor)` returning
-  scalar of arg's elem, etc.) doesn't need a DSL change — its `result` returns
-  a multi-element `NumericType` and its `emit` is responsible for materializing
-  the result. Today no such builtin exists; the path is open when one does.
+- The shape constraint `"any"` exists for builtins that accept any value
+  (scalar through N-D tensor). `disp`, `size`, and `ndims` use it. Their
+  `lowerExpr` / `emit` closures dispatch on the input shape.
+- **Tensor-returning builtins** plug in via `lowerExpr` synthesizing a
+  one-shot `BuiltinSig` whose `result` is multi-element and `emit`
+  renders a runtime helper that allocates the result. Today `size(t)`
+  (→ `mtoc_size_vec`) and `reshape(t, …)` (→ `mtoc_tensor_reshape` /
+  `_complex`) follow this pattern; future ones (e.g. `zeros(N, M)`) plug
+  in the same way. The ANF pass and IR validator recognize non-
+  elementwise builtin Calls with `isOwned` result as owned producers,
+  so a tensor-returning builtin can appear at an Assign RHS or be
+  auto-hoisted out of nested positions.

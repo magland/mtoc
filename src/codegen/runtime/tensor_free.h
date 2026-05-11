@@ -17,6 +17,5 @@ static void mtoc_tensor_free(mtoc_tensor_t *t) {
   free(t->imag);
   t->real = NULL;
   t->imag = NULL;
-  t->rows = 0;
-  t->cols = 0;
+  t->ndim = 0;
 }

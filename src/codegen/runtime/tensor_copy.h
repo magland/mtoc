@@ -11,8 +11,13 @@
 #include <string.h>
 
 static mtoc_tensor_t mtoc_tensor_copy(mtoc_tensor_t src) {
-  mtoc_tensor_t out = mtoc_tensor_alloc(src.rows, src.cols);
-  long n = src.rows * src.cols;
+  /* Struct copy preserves ndim and dims; the heap buffer is
+   * replaced with a fresh allocation of the right total size. */
+  mtoc_tensor_t out = src;
+  long n = 1;
+  for (int i = 0; i < src.ndim; i++) n *= src.dims[i];
+  out.real = mtoc_alloc((size_t)n * sizeof(double));
+  out.imag = NULL;
   memcpy(out.real, src.real, (size_t)n * sizeof(double));
   return out;
 }

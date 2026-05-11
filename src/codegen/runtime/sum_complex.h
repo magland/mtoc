@@ -11,7 +11,7 @@
 static double _Complex mtoc_sum_complex(mtoc_tensor_t t) {
   double sr = 0.0;
   double si = 0.0;
-  long n = t.rows * t.cols;
+  long n = t.dims[0] * t.dims[1];
   for (long i = 0; i < n; i++) {
     sr += t.real[i];
     si += t.imag[i];

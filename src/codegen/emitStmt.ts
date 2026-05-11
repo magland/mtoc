@@ -45,7 +45,13 @@ import { topLevelOwnedDefs, topLevelOwnedUses } from "./liveness.js";
 import { ownedOps } from "./ownedKinds.js";
 import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 import { emitScopeExitFrees } from "./emitOwned.js";
-import { analyzeExpr, emitExpr, wrapOwnedArgCopy } from "./emitExpr.js";
+import {
+  analyzeExpr,
+  emitExpr,
+  tensorColsField,
+  tensorRowsField,
+  wrapOwnedArgCopy,
+} from "./emitExpr.js";
 import { formatNumLit } from "./emitFormat.js";
 import { renderStmt, sanitizeForBlockComment } from "./irRender.js";
 
@@ -190,22 +196,26 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // handle) and installs the new value in one step.
         //
         // The tensor case (multi-element double) splits on RHS kind:
-        // a non-Var, non-TensorLit, non-user-Call RHS materializes
-        // elementwise via a per-slot loop. A user-function call
-        // RHS returns a fully-formed owned tensor by value — the
-        // direct `mtoc_tensor_assign(&lhs, foo(args))` path consumes
-        // that handle without re-allocating. Strings and char arrays
-        // accept a Var (deep-copy) or any owned-producing expression
-        // directly (`StringLit`, `mtoc_string_concat(...)`,
+        // a non-Var, non-TensorLit, non-direct-Call RHS materializes
+        // elementwise via a per-slot loop. A direct-Call RHS (user
+        // function, or a non-elementwise builtin like `size` /
+        // `reshape`) returns a fully-formed owned tensor by value —
+        // the direct `mtoc_tensor_assign(&lhs, foo(args))` path
+        // consumes that handle without re-allocating. Strings and
+        // char arrays accept a Var (deep-copy) or any owned-producing
+        // expression directly (`StringLit`, `mtoc_string_concat(...)`,
         // `mtoc_char_tensor_from_literal(...)`, user-function call).
-        const isUserFuncCall =
-          s.rhs.kind === "Call" && s.rhs.callee.kind === "userFunc";
+        const isDirectOwnedCall =
+          s.rhs.kind === "Call" &&
+          (s.rhs.callee.kind === "userFunc" ||
+            (s.rhs.callee.kind === "builtin" &&
+              !s.rhs.callee.sig.params.every(p => p.shape === "scalar")));
         if (
           isNumeric(s.ty) &&
           isMultiElement(s.ty) &&
           s.ty.elem === "double" &&
           s.rhs.kind !== "Var" &&
-          !isUserFuncCall
+          !isDirectOwnedCall
         ) {
           emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
@@ -267,12 +277,13 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       //     complex base (sets imag[off] = 0).
       const baseCName = s.base.cName;
       const baseTy = s.base.ty as NumericType;
+      const baseRowsField = tensorRowsField(baseTy);
       const offsetExpr =
         s.indices.length === 1
           ? `(long)(${emitExpr(state, s.indices[0], 0)}) - 1L`
           : `(long)(${emitExpr(state, s.indices[0], 0)}) - 1L + ` +
             `((long)(${emitExpr(state, s.indices[1], 0)}) - 1L) * ` +
-            `${baseCName}.rows`;
+            `${baseCName}.${baseRowsField}`;
       const rhsExpr = emitExpr(state, s.rhs, 0);
       if (baseTy.isComplex) {
         // Stash the offset and (for a complex RHS) the value into
@@ -847,11 +858,13 @@ function emitTensorAssignFromExpr(
     useRuntimeByName(state, "mtoc_check_shape");
   }
 
-  // Shape args: either from a Var's runtime rows/cols, or from the
-  // static length of a CharLit (always a 1×N row vector).
+  // Shape args: either from a Var's runtime shape, or from the
+  // static length of a CharLit (always a 1×N row vector). The
+  // staging tensor is always a double-elem `mtoc_tensor_t`, so the
+  // field references below use `dims[0]`/`dims[1]`.
   const shapeArgs =
     src !== null
-      ? `${src.cName}.rows, ${src.cName}.cols`
+      ? `${src.cName}.${tensorRowsField(src.ty)}, ${src.cName}.${tensorColsField(src.ty)}`
       : `1, ${charLitSrc!.value.length}`;
 
   pushStmt(state, level, `{`);
@@ -872,7 +885,7 @@ function emitTensorAssignFromExpr(
   pushStmt(
     state,
     level + 1,
-    `long _mtoc_n = ${stagingName}.rows * ${stagingName}.cols;`
+    `long _mtoc_n = ${stagingName}.dims[0] * ${stagingName}.dims[1];`
   );
   pushStmt(
     state,
@@ -1087,7 +1100,8 @@ function emitIndexSliceAssign(
     pushStmt(
       state,
       level + 1,
-      `long _mtoc_n = ${base.cName}.rows * ${base.cName}.cols;`
+      `long _mtoc_n = ${base.cName}.${tensorRowsField(baseTy)} * ` +
+        `${base.cName}.${tensorColsField(baseTy)};`
     );
     count = "_mtoc_n";
     srcIndexFor = k => k;
@@ -1210,7 +1224,8 @@ function emitIndexSliceStore(
     pushStmt(
       state,
       level + 1,
-      `long _mtoc_n = ${baseCName}.rows * ${baseCName}.cols;`
+      `long _mtoc_n = ${baseCName}.${tensorRowsField(baseTy)} * ` +
+        `${baseCName}.${tensorColsField(baseTy)};`
     );
     dstOffsetFor = k => k;
   } else {
@@ -1304,12 +1319,14 @@ function emitIndexSliceStore(
     );
   }
   const rhsCName = s.rhs.cName;
+  const rhsTy = s.rhs.ty;
   // Runtime count check — guards against buffer overruns. The
   // diagnostic message matches the style of mtoc_check_shape.
   pushStmt(
     state,
     level + 1,
-    `long _mtoc_rhs_n = ${rhsCName}.rows * ${rhsCName}.cols;`
+    `long _mtoc_rhs_n = ${rhsCName}.${tensorRowsField(rhsTy)} * ` +
+      `${rhsCName}.${tensorColsField(rhsTy)};`
   );
   pushStmt(state, level + 1, `if (_mtoc_n != _mtoc_rhs_n) {`);
   pushStmt(

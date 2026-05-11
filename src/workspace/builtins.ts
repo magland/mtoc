@@ -21,11 +21,15 @@ import {
   isCharArray,
   isMultiElement,
   isNumeric,
+  isScalar,
   isScalarReal,
   isString,
+  numericTypeND,
+  rowVecDouble,
   scalarComplex,
   scalarDouble,
   typeToString,
+  type DimInfo,
   type MType,
   type Sign,
 } from "../lowering/types.js";
@@ -878,6 +882,80 @@ const BUILTINS: BuiltinSig[] = [
     ...reduceTensor("numel", "mtoc_numel", "nonnegative"),
     lowerExpr: lengthLikeLowerExpr("numel"),
   },
+
+  // ── Shape builtins (size, ndims, reshape) ─────────────────────────────
+  //
+  // These accept any value (scalar through N-D tensor) and produce
+  // either a scalar (`ndims`, `size(A, dim)`) or a fresh tensor
+  // (`size(A)`, `reshape`). They are the only path today by which a
+  // numbl program can construct a tensor with `ndim > 2`.
+  //
+  // Scalar inputs are constant-folded at lowering: `size(s)` →
+  // `[1 1]`, `ndims(s)` → `2`. Char arrays / strings are
+  // currently rejected (numbl returns `[1 N]` / `2` for those; the
+  // path is open but unused by the test scripts mtoc has).
+  {
+    name: "size",
+    category: "expr",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+    ],
+    // Default 1-arg path: produces a 1×N row vector via runtime helper.
+    result: () => rowVecDouble("nonnegative"),
+    emit: (args, _argTys, state) => {
+      state.useRuntime("mtoc_size_vec");
+      return `mtoc_size_vec(${args[0]})`;
+    },
+    lowerExpr: sizeLowerExpr,
+  },
+  {
+    name: "ndims",
+    category: "expr",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => scalarDouble("positive"),
+    emit: (args, argTys) => {
+      // Scalar input folds at lowering; reaching here means a tensor.
+      // ndims(t) = max(2, t.ndim) — matching numbl.
+      if (argTys.length !== 1 || !isNumeric(argTys[0])) {
+        throw new Error(`codegen internal: ndims expects one numeric arg`);
+      }
+      return `(double)(${args[0]}.ndim > 2 ? ${args[0]}.ndim : 2)`;
+    },
+    lowerExpr: ndimsLowerExpr,
+  },
+  {
+    name: "reshape",
+    category: "expr",
+    // Placeholder one-arg shape — `lowerExpr` intercepts and builds a
+    // call with the actual arity. The default emit path is never used.
+    params: [
+      {
+        shape: "tensor",
+        domain: null,
+        elem: "double",
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "codegen internal: reshape must be lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: reshapeLowerExpr,
+  },
 ];
 
 function lengthLikeLowerExpr(name: string): BuiltinLowerExpr {
@@ -935,6 +1013,227 @@ function lengthLikeLowerExpr(name: string): BuiltinLowerExpr {
       );
     }
     return null;
+  };
+}
+
+/** Expression-position lowering for `size(...)`. Handles both
+ *  `size(A)` (returns row vector of dim sizes) and `size(A, dim)`
+ *  (returns scalar). Scalar arg folds: `size(s)` → `[1 1]`,
+ *  `size(s, _)` → `1`. */
+function sizeLowerExpr(
+  _ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  if (args.length === 0 || args.length > 2) {
+    throw new UnsupportedConstruct(
+      `size(...) takes 1 or 2 args (got ${args.length})`,
+      span
+    );
+  }
+  const a = args[0];
+  if (!isNumeric(a.ty)) {
+    throw new UnsupportedConstruct(
+      `size(${typeToString(a.ty)}) is not yet supported ` +
+        `(only numeric values today)`,
+      span
+    );
+  }
+  // 1-arg form
+  if (args.length === 1) {
+    if (isScalar(a.ty)) {
+      // size(scalar) → [1 1] — fold to a tensor literal.
+      const one: IRExpr = {
+        kind: "NumLit",
+        value: 1,
+        ty: scalarDouble("positive"),
+        span,
+      };
+      return {
+        kind: "TensorLit",
+        elements: [[one, one]],
+        ty: rowVecDouble("positive"),
+        span,
+      };
+    }
+    // Tensor input: defer to the default Call path (which uses
+    // mtoc_size_vec).
+    return null;
+  }
+  // 2-arg form: size(A, dim). dim must be a real scalar.
+  const dim = args[1];
+  if (!isScalarReal(dim.ty)) {
+    throw new UnsupportedConstruct(
+      `size(_, dim) requires a real scalar dim (got ` +
+        `${typeToString(dim.ty)})`,
+      span
+    );
+  }
+  // Scalar tensor: size(s, _) is always 1.
+  if (isScalar(a.ty)) {
+    return {
+      kind: "NumLit",
+      value: 1,
+      ty: scalarDouble("positive"),
+      span,
+    };
+  }
+  // Synthesize a one-shot 2-arg sig for codegen.
+  const sig: BuiltinSig = {
+    name: "size",
+    category: "expr",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+      {
+        shape: "scalar",
+        domain: null,
+        elem: "double",
+        complexDomain: "real-only",
+      },
+    ],
+    result: () => scalarDouble("nonnegative"),
+    emit: (argStrs, _argTys, state) => {
+      state.useRuntime("mtoc_size_dim");
+      return `mtoc_size_dim(${argStrs[0]}, ${argStrs[1]})`;
+    },
+  };
+  return {
+    kind: "Call",
+    name: "size",
+    callee: { kind: "builtin", sig },
+    args: [a, dim],
+    ty: scalarDouble("nonnegative"),
+    span,
+  };
+}
+
+/** Expression-position lowering for `ndims(A)`. Scalar / 2-D inputs
+ *  fold to a NumLit(2); higher-D tensors defer to the default Call
+ *  path so codegen can emit `max(2, t.ndim)` at runtime. */
+function ndimsLowerExpr(
+  _ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  if (args.length !== 1) {
+    throw new UnsupportedConstruct(
+      `ndims(...) takes exactly 1 arg (got ${args.length})`,
+      span
+    );
+  }
+  const a = args[0];
+  if (!isNumeric(a.ty)) {
+    throw new UnsupportedConstruct(
+      `ndims(${typeToString(a.ty)}) is not yet supported`,
+      span
+    );
+  }
+  // Static ndim is `a.ty.dims.length` (always ≥ 2). If it's exactly 2
+  // we can fold; if it's > 2 we know ndim statically too and could
+  // fold, but a runtime read keeps the emitted C readable.
+  if (a.ty.dims.length === 2) {
+    return {
+      kind: "NumLit",
+      value: 2,
+      ty: scalarDouble("positive"),
+      span,
+    };
+  }
+  return null;
+}
+
+/** Expression-position lowering for `reshape(A, d1, d2, ...)`. Takes
+ *  N >= 2 dim args and emits a runtime call to `mtoc_tensor_reshape`
+ *  (or its complex sibling). The result type carries
+ *  `dims = [unknown, unknown, ...]` of length N, normalized (trailing
+ *  ones above index 1 stripped) by `numericTypeND`. */
+function reshapeLowerExpr(
+  _ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  if (args.length < 3) {
+    throw new UnsupportedConstruct(
+      `reshape(...) requires at least 3 args ` +
+        `(tensor + at least 2 dim sizes, got ${args.length})`,
+      span
+    );
+  }
+  const a = args[0];
+  if (!isNumeric(a.ty) || a.ty.elem !== "double") {
+    throw new UnsupportedConstruct(
+      `reshape: first arg must be a double-elem tensor ` +
+        `(got ${typeToString(a.ty)})`,
+      span
+    );
+  }
+  if (!isMultiElement(a.ty)) {
+    throw new UnsupportedConstruct(
+      `reshape: first arg must be a multi-element tensor today ` +
+        `(scalar reshape is not yet implemented)`,
+      span
+    );
+  }
+  const dimArgs = args.slice(1);
+  for (let i = 0; i < dimArgs.length; i++) {
+    if (!isScalarReal(dimArgs[i].ty)) {
+      throw new UnsupportedConstruct(
+        `reshape: dim arg #${i + 1} must be a real scalar ` +
+          `(got ${typeToString(dimArgs[i].ty)})`,
+        span
+      );
+    }
+  }
+  const ndim = dimArgs.length;
+  const resultDims: DimInfo[] = [];
+  for (let i = 0; i < ndim; i++) resultDims.push({ kind: "unknown" });
+  const isComplex = a.ty.isComplex;
+  const resultTy = numericTypeND(resultDims, isComplex, "unknown");
+  const helper = isComplex
+    ? "mtoc_tensor_reshape_complex"
+    : "mtoc_tensor_reshape";
+  const params: ParamConstraint[] = [
+    {
+      shape: "tensor",
+      domain: null,
+      elem: "double",
+      complexDomain: "real-or-complex",
+    },
+    ...dimArgs.map(
+      (): ParamConstraint => ({
+        shape: "scalar",
+        domain: null,
+        elem: "double",
+        complexDomain: "real-only",
+      })
+    ),
+  ];
+  const sig: BuiltinSig = {
+    name: "reshape",
+    category: "expr",
+    params,
+    result: () => resultTy,
+    emit: (argStrs, _argTys, state) => {
+      state.useRuntime(helper);
+      const dimsList = argStrs
+        .slice(1)
+        .map(s => `(long)(${s})`)
+        .join(", ");
+      return `${helper}(${argStrs[0]}, ${ndim}, (long[]){${dimsList}})`;
+    },
+  };
+  return {
+    kind: "Call",
+    name: "reshape",
+    callee: { kind: "builtin", sig },
+    args: [...args],
+    ty: resultTy,
+    span,
   };
 }
 

@@ -7,6 +7,6 @@
  */
 
 static mtoc_tensor_t mtoc_tensor_empty(void) {
-  mtoc_tensor_t out = { NULL, NULL, 0, 0 };
+  mtoc_tensor_t out = { NULL, NULL, 0, {0} };
   return out;
 }

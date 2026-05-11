@@ -24,11 +24,13 @@ import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IndexSliceArg } from "./ir.js";
 import {
   isColVec,
+  isHigherDim,
   isMultiElement,
   isNumeric,
   isRowVec,
   isScalarReal,
   numericType,
+  scalarDouble,
   type DimInfo,
   type MType,
   type NumericType,
@@ -67,6 +69,13 @@ export function lowerIndexSlice(
   if (baseTy.elem === "char") {
     throw new UnsupportedConstruct(
       `range/colon indexing into a char tensor is not yet supported`,
+      span
+    );
+  }
+  if (isHigherDim(baseTy)) {
+    throw new UnsupportedConstruct(
+      `range/colon indexing into a tensor with ndim > 2 is not yet ` +
+        `supported (reshape to 2-D first)`,
       span
     );
   }
@@ -216,12 +225,5 @@ function lowerSliceArg(
  *  Defined inline here so this file doesn't need to thread through
  *  the broader sign helpers. */
 function scalarRealOne(): NumericType {
-  return {
-    kind: "Numeric",
-    elem: "double",
-    isComplex: false,
-    rows: { kind: "one" },
-    cols: { kind: "one" },
-    sign: "positive",
-  };
+  return scalarDouble("positive");
 }

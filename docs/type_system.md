@@ -41,8 +41,11 @@ NumericType {
                         //   `double` / `double _Complex` / `mtoc_tensor_t`
                         //   accordingly. Complex tensors mirror numbl's
                         //   split storage (separate real/imag buffers).
-  rows: DimInfo
-  cols: DimInfo
+  dims: DimInfo[]       // per-axis dim lattice; invariant length >= 2,
+                        //   matching numbl's min-2 padding convention.
+                        //   Trailing singletons above index 1 are stripped
+                        //   by the `numericTypeND` factory (numbl's
+                        //   `reshape` normalization rule).
   sign: Sign
 }
 ```
@@ -53,15 +56,23 @@ dispatch on shape via the `isScalar` / `isRowVec` / `isColVec` / `isVector` /
 via `cTypeFor` (bare `double` for scalars, `mtoc_tensor_t` struct for
 multi-element).
 
+The dims array has invariant length >= 2; for 2-D values (the common case
+today) it is exactly `[rowsDim, colsDim]`. Builtins that produce N-D
+results (`reshape`) push longer arrays through `numericTypeND`. The
+`isHigherDim` predicate guards the operations that don't yet support
+`ndim > 2` (arithmetic, indexing, slicing) with a clear "not yet
+supported" diagnostic.
+
 The predicates intentionally return plain `boolean`, not `t is NumericType`: a
 type predicate would have TS narrow `NumericType` to `never` in the false
 branch, which is wrong. Callers needing `NumericType` narrowing should
 `isNumeric(t)` first.
 
 A small set of constructor helpers (`scalarDouble`, `scalarComplex`,
-`rowVecDouble`, `colVecDouble`, and the general `numericType(rows, cols, …)`)
-keeps lowering call sites short. The vec/scalar variants no longer take a
-numeric `n` — dims are categorical and the row/col arity is `one` or `notOne`.
+`rowVecDouble`, `colVecDouble`, the 2-D shim `numericType(rows, cols, …)`,
+and the N-D factory `numericTypeND(dims, …)`) keeps lowering call sites
+short. The vec/scalar variants no longer take a numeric `n` — dims are
+categorical and each axis is `one`, `notOne`, or `unknown`.
 
 ## DimInfo
 
@@ -83,11 +94,12 @@ directly.
 
 Codegen consumes the coarse dims to pick the C representation
 (`isScalar` ⇒ `double` / `double _Complex`; `isMultiElement` ⇒
-`mtoc_tensor_t`). Specific row/col counts are read from
-`mtoc_tensor_t.rows` / `.cols` at runtime — for tensor literals, the
-lowering pass attaches the source-level cell counts to the IR's
+`mtoc_tensor_t`). Specific dim sizes are read from
+`mtoc_tensor_t.dims[i]` at runtime — for tensor literals, the lowering
+pass attaches the source-level cell counts to the IR's
 `TensorLit.elements`, and codegen emits those as static integers at
-the assignment site.
+the assignment site. `isMultiElement` treats `unknown` as multi-element
+so reshape's runtime-shape result lands in the tensor representation.
 
 Specialization-key collapse falls out of this. Two calls
 `total([1 2 3])` and `total([1 2 3 4])` canonicalize to the same

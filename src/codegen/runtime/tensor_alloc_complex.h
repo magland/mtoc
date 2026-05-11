@@ -9,7 +9,8 @@ static mtoc_tensor_t mtoc_tensor_alloc_complex(long rows, long cols) {
   long n = rows * cols;
   out.real = mtoc_alloc(n * sizeof(double));
   out.imag = mtoc_alloc(n * sizeof(double));
-  out.rows = rows;
-  out.cols = cols;
+  out.ndim = 2;
+  out.dims[0] = rows;
+  out.dims[1] = cols;
   return out;
 }

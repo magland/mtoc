@@ -21,6 +21,7 @@ import type { Expr, LValue, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IRStmt } from "./ir.js";
 import {
+  isHigherDim,
   isMultiElement,
   isNumeric,
   isScalar,
@@ -67,6 +68,13 @@ export function lowerIndexStore(
   if (baseTy.elem === "char") {
     throw new UnsupportedConstruct(
       `indexed write into a char tensor is not yet supported`,
+      span
+    );
+  }
+  if (isHigherDim(baseTy)) {
+    throw new UnsupportedConstruct(
+      `indexed write into a tensor with ndim > 2 is not yet supported ` +
+        `(reshape to 2-D first)`,
       span
     );
   }

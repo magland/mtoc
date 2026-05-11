@@ -17,12 +17,15 @@ import {
   arithResult,
   isCharArray,
   isCharScalar,
+  isHigherDim,
   isMultiElement,
   isScalar,
   isScalarComplex,
   isScalarReal,
   isNumeric,
   isString,
+  numericTypeND,
+  rowVecDouble,
   scalarComplex,
   scalarDouble,
   STRING,
@@ -202,14 +205,7 @@ function lowerComparison(
       );
     }
     // Result is a double row-vec (element-wise 0/1).
-    const resultTy: NumericType = {
-      kind: "Numeric",
-      elem: "double",
-      isComplex: false,
-      rows: { kind: "one" },
-      cols: { kind: "notOne" },
-      sign: "nonnegative",
-    };
+    const resultTy: NumericType = rowVecDouble("nonnegative");
     return {
       kind: "Binary",
       op: e.op,
@@ -263,6 +259,12 @@ function lowerComparison(
         e.span
       );
     }
+    if (isHigherDim(left.ty) || isHigherDim(right.ty)) {
+      throw new UnsupportedConstruct(
+        `comparison ${e.op} on a tensor with ndim > 2 is not yet supported`,
+        e.span
+      );
+    }
     const shape = arithResult("Add", left.ty, right.ty);
     if (!isNumeric(shape)) {
       throw new UnsupportedConstruct(
@@ -271,14 +273,11 @@ function lowerComparison(
         e.span
       );
     }
-    const resultTy: NumericType = {
-      kind: "Numeric",
-      elem: "double",
-      isComplex: false,
-      rows: shape.rows,
-      cols: shape.cols,
-      sign: "nonnegative",
-    };
+    const resultTy: NumericType = numericTypeND(
+      shape.dims,
+      false,
+      "nonnegative"
+    );
     return {
       kind: "Binary",
       op: e.op,
@@ -445,14 +444,7 @@ function lowerPow(
       e.span
     );
   }
-  const resultTy: NumericType = {
-    kind: "Numeric",
-    elem: "double",
-    isComplex: false,
-    rows: shape.rows,
-    cols: shape.cols,
-    sign: "unknown",
-  };
+  const resultTy: NumericType = numericTypeND(shape.dims, false, "unknown");
   return {
     kind: "Binary",
     op: e.op,
@@ -475,6 +467,14 @@ function lowerArith(
   if (!arithOp) {
     throw new UnsupportedConstruct(
       `unsupported arith operator ${e.op}`,
+      e.span
+    );
+  }
+  if (isHigherDim(left.ty) || isHigherDim(right.ty)) {
+    throw new UnsupportedConstruct(
+      `binary ${e.op} on a tensor with ndim > 2 is not yet supported ` +
+        `(reshape to 2-D first; the elementwise codegen loop is still ` +
+        `2-D-shaped)`,
       e.span
     );
   }

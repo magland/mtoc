@@ -42,6 +42,7 @@ import {
   isString,
   MType,
   NumericType,
+  charArrayType,
   scalarChar,
   scalarComplex,
   scalarDouble,
@@ -437,14 +438,7 @@ export class Lowerer {
       const absentDefault: MType = present.every(isString)
         ? STRING
         : present.every(t => isCharArray(t))
-          ? {
-              kind: "Numeric",
-              elem: "char",
-              isComplex: false,
-              rows: { kind: "one" },
-              cols: { kind: "notOne" },
-              sign: "unknown",
-            }
+          ? charArrayType({ kind: "notOne" })
           : present.every(t => isCharScalar(t))
             ? scalarChar()
             : scalarDouble("zero");
@@ -730,14 +724,7 @@ export class Lowerer {
         }
         const n = inner.length;
         const cols: DimInfo = n === 1 ? { kind: "one" } : { kind: "notOne" };
-        const ty: NumericType = {
-          kind: "Numeric",
-          elem: "char",
-          isComplex: false,
-          rows: { kind: "one" },
-          cols,
-          sign: "unknown",
-        };
+        const ty: NumericType = n === 1 ? scalarChar() : charArrayType(cols);
         return { kind: "CharLit", value: inner, ty, span: e.span };
       }
 
@@ -852,14 +839,25 @@ type OwnedExprKind =
   | "tensor-lit"
   | "string-concat"
   | "index-slice"
-  | "user-call";
+  | "user-call"
+  | "builtin-call";
 
 function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
   if (e.kind === "TensorLit") return "tensor-lit";
   if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
   if (e.kind === "IndexSlice") return "index-slice";
-  if (e.kind === "Call" && e.callee.kind === "userFunc" && isOwned(e.ty)) {
-    return "user-call";
+  if (e.kind === "Call" && isOwned(e.ty)) {
+    if (e.callee.kind === "userFunc") return "user-call";
+    // Non-elementwise builtin Call that returns an owned tensor
+    // (e.g. `size(t)`, `reshape(t, …)`). Elementwise lifts use a
+    // scalar-only sig and don't allocate at the Call site; they're
+    // not owned producers in the ANF sense.
+    if (
+      e.callee.kind === "builtin" &&
+      !e.callee.sig.params.every(p => p.shape === "scalar")
+    ) {
+      return "builtin-call";
+    }
   }
   return null;
 }
@@ -886,6 +884,11 @@ function ownedExprMessage(kind: OwnedExprKind): string {
         "internal: owned-returning user-function call still nested " +
         "inside another expression after ANF; ANF pass should have " +
         "hoisted it"
+      );
+    case "builtin-call":
+      return (
+        "internal: owned-returning builtin call still nested inside " +
+        "another expression after ANF; ANF pass should have hoisted it"
       );
   }
 }
@@ -956,7 +959,7 @@ function validateStmt(s: IRStmt): void {
         rejectNestedOwnedExpr(slice.index.step);
         rejectNestedOwnedExpr(slice.index.end);
       }
-    } else if (top === "user-call") {
+    } else if (top === "user-call" || top === "builtin-call") {
       const call = s.rhs as Extract<IRExpr, { kind: "Call" }>;
       for (const a of call.args) rejectNestedOwnedExpr(a);
     } else {

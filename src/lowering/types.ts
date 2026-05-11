@@ -19,7 +19,7 @@ export type ElemKind = "double" | "char";
  * intentionally coarse: we only track whether the axis is a scalar
  * broadcast (`one`) or not (`notOne`), or whether we don't know yet
  * (`unknown`). The specific size is runtime data — codegen reads it
- * off the `mtoc_tensor_t.rows` / `.cols` fields.
+ * off the `mtoc_tensor_t.dims[…]` fields.
  *
  *   one      — statically exactly 1 (broadcast axis).
  *   notOne   — provably not 1 (admits 0 for empty tensors and any n≥2);
@@ -32,6 +32,8 @@ export type DimInfo =
   | { kind: "one" }
   | { kind: "notOne" }
   | { kind: "unknown" };
+
+const DIM_ONE: DimInfo = { kind: "one" };
 
 /**
  * What we know statically about the sign of a real-valued tensor.
@@ -55,6 +57,13 @@ export type Sign =
  * C representation (`double` vs `double _Complex` vs the
  * `mtoc_tensor_t` struct).
  *
+ * Shape representation: `dims[i]` is the lattice value for axis `i`.
+ * The invariant is `dims.length >= 2`; trailing singleton axes above
+ * index 1 are stripped by factories (matching numbl's `reshape`
+ * normalization rule). Today every numeric value mtoc actually
+ * constructs has exactly `dims.length === 2`; the array form exists
+ * so the IR can grow to N-D without further plumbing changes.
+ *
  * Invariant: `sign` is meaningful only when `isComplex === false`.
  * For complex numerics, `sign` MUST be `"unknown"`. The invariant is
  * enforced wherever the type is observed for behavioral effect:
@@ -68,10 +77,24 @@ export interface NumericType {
   kind: "Numeric";
   elem: ElemKind;
   isComplex: boolean;
-  rows: DimInfo;
-  cols: DimInfo;
+  /** Per-axis DimInfo. Length >= 2 (invariant — see file header). */
+  dims: readonly DimInfo[];
   /** Meaningful only when `isComplex === false`; "unknown" otherwise. */
   sign: Sign;
+}
+
+/** Normalize a dims array to satisfy the `length >= 2` invariant by
+ *  padding with `{kind: "one"}`, and strip trailing singletons above
+ *  index 1 (matching numbl's `reshape` rule). The result has minimum
+ *  length 2; any trailing axes that are statically known to be 1 are
+ *  dropped down to that floor. */
+function normalizeDims(dims: readonly DimInfo[]): readonly DimInfo[] {
+  const padded: DimInfo[] = dims.length >= 2 ? dims.slice() : [...dims];
+  while (padded.length < 2) padded.push(DIM_ONE);
+  while (padded.length > 2 && padded[padded.length - 1].kind === "one") {
+    padded.pop();
+  }
+  return padded;
 }
 
 /**
@@ -113,8 +136,7 @@ export const SCALAR_DOUBLE: NumericType = {
   kind: "Numeric",
   elem: "double",
   isComplex: false,
-  rows: { kind: "one" },
-  cols: { kind: "one" },
+  dims: [DIM_ONE, DIM_ONE],
   sign: "unknown",
 };
 
@@ -124,8 +146,7 @@ export const SCALAR_CHAR: NumericType = {
   kind: "Numeric",
   elem: "char",
   isComplex: false,
-  rows: { kind: "one" },
-  cols: { kind: "one" },
+  dims: [DIM_ONE, DIM_ONE],
   sign: "unknown",
 };
 
@@ -140,8 +161,7 @@ export function charArrayType(cols: DimInfo): NumericType {
     kind: "Numeric",
     elem: "char",
     isComplex: false,
-    rows: { kind: "one" },
-    cols,
+    dims: [DIM_ONE, cols],
     sign: "unknown",
   };
 }
@@ -158,22 +178,20 @@ export function scalarComplex(): NumericType {
     kind: "Numeric",
     elem: "double",
     isComplex: true,
-    rows: { kind: "one" },
-    cols: { kind: "one" },
+    dims: [DIM_ONE, DIM_ONE],
     sign: "unknown",
   };
 }
 
 /** Construct a row-vector type. The cols dim is `notOne` (i.e.
  *  provably ≠ 1); the specific size is runtime data and lives on
- *  `mtoc_tensor_t.cols` at runtime. */
+ *  `mtoc_tensor_t.dims[1]` at runtime. */
 export function rowVecDouble(sign: Sign = "unknown"): NumericType {
   return {
     kind: "Numeric",
     elem: "double",
     isComplex: false,
-    rows: { kind: "one" },
-    cols: { kind: "notOne" },
+    dims: [DIM_ONE, { kind: "notOne" }],
     sign,
   };
 }
@@ -185,8 +203,7 @@ export function colVecDouble(sign: Sign = "unknown"): NumericType {
     kind: "Numeric",
     elem: "double",
     isComplex: false,
-    rows: { kind: "notOne" },
-    cols: { kind: "one" },
+    dims: [{ kind: "notOne" }, DIM_ONE],
     sign,
   };
 }
@@ -201,12 +218,24 @@ export function numericType(
   isComplex: boolean = false,
   sign: Sign = "unknown"
 ): NumericType {
+  return numericTypeND([rows, cols], isComplex, sign);
+}
+
+/** N-dimensional factory. The dims array is normalized: padded to
+ *  `length >= 2` and trailing singletons above index 1 stripped
+ *  (numbl's `reshape` normalization). For 2-D callers, the 2-arg
+ *  `numericType(rows, cols, …)` shim above is more readable. */
+export function numericTypeND(
+  dims: readonly DimInfo[],
+  isComplex: boolean = false,
+  sign: Sign = "unknown",
+  elem: ElemKind = "double"
+): NumericType {
   return {
     kind: "Numeric",
-    elem: "double",
+    elem,
     isComplex,
-    rows,
-    cols,
+    dims: normalizeDims(dims),
     sign: isComplex ? "unknown" : sign,
   };
 }
@@ -241,19 +270,32 @@ export function dimIsNotOne(d: DimInfo): boolean {
 // NumericType from itself in the false branch, narrowing to `never`.
 // Callers that need NumericType narrowing should `isNumeric(t)` first.
 
-/** True when both dimensions are statically known to be exactly 1. */
+/** True when every axis is statically known to be exactly 1. */
 export function isScalar(t: MType): boolean {
-  return isNumeric(t) && dimIsOne(t.rows) && dimIsOne(t.cols);
+  return isNumeric(t) && t.dims.every(dimIsOne);
 }
 
-/** True when rows is exactly 1 and cols is statically known to be not 1. */
+/** True when axis 0 is exactly 1, axis 1 is statically known to be not 1,
+ *  and any further axes are 1 (trailing-singleton normalization keeps a
+ *  pure row vector at exactly length 2). */
 export function isRowVec(t: MType): boolean {
-  return isNumeric(t) && dimIsOne(t.rows) && dimIsNotOne(t.cols);
+  return (
+    isNumeric(t) &&
+    t.dims.length >= 2 &&
+    dimIsOne(t.dims[0]) &&
+    dimIsNotOne(t.dims[1]) &&
+    t.dims.slice(2).every(dimIsOne)
+  );
 }
 
-/** True when cols is exactly 1 and rows is statically known to be not 1. */
+/** True when axis 0 is statically not 1 and every other axis is 1. */
 export function isColVec(t: MType): boolean {
-  return isNumeric(t) && dimIsOne(t.cols) && dimIsNotOne(t.rows);
+  return (
+    isNumeric(t) &&
+    t.dims.length >= 1 &&
+    dimIsNotOne(t.dims[0]) &&
+    t.dims.slice(1).every(dimIsOne)
+  );
 }
 
 /** A vector is a row vector or a column vector (and not a scalar). */
@@ -266,11 +308,14 @@ export function isMatrix(t: MType): boolean {
   return isMultiElement(t) && !isVector(t);
 }
 
-/** Multi-element tensor (vector or matrix). At least one dim is
- *  statically known to be not 1. Codegen uses this to pick between the
- *  bare `double` representation and `mtoc_tensor_t`. */
+/** Multi-element tensor (vector or matrix). At least one axis is NOT
+ *  statically known to be 1 — `notOne` or `unknown` both count.
+ *  Codegen uses this to pick between the bare `double` representation
+ *  and `mtoc_tensor_t`; `unknown` defaults to the tensor representation
+ *  because it might be > 1 at runtime (e.g. the output of `reshape`,
+ *  whose per-axis sizes are runtime-determined). */
 export function isMultiElement(t: MType): boolean {
-  return isNumeric(t) && (dimIsNotOne(t.rows) || dimIsNotOne(t.cols));
+  return isNumeric(t) && t.dims.some(d => !dimIsOne(d));
 }
 
 /** True when `t` is a scalar char (1×1, C `char`). */
@@ -281,6 +326,16 @@ export function isCharScalar(t: MType): boolean {
 /** True when `t` is a multi-element char array (`mtoc_char_tensor_t`). */
 export function isCharArray(t: MType): boolean {
   return isNumeric(t) && t.elem === "char" && isMultiElement(t);
+}
+
+/** True when `t`'s static shape is known to extend past 2 axes
+ *  (`dims.length > 2`). Lowering sites that do not yet handle N-D
+ *  tensors gate on this and emit a clear "not yet supported"
+ *  diagnostic — disp, reshape, size, ndims, numel, length, and
+ *  variable assignment are the only operations currently allowed
+ *  to consume one. */
+export function isHigherDim(t: MType): boolean {
+  return isNumeric(t) && t.dims.length > 2;
 }
 
 /** True when the value of type `t` is backed by a heap allocation that
@@ -455,9 +510,17 @@ function joinDim(a: DimInfo, b: DimInfo): DimInfo {
 //
 // Single source of truth describing every storable field on `NumericType`.
 // `canonicalizeType`, `typeToString`, and `unify` all iterate this list
-// instead of hand-rolling a copy of every field. Adding a new field
-// (say, `complexKind`) means appending one entry here — the three
+// instead of hand-rolling a copy of every field. Adding a new scalar
+// field (say, `complexKind`) means appending one entry here — the three
 // shared routines pick it up automatically.
+//
+// Shape (`dims`) is special-cased outside this template because it is
+// array-valued; the template handles only the scalar fields. The
+// "rows"/"cols" entries below are synthetic canonicalize-only fragments
+// that pull from `dims[0]`/`dims[1]` to preserve mangled-name hash
+// compatibility with the pre-N-D 2-D form (`canonicalizeType` for a
+// 2-D type produces the same JSON as before; for ndim > 2 it appends
+// a `dims` field so higher axes participate in the hash).
 //
 // IMPORTANT: the field ORDER below is the canonical hash order. Since
 // the lowerer hashes `JSON.stringify(canonicalizeType(...))` to produce
@@ -466,15 +529,13 @@ function joinDim(a: DimInfo, b: DimInfo): DimInfo {
 // New fields MUST be appended to the end.
 
 interface TensorFieldEntry {
-  /** Field key on `NumericType`. */
-  readonly name: keyof NumericType;
+  /** Output key in the canonicalized JSON object. */
+  readonly name: string;
   /** Canonical-hash value contributed by this field (deterministic JSON
-   *  for `canonicalizeType`). Default: pass-through of `t[name]`. */
+   *  for `canonicalizeType`). */
   readonly canonicalize: (t: NumericType) => unknown;
   /** typeToString fragment contributed by this field. Empty string is
-   *  fine — the framing handles separators. Receives the whole type so
-   *  paired-field renderings (rows+cols → "RxC") can be coalesced into
-   *  a single field's contribution. */
+   *  fine — the framing handles separators. */
   readonly format: (t: NumericType) => string;
   /** Joins this field across `a` and `b`, writing the result into
    *  `out`. Returns `false` when the two values can't share a single
@@ -486,9 +547,9 @@ interface TensorFieldEntry {
   ) => boolean;
 }
 
-/** Build a field entry with per-field types preserved. The resulting
- *  closures cast inside the union so callers see a uniform interface. */
-function makeField<K extends keyof NumericType>(
+/** Build a field entry for a scalar (non-array) `NumericType` key.
+ *  Array-valued fields like `dims` are handled separately. */
+function makeField<K extends Exclude<keyof NumericType, "dims" | "kind">>(
   name: K,
   format: (t: NumericType) => string,
   join: (a: NumericType[K], b: NumericType[K]) => NumericType[K] | null
@@ -517,17 +578,47 @@ const NUMERIC_FIELDS: ReadonlyArray<TensorFieldEntry> = [
     t => (t.isComplex ? "complex" : "real"),
     (a, b) => a || b
   ),
-  // rows/cols emit the empty fragment — their pretty-printed form
-  // ("RxC") is rendered by typeToString itself in the framing prefix
-  // because it reads both fields together.
-  makeField("rows", () => "", joinDim),
-  makeField("cols", () => "", joinDim),
+  // Synthetic rows/cols canonicalize fragments: preserve the legacy
+  // {rows, cols} hash form for 2-D types. Joining is handled separately
+  // by `joinDimsArray` in `unify`, so these entries are no-ops there.
+  // typeToString renders dims via its own dedicated path.
+  {
+    name: "rows",
+    canonicalize: t => t.dims[0],
+    format: () => "",
+    joinInto: () => true,
+  },
+  {
+    name: "cols",
+    canonicalize: t => t.dims[1],
+    format: () => "",
+    joinInto: () => true,
+  },
   makeField(
     "sign",
     t => (t.sign === "unknown" ? "" : `sign=${t.sign}`),
     joinSign
   ),
 ];
+
+/** Join two dims arrays. Pads the shorter to `max(a.length, b.length, 2)`
+ *  with `{kind: "one"}`, then `joinDim`s element-wise. The result
+ *  satisfies the `length >= 2` invariant on `NumericType.dims` (and is
+ *  re-normalized through `normalizeDims` by the factory at the call
+ *  site to strip trailing singletons). */
+function joinDimsArray(
+  a: readonly DimInfo[],
+  b: readonly DimInfo[]
+): readonly DimInfo[] {
+  const len = Math.max(a.length, b.length, 2);
+  const result: DimInfo[] = [];
+  for (let i = 0; i < len; i++) {
+    const ai = a[i] ?? DIM_ONE;
+    const bi = b[i] ?? DIM_ONE;
+    result.push(joinDim(ai, bi));
+  }
+  return result;
+}
 
 /**
  * Compute the least upper bound of two types (used at control-flow joins
@@ -553,12 +644,12 @@ export function unify(a: MType, b: MType): MType {
       ? STRING
       : { kind: "Unknown" };
   }
-  // Walk the field template, building a fresh NumericType in the
-  // canonical field order (kind, then NUMERIC_FIELDS in array order).
-  // Insertion order matters because canonicalizeType normalizes by
-  // re-iterating the same template, but keeping it consistent here
-  // keeps debug-prints stable too.
-  const out: Record<string, unknown> = { kind: "Numeric" };
+  // Build a fresh NumericType. Shape is array-valued so it's joined
+  // separately; the template walks only the scalar fields.
+  const out: Record<string, unknown> = {
+    kind: "Numeric",
+    dims: normalizeDims(joinDimsArray(a.dims, b.dims)),
+  };
   for (const f of NUMERIC_FIELDS) {
     if (!f.joinInto(a, b, out)) return { kind: "Unknown" };
   }
@@ -599,6 +690,29 @@ function dimMeet(a: DimInfo, b: DimInfo): DimInfo {
   if (b.kind === "unknown") return a;
   // Per dimAccept's contract, the (one, notOne) pair never gets here.
   return { kind: "unknown" };
+}
+
+/** Broadcast two shape arrays. Pads the shorter with `{kind: "one"}`
+ *  to `max(a.length, b.length, 2)`, then takes `dimMeet` element-wise.
+ *  Returns `null` when any axis fails `dimAccept` (categorical
+ *  mismatch — the rowVec-vs-colVec case the coarse lattice can prove
+ *  incompatible).
+ *
+ *  Result is unnormalized — caller passes through `numericTypeND` /
+ *  `normalizeDims` to strip trailing singletons. */
+export function broadcastShape(
+  a: readonly DimInfo[],
+  b: readonly DimInfo[]
+): readonly DimInfo[] | null {
+  const len = Math.max(a.length, b.length, 2);
+  const result: DimInfo[] = [];
+  for (let i = 0; i < len; i++) {
+    const ai = a[i] ?? DIM_ONE;
+    const bi = b[i] ?? DIM_ONE;
+    if (!dimAccept(ai, bi)) return null;
+    result.push(dimMeet(ai, bi));
+  }
+  return result;
 }
 
 /**
@@ -642,26 +756,12 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   const bSc = isScalar(b);
 
   if (aSc && bSc) {
-    return {
-      kind: "Numeric",
-      elem: resultElem,
-      isComplex,
-      rows: { kind: "one" },
-      cols: { kind: "one" },
-      sign,
-    };
+    return numericTypeND([DIM_ONE, DIM_ONE], isComplex, sign, resultElem);
   }
   if (aSc || bSc) {
     // Scalar broadcasts to the other operand's shape.
     const tensor = aSc ? b : a;
-    return {
-      kind: "Numeric",
-      elem: resultElem,
-      isComplex,
-      rows: tensor.rows,
-      cols: tensor.cols,
-      sign,
-    };
+    return numericTypeND(tensor.dims, isComplex, sign, resultElem);
   }
   // Both are tensors — only elementwise (Add/Sub) is allowed today
   // when we route here. Mul/Div on two tensors are matrix multiply /
@@ -669,17 +769,9 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
   // `Mul`/`Div` in the abstract kind too, so we accept those here for
   // same-shape and reject in the lowerer's path that distinguishes
   // `Mul` from `ElemMul`.
-  if (!dimAccept(a.rows, b.rows) || !dimAccept(a.cols, b.cols)) {
-    return { kind: "Unknown" };
-  }
-  return {
-    kind: "Numeric",
-    elem: resultElem,
-    isComplex,
-    rows: dimMeet(a.rows, b.rows),
-    cols: dimMeet(a.cols, b.cols),
-    sign,
-  };
+  const broadcasted = broadcastShape(a.dims, b.dims);
+  if (broadcasted === null) return { kind: "Unknown" };
+  return numericTypeND(broadcasted, isComplex, sign, resultElem);
 }
 
 /** Backwards-compat alias for code paths that only deal with the
@@ -708,6 +800,13 @@ export function canonicalizeType(t: MType): unknown {
   for (const f of NUMERIC_FIELDS) {
     out[f.name] = f.canonicalize(normalized);
   }
+  // For ndim > 2, the synthetic rows/cols fragments above only capture
+  // axes 0 and 1; append the full dims array so higher axes participate
+  // in the specialization hash. For ndim === 2 this key is omitted so
+  // the hash form remains byte-identical to the pre-N-D representation.
+  if (normalized.dims.length > 2) {
+    out.dims = normalized.dims;
+  }
   return out;
 }
 
@@ -722,10 +821,9 @@ export function typeToString(t: MType): string {
   if (t.kind === "Void") return "Void";
   if (t.kind === "String") return "String";
   const cat = shapeCategory(t);
-  // Dims are rendered into the framing prefix — they're a paired
-  // rows+cols read, which doesn't fit the per-field iteration model.
-  // The corresponding NUMERIC_FIELDS entries return the empty fragment.
-  const dims = `${dimToString(t.rows)}x${dimToString(t.cols)}`;
+  // dims is array-valued so rendered into the framing prefix; the
+  // NUMERIC_FIELDS entries for rows/cols contribute empty fragments.
+  const dims = t.dims.map(dimToString).join("x");
   const fragments = NUMERIC_FIELDS.map(f => f.format(t)).filter(s => s !== "");
   return `Numeric<${cat}(${dims}), ${fragments.join(", ")}>`;
 }

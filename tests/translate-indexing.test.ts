@@ -6,7 +6,7 @@ describe("indexing — scalar reads", () => {
   // Cross-runner tests in test_scripts/indexing/ verify byte-for-byte
   // stdout against numbl. These vitest assertions pin the *shape* of
   // the emitted C — specific patterns (`v.real[(long)(i) - 1L]`,
-  // `M.real[i + j * M.rows]`) that stdout comparison alone can't
+  // `M.real[i + j * M.dims[0]]`) that stdout comparison alone can't
   // catch.
 
   it("emits v.real[(long)(i) - 1L] for a 1-arg index on a row vector", () => {
@@ -21,34 +21,36 @@ describe("indexing — scalar reads", () => {
     const c = translate("M = [1 2 3; 4 5 6];\ndisp(M(2, 3));\n");
     // i + j*rows pattern with the (long)(...) - 1L conversions.
     expect(c).toMatch(
-      /M\.real\[\(long\)\(2\.0\) - 1L \+ \(\(long\)\(3\.0\) - 1L\) \* M\.rows\]/
+      /M\.real\[\(long\)\(2\.0\) - 1L \+ \(\(long\)\(3\.0\) - 1L\) \* M\.dims\[0\]\]/
     );
   });
 
-  it("resolves end inside a 1-arg index to numel via rows*cols", () => {
+  it("resolves end inside a 1-arg index to numel via dims[0]*dims[1]", () => {
     const c = translate("v = [1 2 3 4];\ndisp(v(end));\n");
-    // For 1-arg indexing, `end` resolves to `(v.rows * v.cols)`.
-    expect(c).toMatch(/v\.real\[\(long\)\(\(v\.rows \* v\.cols\)\) - 1L\]/);
+    // For 1-arg indexing, `end` resolves to `(v.dims[0] * v.dims[1])`.
+    expect(c).toMatch(
+      /v\.real\[\(long\)\(\(v\.dims\[0\] \* v\.dims\[1\]\)\) - 1L\]/
+    );
   });
 
-  it("resolves end in slot 0 of a 2-arg index to .rows", () => {
+  it("resolves end in slot 0 of a 2-arg index to .dims[0]", () => {
     const c = translate("M = [1 2; 3 4];\ndisp(M(end, 1));\n");
     expect(c).toMatch(
-      /M\.real\[\(long\)\(M\.rows\) - 1L \+ \(\(long\)\(1\.0\) - 1L\) \* M\.rows\]/
+      /M\.real\[\(long\)\(M\.dims\[0\]\) - 1L \+ \(\(long\)\(1\.0\) - 1L\) \* M\.dims\[0\]\]/
     );
   });
 
-  it("resolves end in slot 1 of a 2-arg index to .cols", () => {
+  it("resolves end in slot 1 of a 2-arg index to .dims[1]", () => {
     const c = translate("M = [1 2; 3 4];\ndisp(M(1, end));\n");
     expect(c).toMatch(
-      /M\.real\[\(long\)\(1\.0\) - 1L \+ \(\(long\)\(M\.cols\) - 1L\) \* M\.rows\]/
+      /M\.real\[\(long\)\(1\.0\) - 1L \+ \(\(long\)\(M\.dims\[1\]\) - 1L\) \* M\.dims\[0\]\]/
     );
   });
 
   it("composes index reads inside arithmetic", () => {
     const c = translate("v = [10 20 30];\ndisp(v(1) + v(end));\n");
     expect(c).toContain("v.real[(long)(1.0) - 1L]");
-    expect(c).toContain("v.real[(long)((v.rows * v.cols)) - 1L]");
+    expect(c).toContain("v.real[(long)((v.dims[0] * v.dims[1])) - 1L]");
     expect(c).toMatch(/v\.real\[.*\] \+ v\.real\[.*\]/);
   });
 
@@ -178,8 +180,8 @@ describe("indexing — range and colon reads", () => {
 
   it("v(:) emits a column-allocating linearization", () => {
     const c = translate("v = [10 20 30];\nw = v(:);\ndisp(w);\n");
-    // Colon: count = base.rows * base.cols, result is column.
-    expect(c).toContain("long _mtoc_n = v.rows * v.cols;");
+    // Colon: count = base.dims[0] * base.dims[1], result is column.
+    expect(c).toContain("long _mtoc_n = v.dims[0] * v.dims[1];");
     expect(c).toContain(
       "mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc(_mtoc_n, 1)"
     );
@@ -202,10 +204,10 @@ describe("indexing — range and colon reads", () => {
     );
   });
 
-  it("end inside a 1-slot range resolves to numel via rows*cols", () => {
+  it("end inside a 1-slot range resolves to numel via dims[0]*dims[1]", () => {
     const c = translate("v = [1 2 3 4 5];\nw = v(2:end);\ndisp(w);\n");
-    // The range's end is `end` → renders as `(v.rows * v.cols)`.
-    expect(c).toContain("double _mtoc_end = (v.rows * v.cols);");
+    // The range's end is `end` → renders as `(v.dims[0] * v.dims[1])`.
+    expect(c).toContain("double _mtoc_end = (v.dims[0] * v.dims[1]);");
   });
 
   it("emits both real and imag fills for a complex range slice", () => {
@@ -287,14 +289,14 @@ describe("indexing — scalar writes", () => {
   it("emits the column-major formula for M(i, j) = x", () => {
     const c = translate("M = [1 2; 3 4];\nM(2, 1) = 99;\ndisp(M);\n");
     expect(c).toMatch(
-      /M\.real\[\(long\)\(2\.0\) - 1L \+ \(\(long\)\(1\.0\) - 1L\) \* M\.rows\] = 99\.0;/
+      /M\.real\[\(long\)\(2\.0\) - 1L \+ \(\(long\)\(1\.0\) - 1L\) \* M\.dims\[0\]\] = 99\.0;/
     );
   });
 
   it("v(end) = x resolves end via numel for a 1-slot write", () => {
     const c = translate("v = [1 2 3 4];\nv(end) = 99;\ndisp(v);\n");
     expect(c).toMatch(
-      /v\.real\[\(long\)\(\(v\.rows \* v\.cols\)\) - 1L\] = 99\.0;/
+      /v\.real\[\(long\)\(\(v\.dims\[0\] \* v\.dims\[1\]\)\) - 1L\] = 99\.0;/
     );
   });
 
@@ -413,7 +415,7 @@ describe("indexing — range and colon writes", () => {
     // The codegen emits the count formula + a runtime check before
     // the loop.
     expect(c).toMatch(/long _mtoc_n = \(long\)floor\(/);
-    expect(c).toContain("long _mtoc_rhs_n = w.rows * w.cols;");
+    expect(c).toContain("long _mtoc_rhs_n = w.dims[0] * w.dims[1];");
     expect(c).toContain("if (_mtoc_n != _mtoc_rhs_n)");
     expect(c).toContain("range-write count mismatch");
     // Loop body writes into the base from rhs, with the dst offset
@@ -423,8 +425,8 @@ describe("indexing — range and colon writes", () => {
 
   it("v(:) = w emits the column-flat copy without a range formula", () => {
     const c = translate("v = [1 2 3];\nw = [9 8 7];\nv(:) = w;\ndisp(v);\n");
-    // Colon: count = base.rows * base.cols; dst offset is just k.
-    expect(c).toContain("long _mtoc_n = v.rows * v.cols;");
+    // Colon: count = base.dims[0] * base.dims[1]; dst offset is just k.
+    expect(c).toContain("long _mtoc_n = v.dims[0] * v.dims[1];");
     expect(c).toMatch(/long _mtoc_dst = _mtoc_k;/);
     expect(c).toMatch(/v\.real\[_mtoc_dst\] = w\.real\[_mtoc_k\];/);
   });

@@ -17,8 +17,7 @@ describe("type system invariants", () => {
     kind: "Numeric",
     elem: "double",
     isComplex: true,
-    rows: { kind: "one" },
-    cols: { kind: "one" },
+    dims: [{ kind: "one" }, { kind: "one" }],
     sign,
   });
 

@@ -8,7 +8,10 @@ import type { Expr, UnaryOperation as UnOp } from "../parser/index.js";
 import { UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
+  isHigherDim,
+  isMultiElement,
   isNumeric,
+  numericTypeND,
   scalarDouble,
   signFromValue,
   signNegate,
@@ -78,6 +81,14 @@ export function lowerUnary(
   }
   let ty: MType = operand.ty;
   if (isNumeric(operand.ty)) {
+    if (isMultiElement(operand.ty) && isHigherDim(operand.ty)) {
+      throw new UnsupportedConstruct(
+        `unary ${e.op} on a tensor with ndim > 2 is not yet supported ` +
+          `(reshape to 2-D first; the elementwise codegen loop is still ` +
+          `2-D-shaped)`,
+        e.span
+      );
+    }
     if (e.op === "Minus") {
       // Sign negation only applies on the real branch — complex `sign`
       // stays "unknown" by the type-system invariant.
@@ -89,14 +100,7 @@ export function lowerUnary(
       // double with sign=nonnegative (0.0/1.0); shape mirrors the
       // operand so the iter-loop codegen materializes a same-shape
       // result tensor.
-      ty = {
-        kind: "Numeric",
-        elem: "double",
-        isComplex: false,
-        rows: operand.ty.rows,
-        cols: operand.ty.cols,
-        sign: "nonnegative",
-      };
+      ty = numericTypeND(operand.ty.dims, false, "nonnegative");
     }
   }
   return { kind: "Unary", op: e.op, operand, ty, span: e.span };

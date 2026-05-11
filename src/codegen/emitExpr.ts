@@ -40,6 +40,18 @@ import {
   type EmitState,
 } from "./emitState.js";
 
+/** C-side struct field name for the row count of a tensor handle of
+ *  type `ty`. Double tensors store shape in `dims[…]`; char tensors
+ *  are 2-D-only and keep their legacy `.rows`/`.cols` fields. */
+export function tensorRowsField(ty: MType): string {
+  return isNumeric(ty) && ty.elem === "char" ? "rows" : "dims[0]";
+}
+
+/** C-side struct field name for the column count of a tensor handle. */
+export function tensorColsField(ty: MType): string {
+  return isNumeric(ty) && ty.elem === "char" ? "cols" : "dims[1]";
+}
+
 /** Copy-on-arg-pass: wrap an owned-typed argument in its kind's `copy`
  *  helper so the callee gets a freshly-owned value to manage. Tensors
  *  (real / complex) and char arrays follow this protocol; strings
@@ -71,18 +83,23 @@ export function emitExpr(
   // the check at the top level.
   // `CharLit` is excluded: a non-owning literal handle (char scalar or
   // char array) is safe in any expression position — no allocation.
-  // User-function `Call`s that return a multi-element tensor are also
+  // Direct-Call producers — user-function `Call`s OR non-elementwise
+  // builtin `Call`s — that return a multi-element tensor are also
   // excluded: they return a fully-formed `mtoc_tensor_t` struct by
   // value, which the surrounding owned-LHS assign path consumes via
   // `mtoc_<kind>_assign(&lhs, foo(args))` without going through the
   // iter-loop materialization machinery.
-  const isUserFuncCall = e.kind === "Call" && e.callee.kind === "userFunc";
+  const isDirectOwnedCall =
+    e.kind === "Call" &&
+    (e.callee.kind === "userFunc" ||
+      (e.callee.kind === "builtin" &&
+        !e.callee.sig.params.every(p => p.shape === "scalar")));
   if (
     state.iterStack.length === 0 &&
     e.kind !== "Var" &&
     e.kind !== "TensorLit" &&
     e.kind !== "CharLit" &&
-    !isUserFuncCall &&
+    !isDirectOwnedCall &&
     isMultiElement(e.ty)
   ) {
     throw new Error(
@@ -267,13 +284,18 @@ export function emitExpr(
       // forms render to a `long`-valued C expression that auto-promotes
       // to `double` in arithmetic; the indexing site re-casts to long
       // before forming the bracket index.
+      //
+      // Double tensors carry shape in `dims[0..ndim-1]`; char tensors
+      // are 2-D only and keep their legacy `.rows`/`.cols` fields.
+      const rowsField = tensorRowsField(e.baseTy);
+      const colsField = tensorColsField(e.baseTy);
       switch (e.axis) {
         case "row":
-          return `${e.baseCName}.rows`;
+          return `${e.baseCName}.${rowsField}`;
         case "col":
-          return `${e.baseCName}.cols`;
+          return `${e.baseCName}.${colsField}`;
         case "linear":
-          return `(${e.baseCName}.rows * ${e.baseCName}.cols)`;
+          return `(${e.baseCName}.${rowsField} * ${e.baseCName}.${colsField})`;
       }
       // Exhaustiveness check.
       throw new Error(
@@ -287,7 +309,8 @@ export function emitExpr(
       // renders as a `double`-valued C string; we cast to `long` and
       // subtract 1 to reach the C 0-indexed slot. For 2D, codegen
       // emits the column-major formula `i + j * rows` using the base's
-      // runtime `.rows` field.
+      // runtime row count (`.dims[0]` for double tensors, `.rows` for
+      // char tensors — see `tensorRowsField`).
       //
       // The base is always rendered as the bare cName here — the per-
       // element iter rendering for multi-element Vars (`v.real[<iter>]`)
@@ -296,12 +319,13 @@ export function emitExpr(
       // rather than recursing through `emitExpr` on the base.
       const baseCName = e.base.cName;
       const baseTy = e.base.ty;
+      const baseRowsField = tensorRowsField(baseTy);
       const offset =
         e.indices.length === 1
           ? `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L`
           : `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L + ` +
             `((long)(${emitExpr(state, e.indices[1], 0)}) - 1L) * ` +
-            `${baseCName}.rows`;
+            `${baseCName}.${baseRowsField}`;
       // Char tensor: read `.data[offset]` — yields a scalar `char`.
       if (isNumeric(baseTy) && baseTy.elem === "char") {
         return `${baseCName}.data[${offset}]`;

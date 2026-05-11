@@ -18,6 +18,7 @@ import type { IRExpr, IRFunction } from "./ir.js";
 import {
   arithResult,
   canonicalizeType,
+  isHigherDim,
   isMultiElement,
   isOwned,
   isScalar,
@@ -116,20 +117,22 @@ export function lowerBuiltinCallWithArgs(
       span
     );
   }
+  // Optional `lowerExpr` override: lets a builtin constant-fold or
+  // rewrite the call before standard validation runs (e.g.
+  // `length(string)` folds to `NumLit(1)` regardless of the registry's
+  // shape: "tensor" constraint, since strings aren't tensors).
+  // Variadic builtins (`size`, `reshape`, ...) own their arity check
+  // here; the declared `params` length covers only the default path.
+  // Returning null defers to the standard path below.
+  if (builtin.lowerExpr) {
+    const overridden = builtin.lowerExpr(this, args, span);
+    if (overridden !== null) return overridden;
+  }
   if (args.length !== builtin.params.length) {
     throw new UnsupportedConstruct(
       `${name} expects ${builtin.params.length} argument(s), got ${args.length}`,
       span
     );
-  }
-  // Optional `lowerExpr` override: lets a builtin constant-fold or
-  // rewrite the call before standard validation runs (e.g.
-  // `length(string)` folds to `NumLit(1)` regardless of the registry's
-  // shape: "tensor" constraint, since strings aren't tensors). Returning
-  // null defers to the standard path below.
-  if (builtin.lowerExpr) {
-    const overridden = builtin.lowerExpr(this, args, span);
-    if (overridden !== null) return overridden;
   }
   const argLabel = (i: number): string =>
     builtin.params.length === 1 ? "x" : `arg ${i + 1}`;
@@ -141,6 +144,15 @@ export function lowerBuiltinCallWithArgs(
   // to validate the args against their scalar-equivalent constraints
   // and widen the builtin's scalar result type to the broadcast shape.
   if (isElementwiseEligible(builtin, args)) {
+    for (const a of args) {
+      if (isHigherDim(a.ty)) {
+        throw new UnsupportedConstruct(
+          `${name}: elementwise lift over a tensor with ndim > 2 is not ` +
+            `yet supported (reshape to 2-D first)`,
+          span
+        );
+      }
+    }
     const shape = broadcastNumericShape(args.map(a => a.ty));
     if (shape === null) {
       throw new TypeError(
@@ -174,11 +186,7 @@ export function lowerBuiltinCallWithArgs(
         span
       );
     }
-    const resultTy: NumericType = {
-      ...scalarResult,
-      rows: shape.rows,
-      cols: shape.cols,
-    };
+    const resultTy: NumericType = { ...scalarResult, dims: shape };
     return {
       kind: "Call",
       name,
@@ -251,33 +259,33 @@ function isElementwiseEligible(
   return anyMultiElement;
 }
 
-/** Drop the row/col dims of a numeric type down to 1×1 while preserving
- *  `elem`, `isComplex`, and `sign`. Used to "scalarify" an
+/** Drop the dims of a numeric type down to 1×1 (all axes `one`) while
+ *  preserving `elem`, `isComplex`, and `sign`. Used to "scalarify" an
  *  element-wise-lifted call's arg types before asking the builtin for
  *  its scalar-equivalent result type; the call site then widens that
  *  result back up to the broadcast shape. */
 function scalarifyType(t: MType): MType {
   if (!isNumeric(t)) return t;
   const one: DimInfo = { kind: "one" };
-  return { ...t, rows: one, cols: one };
+  return { ...t, dims: [one, one] };
 }
 
 /** Broadcast shape across a list of numeric arg types — the dim of the
  *  largest-shaped operand per axis (`scalar ⊙ tensor → tensor`,
  *  `tensor ⊙ same-shape tensor → same`, rowVec ⊙ colVec → null).
- *  Returns just the rows/cols pair (sign/complex/elem are recomputed
- *  by the builtin's `result` closure). Returns null if any pair is
+ *  Returns just the dims array (sign/complex/elem are recomputed by
+ *  the builtin's `result` closure). Returns null if any pair is
  *  shape-incompatible (mirrors `arithResult`'s Unknown). */
 function broadcastNumericShape(
   tys: ReadonlyArray<MType>
-): { rows: DimInfo; cols: DimInfo } | null {
+): readonly DimInfo[] | null {
   let acc: MType = scalarDouble("unknown");
   for (const t of tys) {
     if (!isNumeric(t)) return null;
     acc = arithResult("Add", acc, t);
     if (!isNumeric(acc)) return null;
   }
-  return { rows: acc.rows, cols: acc.cols };
+  return acc.dims;
 }
 
 function validateShape(

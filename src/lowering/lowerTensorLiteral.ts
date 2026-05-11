@@ -10,10 +10,12 @@ import type { Expr } from "../parser/index.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
+  charArrayType,
   isScalar,
   isNumeric,
   joinSign,
   numericType,
+  scalarChar,
   type DimInfo,
   type NumericType,
   type Sign,
@@ -83,14 +85,7 @@ export function lowerTensorLiteral(
     }
     const n = combined.length;
     const cols: DimInfo = n === 1 ? { kind: "one" } : { kind: "notOne" };
-    const ty: NumericType = {
-      kind: "Numeric",
-      elem: "char",
-      isComplex: false,
-      rows: { kind: "one" },
-      cols,
-      sign: "unknown",
-    };
+    const ty: NumericType = n === 1 ? scalarChar() : charArrayType(cols);
     return { kind: "CharLit", value: combined, ty, span: e.span };
   }
   const elements: IRExpr[][] = [];

@@ -19,6 +19,7 @@ import type { Expr, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
+  isHigherDim,
   isMultiElement,
   isNumeric,
   isScalar,
@@ -68,6 +69,13 @@ export function lowerIndexLoad(
   if (!isMultiElement(baseTy)) {
     throw new UnsupportedConstruct(
       `cannot index variable '${name}' with type ${typeToString(baseTy)}`,
+      span
+    );
+  }
+  if (isHigherDim(baseTy)) {
+    throw new UnsupportedConstruct(
+      `indexing into a tensor with ndim > 2 is not yet supported ` +
+        `(reshape to 2-D first)`,
       span
     );
   }

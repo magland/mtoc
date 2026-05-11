@@ -85,6 +85,15 @@ The subset is growing iteratively. Roughly:
 - Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`,
   `strcmp` (char-array, string, or any mix; scalar 0/1 result)
   (full registry: [`src/workspace/builtins.ts`](src/workspace/builtins.ts))
+- Shape builtins: `size(t)` (row vector of dim sizes),
+  `size(t, dim)`, `ndims(t)` (min-2 padded like numbl),
+  `reshape(t, d1, d2, ..., dN)` — `reshape` is the path that
+  produces tensors with `ndim > 2`; `disp`, `size`, `ndims`,
+  `numel`, `length`, and another `reshape` are the operations
+  currently supported on those N-D values. Arithmetic / indexing
+  / slicing on `ndim > 2` are gated with a clear "not yet
+  supported" diagnostic (the elementwise codegen loop is still
+  2-D-shaped).
 - Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`,
   `assert(cond, msg)` (msg may be a string or char-array literal /
   variable; tensor-condition form is deferred)

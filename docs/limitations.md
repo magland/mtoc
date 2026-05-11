@@ -26,12 +26,19 @@ workaround or a roadmap note.
 ## Tensors
 
 - **Tensor dims are categorical, not exact.** The type lattice tracks
-  whether an axis is `one` (broadcast), `notOne` (≥2 or 0), or `unknown`;
-  the specific size lives at runtime on `mtoc_tensor_t.rows` / `.cols`.
-  This collapses specializations across same-shape-category calls
-  (`total([1 2 3])` and `total([1 2 3 4])` share one mangled function)
-  and lets a tensor variable take on different runtime shapes via free +
-  realloc at the assignment site.
+  whether each axis is `one` (broadcast), `notOne` (≥2 or 0), or
+  `unknown`; the specific sizes live at runtime on
+  `mtoc_tensor_t.dims[i]`. This collapses specializations across
+  same-shape-category calls (`total([1 2 3])` and `total([1 2 3 4])`
+  share one mangled function) and lets a tensor variable take on
+  different runtime shapes via free + realloc at the assignment site.
+- **N-D tensors are constructible but not yet operand-eligible.**
+  `reshape(v, d1, d2, …, dN)` produces an N-D tensor, and `disp`,
+  `size`, `ndims`, `numel`, `length`, and another `reshape` work on
+  it. Arithmetic, indexing, slicing, and elementwise builtin lifts on
+  an N-D tensor (`A + 1` where `ndim(A) > 2`) are not yet supported —
+  the elementwise codegen loop is still 2-D-shaped. `MTOC_MAX_NDIM`
+  is 8.
 - **Builtins for runtime-shape allocation aren't here yet.**
   `zeros(N, M)`, `ones(N, M)`, etc. with a runtime size still raise
   `UnsupportedConstruct`. The codegen path for dynamic-shape allocation

@@ -12,7 +12,7 @@
 
 static double mtoc_sum(mtoc_tensor_t t) {
   double s = 0.0;
-  long n = t.rows * t.cols;
+  long n = t.dims[0] * t.dims[1];
   for (long i = 0; i < n; i++) s += t.real[i];
   return s;
 }

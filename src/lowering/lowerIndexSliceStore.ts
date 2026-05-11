@@ -25,10 +25,12 @@ import type { Expr, LValue, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IRStmt, IndexSliceArg } from "./ir.js";
 import {
+  isHigherDim,
   isMultiElement,
   isNumeric,
   isScalar,
   isScalarReal,
+  scalarDouble,
   type MType,
   type NumericType,
   typeToString,
@@ -75,6 +77,13 @@ export function lowerIndexSliceStore(
   if (baseTy.elem === "char") {
     throw new UnsupportedConstruct(
       `range/colon indexed write into a char tensor is not yet supported`,
+      span
+    );
+  }
+  if (isHigherDim(baseTy)) {
+    throw new UnsupportedConstruct(
+      `range/colon indexed write into a tensor with ndim > 2 is not yet ` +
+        `supported (reshape to 2-D first)`,
       span
     );
   }
@@ -213,12 +222,5 @@ function lowerSliceSlot(
 }
 
 function scalarRealOne(): NumericType {
-  return {
-    kind: "Numeric",
-    elem: "double",
-    isComplex: false,
-    rows: { kind: "one" },
-    cols: { kind: "one" },
-    sign: "positive",
-  };
+  return scalarDouble("positive");
 }
