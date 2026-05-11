@@ -18,7 +18,6 @@ import {
   broadcastShape,
   isCharArray,
   isCharScalar,
-  isHigherDim,
   isMultiElement,
   isScalar,
   isScalarComplex,
@@ -249,12 +248,6 @@ function lowerComparison(
       throw new UnsupportedConstruct(
         `${e.op === "AndAnd" ? "&&" : "||"} on tensor operands is not ` +
           `supported (only scalars; use a scalar reduction first)`,
-        e.span
-      );
-    }
-    if (isHigherDim(left.ty) || isHigherDim(right.ty)) {
-      throw new UnsupportedConstruct(
-        `comparison ${e.op} on a tensor with ndim > 2 is not yet supported`,
         e.span
       );
     }
@@ -513,14 +506,6 @@ function lowerArith(
   if (!arithOp) {
     throw new UnsupportedConstruct(
       `unsupported arith operator ${e.op}`,
-      e.span
-    );
-  }
-  if (isHigherDim(left.ty) || isHigherDim(right.ty)) {
-    throw new UnsupportedConstruct(
-      `binary ${e.op} on a tensor with ndim > 2 is not yet supported ` +
-        `(reshape to 2-D first; the elementwise codegen loop is still ` +
-        `2-D-shaped)`,
       e.span
     );
   }

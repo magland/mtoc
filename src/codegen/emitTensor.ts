@@ -113,9 +113,19 @@ export function emitTensorAssignFromExpr(
   useRuntimeByName(state, "mtoc_tensor_assign");
 
   const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
-  const allocHelper = isComplex
-    ? "mtoc_tensor_alloc_complex"
-    : "mtoc_tensor_alloc";
+  // Result ndim drives helper selection: 2-D keeps the legacy
+  // `(rows, cols)` alloc shape (preserves byte-for-byte output for
+  // every existing 2-D test); >2-D routes through the N-D alloc
+  // helpers, passing the dim vector as a compound literal.
+  const resultNdim = isNumeric(rhs.ty) ? rhs.ty.dims.length : 2;
+  const isNd = resultNdim > 2;
+  const allocHelper = isNd
+    ? isComplex
+      ? "mtoc_tensor_alloc_nd_complex"
+      : "mtoc_tensor_alloc_nd"
+    : isComplex
+      ? "mtoc_tensor_alloc_complex"
+      : "mtoc_tensor_alloc";
   useRuntimeByName(state, allocHelper);
 
   const iterId = state.elemwiseLoopCounter++;
@@ -148,13 +158,34 @@ export function emitTensorAssignFromExpr(
   }
 
   // Shape args: either from a Var's runtime shape, or from the
-  // static length of a CharLit (always a 1×N row vector). The
-  // staging tensor is always a double-elem `mtoc_tensor_t`, so the
-  // field references below use `dims[0]`/`dims[1]`.
-  const shapeArgs =
-    src !== null
-      ? `${src.cName}.${tensorRowsField(src.ty)}, ${src.cName}.${tensorColsField(src.ty)}`
-      : `1, ${charLitSrc!.value.length}`;
+  // static length of a CharLit (always a 1×N row vector — N-D
+  // shape sources are always Vars, never CharLits). For the N-D
+  // path, pull every axis off the source's `dims[i]`; for the 2-D
+  // path, use the legacy field names (which become `rows`/`cols`
+  // on char tensors and `dims[0]`/`dims[1]` on double tensors).
+  let shapeArgs: string;
+  let numelExpr: string;
+  if (isNd) {
+    if (src === null) {
+      throw new Error(
+        `codegen internal: N-D elementwise result without a multi-element ` +
+          `Var shape source (rhs ${typeToString(rhs.ty)}); CharLit ` +
+          `shape sources only produce 2-D results`
+      );
+    }
+    const dimRefs = Array.from(
+      { length: resultNdim },
+      (_, i) => `${src.cName}.dims[${i}]`
+    );
+    shapeArgs = `${resultNdim}, (long[]){${dimRefs.join(", ")}}`;
+    numelExpr = dimRefs.join(" * ");
+  } else {
+    shapeArgs =
+      src !== null
+        ? `${src.cName}.${tensorRowsField(src.ty)}, ${src.cName}.${tensorColsField(src.ty)}`
+        : `1, ${charLitSrc!.value.length}`;
+    numelExpr = `${stagingName}.dims[0] * ${stagingName}.dims[1]`;
+  }
 
   pushStmt(state, level, `{`);
   if (src !== null) {
@@ -171,11 +202,7 @@ export function emitTensorAssignFromExpr(
     level + 1,
     `mtoc_tensor_t ${stagingName} = ${allocHelper}(${shapeArgs});`
   );
-  pushStmt(
-    state,
-    level + 1,
-    `long _mtoc_n = ${stagingName}.dims[0] * ${stagingName}.dims[1];`
-  );
+  pushStmt(state, level + 1, `long _mtoc_n = ${numelExpr};`);
   pushStmt(
     state,
     level + 1,

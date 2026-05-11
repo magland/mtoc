@@ -18,7 +18,6 @@ import type { IRExpr, IRFunction } from "./ir.js";
 import {
   arithResult,
   canonicalizeType,
-  isHigherDim,
   isMultiElement,
   isOwned,
   isScalar,
@@ -154,15 +153,6 @@ export function lowerBuiltinCallWithArgs(
   // to validate the args against their scalar-equivalent constraints
   // and widen the builtin's scalar result type to the broadcast shape.
   if (isElementwiseEligible(builtin, args)) {
-    for (const a of args) {
-      if (isHigherDim(a.ty)) {
-        throw new UnsupportedConstruct(
-          `${name}: elementwise lift over a tensor with ndim > 2 is not ` +
-            `yet supported (reshape to 2-D first)`,
-          span
-        );
-      }
-    }
     const shape = broadcastNumericShape(args.map(a => a.ty));
     if (shape === null) {
       throw new TypeError(
