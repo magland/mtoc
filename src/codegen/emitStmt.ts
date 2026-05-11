@@ -271,19 +271,19 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // `<base>(idx) = rhs;` — write one slot of the base's heap
       // buffer in place. Lowering already validated:
       //   - base is a multi-element double tensor (real or complex)
-      //   - the indices are real scalars (1 or 2)
+      //   - the indices are real scalars (1, 2, or ndim — matching
+      //     lowerIndexStore's arity rules)
       //   - the RHS is a numeric scalar; complex into real has been
       //     rejected, so the only widening case is real RHS into a
       //     complex base (sets imag[off] = 0).
       const baseCName = s.base.cName;
       const baseTy = s.base.ty as NumericType;
-      const baseRowsField = tensorRowsField(baseTy);
-      const offsetExpr =
-        s.indices.length === 1
-          ? `(long)(${emitExpr(state, s.indices[0], 0)}) - 1L`
-          : `(long)(${emitExpr(state, s.indices[0], 0)}) - 1L + ` +
-            `((long)(${emitExpr(state, s.indices[1], 0)}) - 1L) * ` +
-            `${baseCName}.${baseRowsField}`;
+      const offsetExpr = emitNdScalarOffset(
+        state,
+        s.indices,
+        baseCName,
+        baseTy
+      );
       const rhsExpr = emitExpr(state, s.rhs, 0);
       if (baseTy.isComplex) {
         // Stash the offset and (for a complex RHS) the value into
@@ -1046,18 +1046,22 @@ function emitTensorLitAssign(
   pushStmt(state, level, `}`);
 }
 
-/** Emit a range/colon-indexed read: `target = base(a:b)`,
- *  `target = base(a:s:b)`, or `target = base(:)`. The slice
- *  allocates a fresh result tensor sized by the index range,
- *  fills it via a counted loop, and consume-replaces the target.
+/** Emit a range/colon/scalar-mix indexed read: `target = base(a:b)`,
+ *  `target = base(:)`, `target = base(:, j)`, … . The slice
+ *  allocates a fresh result tensor sized by the slice's per-axis
+ *  counts, fills it via nested counted loops, and consume-replaces
+ *  the target.
  *
- *  The result-shape rules match `lowerIndexSlice`:
- *    - `Colon`        → column tensor of `base.rows * base.cols`.
- *    - `Range`, base is row-vec → row tensor of count.
- *    - `Range`, otherwise       → column tensor of count.
+ *  Two emission paths:
+ *    - `index.length === 1`: single-slot linear indexing; preserves
+ *      the legacy 2-D byte-for-byte emission shape (used by every
+ *      `v(:)` / `v(a:b)` form).
+ *    - `index.length > 1`  : multi-slot per-axis indexing. The slice
+ *      shape is one axis per slot; loops nest with slot 0 innermost
+ *      (column-major source + destination linearization).
  *
  *  For complex bases the result is a complex tensor; the codegen
- *  copies both `.real` and `.imag` per slot. Char ranges are
+ *  copies both `.real` and `.imag` per slot. Char slices are
  *  rejected at lowering, so this function only handles double. */
 function emitIndexSliceAssign(
   state: EmitState,
@@ -1076,19 +1080,33 @@ function emitIndexSliceAssign(
   const isComplex = baseTy.isComplex;
   useRuntimeByName(state, "mtoc_tensor_t");
   useRuntimeByName(state, "mtoc_tensor_assign");
+
+  if (rhs.index.length === 1) {
+    emitSingleSlotSliceRead(state, level, target, rhs, base, baseTy, isComplex);
+    return;
+  }
+  emitMultiSlotSliceRead(state, level, target, rhs, base, baseTy, isComplex);
+}
+
+/** Single-slot slice read (`v(:)`, `v(a:b)`, `v(a:s:b)`). Preserves
+ *  the legacy 2-D-only emission shape: 2-D `mtoc_tensor_alloc(rows,
+ *  cols)`, one flat `for (k …)` loop, byte-for-byte stable so vitest
+ *  expectations keep matching. */
+function emitSingleSlotSliceRead(
+  state: EmitState,
+  level: number,
+  target: string,
+  rhs: Extract<IRExpr, { kind: "IndexSlice" }>,
+  base: Extract<IRExpr, { kind: "Var" }>,
+  baseTy: NumericType,
+  isComplex: boolean
+): void {
   const allocHelper = isComplex
     ? "mtoc_tensor_alloc_complex"
     : "mtoc_tensor_alloc";
   useRuntimeByName(state, allocHelper);
+  const slot = rhs.index[0];
 
-  // Render the source-index expression for iteration k:
-  //   - Colon:  k          (already 0-based; reads base.real[k])
-  //   - Range:  start + step*k - 1   (1-based MATLAB → 0-based C)
-  //
-  // Plus a count-and-shape preamble that depends on the slot kind.
-  // The whole emission is wrapped in `{ … }` so per-slice locals
-  // (`_mtoc_n`, `_mtoc_t`, `_mtoc_k`, `_mtoc_start`, `_mtoc_step`)
-  // are scoped to this statement.
   pushStmt(state, level, `{`);
 
   let count: string;
@@ -1096,7 +1114,7 @@ function emitIndexSliceAssign(
   let resultRows: string;
   let resultCols: string;
 
-  if (rhs.index.kind === "Colon") {
+  if (slot.kind === "Colon") {
     pushStmt(
       state,
       level + 1,
@@ -1107,20 +1125,16 @@ function emitIndexSliceAssign(
     srcIndexFor = k => k;
     resultRows = "_mtoc_n";
     resultCols = "1";
-  } else {
-    // Range slot. Step is guaranteed to be a numeric literal by
-    // lowering; render as a `double` expression for the count
-    // formula, then cast inside the per-iteration source-index
-    // expression.
-    if (rhs.index.step.kind !== "NumLit") {
+  } else if (slot.kind === "Range") {
+    if (slot.step.kind !== "NumLit") {
       throw new Error(
         "codegen internal: IndexSlice range step must be a NumLit; " +
           "should have been caught at lowering"
       );
     }
-    const startStr = emitExpr(state, rhs.index.start, 0);
-    const endStr = emitExpr(state, rhs.index.end, 0);
-    const stepStr = formatNumLit(rhs.index.step.value);
+    const startStr = emitExpr(state, slot.start, 0);
+    const endStr = emitExpr(state, slot.end, 0);
+    const stepStr = formatNumLit(slot.step.value);
     pushStmt(state, level + 1, `double _mtoc_start = ${startStr};`);
     pushStmt(state, level + 1, `double _mtoc_end = ${endStr};`);
     pushStmt(
@@ -1131,12 +1145,6 @@ function emitIndexSliceAssign(
     pushStmt(state, level + 1, `if (_mtoc_n < 0) _mtoc_n = 0;`);
     count = "_mtoc_n";
     srcIndexFor = k => `(long)(_mtoc_start + ${stepStr} * (double)${k}) - 1L`;
-    // Result orientation:
-    //   - row-vec base → row (preserves)
-    //   - col-vec base → col (preserves)
-    //   - matrix base  → row (linear-indexed `a:b` is itself a row,
-    //                     and the index orientation wins for a
-    //                     matrix base; matches numbl).
     if (isRowVec(baseTy)) {
       resultRows = "1";
       resultCols = "_mtoc_n";
@@ -1147,8 +1155,13 @@ function emitIndexSliceAssign(
       resultRows = "1";
       resultCols = "_mtoc_n";
     }
-    // Range arithmetic involves floor() — make sure <math.h> is in.
     state.needMath.value = true;
+  } else {
+    // Single-slot Scalar should have routed through IndexLoad.
+    throw new Error(
+      "codegen internal: single-slot IndexSlice with Scalar slot; " +
+        "should have been routed to IndexLoad at lowering"
+    );
   }
 
   pushStmt(
@@ -1162,22 +1175,16 @@ function emitIndexSliceAssign(
     `for (long _mtoc_k = 0; _mtoc_k < ${count}; _mtoc_k++) {`
   );
   const srcIdx = srcIndexFor("_mtoc_k");
+  pushStmt(
+    state,
+    level + 2,
+    `_mtoc_t.real[_mtoc_k] = ${base.cName}.real[${srcIdx}];`
+  );
   if (isComplex) {
     pushStmt(
       state,
       level + 2,
-      `_mtoc_t.real[_mtoc_k] = ${base.cName}.real[${srcIdx}];`
-    );
-    pushStmt(
-      state,
-      level + 2,
       `_mtoc_t.imag[_mtoc_k] = ${base.cName}.imag[${srcIdx}];`
-    );
-  } else {
-    pushStmt(
-      state,
-      level + 2,
-      `_mtoc_t.real[_mtoc_k] = ${base.cName}.real[${srcIdx}];`
     );
   }
   pushStmt(state, level + 1, `}`);
@@ -1185,13 +1192,179 @@ function emitIndexSliceAssign(
   pushStmt(state, level, `}`);
 }
 
-/** Emit a range/colon-indexed write: `<base>(slice) = rhs;`. The
- *  base buffer is mutated in place; one slot per loop iteration is
+/** Multi-slot slice read: one result axis per slot, loops nest with
+ *  slot 0 innermost (column-major both source and destination). The
+ *  result is allocated via `mtoc_tensor_alloc_nd` uniformly. */
+function emitMultiSlotSliceRead(
+  state: EmitState,
+  level: number,
+  target: string,
+  rhs: Extract<IRExpr, { kind: "IndexSlice" }>,
+  base: Extract<IRExpr, { kind: "Var" }>,
+  baseTy: NumericType,
+  isComplex: boolean
+): void {
+  const allocHelper = isComplex
+    ? "mtoc_tensor_alloc_nd_complex"
+    : "mtoc_tensor_alloc_nd";
+  useRuntimeByName(state, allocHelper);
+  const baseCName = base.cName;
+  const ndim = rhs.index.length;
+
+  pushStmt(state, level, `{`);
+
+  const slotSrc = emitSliceSlotSetup(state, level + 1, rhs.index, baseCName);
+
+  // The result type's `dims.length` is the post-normalization rank
+  // (trailing singletons stripped, but with a 2-axis minimum). The
+  // allocator takes that rank and the corresponding first prefix of
+  // the per-slot counts. Trailing scalar slots collapse out cleanly:
+  // their `_mtoc_n_i = 1` is dropped from the dims list, and the
+  // destination-offset formula's `_mtoc_k_i = 0` term zeroes out.
+  if (!isNumeric(rhs.ty)) {
+    throw new Error(
+      `codegen internal: IndexSlice result has non-numeric type ` +
+        `${typeToString(rhs.ty)}`
+    );
+  }
+  const resultRank = Math.max(2, rhs.ty.dims.length);
+  const dimsList: string[] = [];
+  for (let i = 0; i < resultRank; i++) {
+    dimsList.push(i < ndim ? `_mtoc_n_${i}` : `1L`);
+  }
+  pushStmt(
+    state,
+    level + 1,
+    `mtoc_tensor_t _mtoc_t = ${allocHelper}(${resultRank}, (long[]){${dimsList.join(", ")}});`
+  );
+
+  // Nested loops, slot 0 innermost.
+  for (let i = ndim - 1; i >= 0; i--) {
+    pushStmt(
+      state,
+      level + 1 + (ndim - 1 - i),
+      `for (long _mtoc_k_${i} = 0; _mtoc_k_${i} < _mtoc_n_${i}; _mtoc_k_${i}++) {`
+    );
+  }
+  const inner = level + 1 + ndim;
+  pushStmt(
+    state,
+    inner,
+    `long _mtoc_src_off = ${formatNdOffset(slotSrc, i => `${baseCName}.dims[${i}]`)};`
+  );
+  pushStmt(
+    state,
+    inner,
+    `long _mtoc_dst_off = ${formatNdOffset(
+      Array.from({ length: ndim }, (_, i) => `_mtoc_k_${i}`),
+      i => `_mtoc_n_${i}`
+    )};`
+  );
+  pushStmt(
+    state,
+    inner,
+    `_mtoc_t.real[_mtoc_dst_off] = ${baseCName}.real[_mtoc_src_off];`
+  );
+  if (isComplex) {
+    pushStmt(
+      state,
+      inner,
+      `_mtoc_t.imag[_mtoc_dst_off] = ${baseCName}.imag[_mtoc_src_off];`
+    );
+  }
+  for (let i = ndim - 1; i >= 0; i--) {
+    pushStmt(state, level + 1 + (ndim - 1 - i), `}`);
+  }
+  pushStmt(state, level + 1, `mtoc_tensor_assign(&${target}, _mtoc_t);`);
+  pushStmt(state, level, `}`);
+}
+
+/** Compute the column-major linear offset `sum_i a_i * prod(s_0..s_{i-1})`
+ *  given per-slot terms `a_i` and a stride-source `stride(j)` that
+ *  renders `s_j`. Zero-cost when ndim === 1 (just returns `a_0`).
+ *  Helper used by both the source-side and destination-side offset
+ *  computations in the multi-slot slice emission. */
+function formatNdOffset(
+  terms: ReadonlyArray<string>,
+  stride: (axisIndex: number) => string
+): string {
+  const out: string[] = [];
+  for (let i = 0; i < terms.length; i++) {
+    if (i === 0) {
+      out.push(terms[i]);
+    } else {
+      const strideParts: string[] = [];
+      for (let j = 0; j < i; j++) strideParts.push(stride(j));
+      out.push(`${terms[i]} * ${strideParts.join(" * ")}`);
+    }
+  }
+  return out.join(" + ");
+}
+
+/** Emit per-slot setup for a multi-slot slice (read or write): for
+ *  every slot, push `_mtoc_n_<i>` (the iteration count) and any
+ *  Range-specific locals (`_mtoc_start_<i>`, `_mtoc_end_<i>`) or
+ *  Scalar-specific source/dest offset locals. Returns the per-slot
+ *  source-index expression (a string in terms of `_mtoc_k_<i>` for
+ *  Colon/Range slots, or a precomputed `_mtoc_src_<i>` local for
+ *  Scalar slots). The caller drives the loop nesting and assembles
+ *  the offset formula via `formatNdOffset`. */
+function emitSliceSlotSetup(
+  state: EmitState,
+  level: number,
+  slots: ReadonlyArray<import("../lowering/ir.js").IndexSliceArg>,
+  baseCName: string
+): string[] {
+  const slotSrc: string[] = [];
+  for (let i = 0; i < slots.length; i++) {
+    const slot = slots[i];
+    const kVar = `_mtoc_k_${i}`;
+    if (slot.kind === "Colon") {
+      pushStmt(state, level, `long _mtoc_n_${i} = ${baseCName}.dims[${i}];`);
+      slotSrc.push(kVar);
+    } else if (slot.kind === "Scalar") {
+      const scalarStr = emitExpr(state, slot.expr, 0);
+      pushStmt(state, level, `long _mtoc_n_${i} = 1;`);
+      pushStmt(
+        state,
+        level,
+        `long _mtoc_src_${i} = (long)(${scalarStr}) - 1L;`
+      );
+      slotSrc.push(`_mtoc_src_${i}`);
+    } else {
+      if (slot.step.kind !== "NumLit") {
+        throw new Error(
+          "codegen internal: IndexSlice range step must be a NumLit; " +
+            "should have been caught at lowering"
+        );
+      }
+      const startStr = emitExpr(state, slot.start, 0);
+      const endStr = emitExpr(state, slot.end, 0);
+      const stepStr = formatNumLit(slot.step.value);
+      pushStmt(state, level, `double _mtoc_start_${i} = ${startStr};`);
+      pushStmt(state, level, `double _mtoc_end_${i} = ${endStr};`);
+      pushStmt(
+        state,
+        level,
+        `long _mtoc_n_${i} = (long)floor((_mtoc_end_${i} - _mtoc_start_${i}) / ${stepStr}) + 1;`
+      );
+      pushStmt(state, level, `if (_mtoc_n_${i} < 0) _mtoc_n_${i} = 0;`);
+      slotSrc.push(
+        `((long)(_mtoc_start_${i} + ${stepStr} * (double)${kVar}) - 1L)`
+      );
+      state.needMath.value = true;
+    }
+  }
+  return slotSrc;
+}
+
+/** Emit a range/colon/scalar-mix indexed write: `<base>(slice) = rhs;`.
+ *  The base buffer is mutated in place; one slot per loop iteration is
  *  overwritten. For a tensor RHS we emit a runtime count check so a
  *  size mismatch fails loudly instead of silently scribbling past
  *  the end of either buffer.
  *
- *  Layout (real base, tensor RHS):
+ *  Single-slot layout (real base, tensor RHS):
  *    {
  *      long _mtoc_n   = <count(slice)>;
  *      long _mtoc_rhs_n = rhs.rows * rhs.cols;
@@ -1202,6 +1375,12 @@ function emitIndexSliceAssign(
  *      }
  *    }
  *
+ *  Multi-slot layout: one nested loop per slot (slot 0 innermost,
+ *  column-major), the dst offset is computed from each slot's source
+ *  index (Colon → k_i, Range → start + step*k_i − 1, Scalar → const
+ *  precomputed once before the loop nest), and the tensor-RHS linear
+ *  index is `_mtoc_k_0 + _mtoc_k_1 * _mtoc_n_0 + …`.
+ *
  *  Complex bases write both .real and .imag; a real RHS into a
  *  complex base zeros .imag per slot. A scalar RHS broadcasts.
  *  See the lowering pass for type-rule pre-checks. */
@@ -1210,6 +1389,10 @@ function emitIndexSliceStore(
   level: number,
   s: Extract<IRStmt, { kind: "IndexSliceStore" }>
 ): void {
+  if (s.index.length > 1) {
+    emitMultiSlotSliceStore(state, level, s);
+    return;
+  }
   const baseCName = s.base.cName;
   const baseTy = s.base.ty as NumericType;
   const baseIsComplex = baseTy.isComplex;
@@ -1218,9 +1401,9 @@ function emitIndexSliceStore(
 
   pushStmt(state, level, `{`);
 
-  // Slice count + per-iteration dst offset.
+  const slot = s.index[0];
   let dstOffsetFor: (kVar: string) => string;
-  if (s.index.kind === "Colon") {
+  if (slot.kind === "Colon") {
     pushStmt(
       state,
       level + 1,
@@ -1228,16 +1411,16 @@ function emitIndexSliceStore(
         `${baseCName}.${tensorColsField(baseTy)};`
     );
     dstOffsetFor = k => k;
-  } else {
-    if (s.index.step.kind !== "NumLit") {
+  } else if (slot.kind === "Range") {
+    if (slot.step.kind !== "NumLit") {
       throw new Error(
         "codegen internal: IndexSliceStore range step must be a NumLit; " +
           "should have been caught at lowering"
       );
     }
-    const startStr = emitExpr(state, s.index.start, 0);
-    const endStr = emitExpr(state, s.index.end, 0);
-    const stepStr = formatNumLit(s.index.step.value);
+    const startStr = emitExpr(state, slot.start, 0);
+    const endStr = emitExpr(state, slot.end, 0);
+    const stepStr = formatNumLit(slot.step.value);
     pushStmt(state, level + 1, `double _mtoc_start = ${startStr};`);
     pushStmt(state, level + 1, `double _mtoc_end = ${endStr};`);
     pushStmt(
@@ -1248,6 +1431,12 @@ function emitIndexSliceStore(
     pushStmt(state, level + 1, `if (_mtoc_n < 0) _mtoc_n = 0;`);
     dstOffsetFor = k => `(long)(_mtoc_start + ${stepStr} * (double)${k}) - 1L`;
     state.needMath.value = true;
+  } else {
+    // Single-slot Scalar should have routed through IndexStore.
+    throw new Error(
+      "codegen internal: single-slot IndexSliceStore with Scalar slot; " +
+        "should have been routed to IndexStore at lowering"
+    );
   }
 
   // Tensor RHS: runtime count check + per-slot read from rhs's buffer.
@@ -1374,4 +1563,178 @@ function emitIndexSliceStore(
   // <stdlib.h> (transitively pulled in by every tensor-bearing
   // program through the alloc helper, which any IndexSliceStore
   // base must have triggered). No extra header activation needed.
+}
+
+/** Multi-slot `<base>(slice) = rhs;` write. One nested loop per slot
+ *  (slot 0 innermost, column-major). Scalar RHS broadcasts; tensor
+ *  RHS is read linearly with a runtime count check against the
+ *  product of per-slot counts. */
+function emitMultiSlotSliceStore(
+  state: EmitState,
+  level: number,
+  s: Extract<IRStmt, { kind: "IndexSliceStore" }>
+): void {
+  const baseCName = s.base.cName;
+  const baseTy = s.base.ty as NumericType;
+  const baseIsComplex = baseTy.isComplex;
+  const rhsIsScalar = isNumeric(s.rhs.ty) && isScalar(s.rhs.ty);
+  const rhsIsComplex = isNumeric(s.rhs.ty) && s.rhs.ty.isComplex;
+  const ndim = s.index.length;
+
+  pushStmt(state, level, `{`);
+
+  const slotDst = emitSliceSlotSetup(state, level + 1, s.index, baseCName);
+
+  // Total slice element count (product of per-slot counts) — used by
+  // the tensor-RHS count check and by both branches' linear index.
+  const totalParts: string[] = [];
+  for (let i = 0; i < ndim; i++) totalParts.push(`_mtoc_n_${i}`);
+  pushStmt(state, level + 1, `long _mtoc_n = ${totalParts.join(" * ")};`);
+
+  // RHS preparation.
+  let rhsCName: string | null = null;
+  if (rhsIsScalar) {
+    const rhsExpr = emitExpr(state, s.rhs, 0);
+    if (baseIsComplex && rhsIsComplex) {
+      pushStmt(state, level + 1, `double _Complex _mtoc_rhs = ${rhsExpr};`);
+      pushStmt(state, level + 1, `double _mtoc_rhs_re = creal(_mtoc_rhs);`);
+      pushStmt(state, level + 1, `double _mtoc_rhs_im = cimag(_mtoc_rhs);`);
+    } else {
+      pushStmt(state, level + 1, `double _mtoc_rhs = ${rhsExpr};`);
+    }
+  } else {
+    if (s.rhs.kind !== "Var") {
+      throw new Error(
+        `codegen internal: IndexSliceStore RHS must be a scalar or a Var ` +
+          `(got ${s.rhs.kind}); should have been caught at lowering`
+      );
+    }
+    rhsCName = s.rhs.cName;
+    const rhsTy = s.rhs.ty;
+    // numel(rhs) — generalized for any-dim tensors.
+    let rhsNumel: string;
+    if (isNumeric(rhsTy) && rhsTy.elem === "char") {
+      rhsNumel = `${rhsCName}.rows * ${rhsCName}.cols`;
+    } else if (isNumeric(rhsTy)) {
+      const parts: string[] = [];
+      for (let j = 0; j < rhsTy.dims.length; j++) {
+        parts.push(`${rhsCName}.dims[${j}]`);
+      }
+      rhsNumel = parts.join(" * ");
+    } else {
+      throw new Error(
+        `codegen internal: IndexSliceStore tensor RHS has non-numeric type ` +
+          `${typeToString(rhsTy)}`
+      );
+    }
+    pushStmt(state, level + 1, `long _mtoc_rhs_n = ${rhsNumel};`);
+    pushStmt(state, level + 1, `if (_mtoc_n != _mtoc_rhs_n) {`);
+    pushStmt(
+      state,
+      level + 2,
+      `fprintf(stderr, "mtoc: range-write count mismatch: lhs slice has %ld elements, rhs has %ld\\n", _mtoc_n, _mtoc_rhs_n);`
+    );
+    pushStmt(state, level + 2, `abort();`);
+    pushStmt(state, level + 1, `}`);
+  }
+
+  // Nested loops, slot 0 innermost.
+  for (let i = ndim - 1; i >= 0; i--) {
+    pushStmt(
+      state,
+      level + 1 + (ndim - 1 - i),
+      `for (long _mtoc_k_${i} = 0; _mtoc_k_${i} < _mtoc_n_${i}; _mtoc_k_${i}++) {`
+    );
+  }
+  const inner = level + 1 + ndim;
+  pushStmt(
+    state,
+    inner,
+    `long _mtoc_dst = ${formatNdOffset(slotDst, j => `${baseCName}.dims[${j}]`)};`
+  );
+  if (rhsIsScalar) {
+    if (baseIsComplex && rhsIsComplex) {
+      pushStmt(state, inner, `${baseCName}.real[_mtoc_dst] = _mtoc_rhs_re;`);
+      pushStmt(state, inner, `${baseCName}.imag[_mtoc_dst] = _mtoc_rhs_im;`);
+    } else if (baseIsComplex) {
+      pushStmt(state, inner, `${baseCName}.real[_mtoc_dst] = _mtoc_rhs;`);
+      pushStmt(state, inner, `${baseCName}.imag[_mtoc_dst] = 0.0;`);
+    } else {
+      pushStmt(state, inner, `${baseCName}.real[_mtoc_dst] = _mtoc_rhs;`);
+    }
+  } else {
+    pushStmt(
+      state,
+      inner,
+      `long _mtoc_k = ${formatNdOffset(
+        Array.from({ length: ndim }, (_, i) => `_mtoc_k_${i}`),
+        j => `_mtoc_n_${j}`
+      )};`
+    );
+    if (baseIsComplex && rhsIsComplex) {
+      pushStmt(
+        state,
+        inner,
+        `${baseCName}.real[_mtoc_dst] = ${rhsCName}.real[_mtoc_k];`
+      );
+      pushStmt(
+        state,
+        inner,
+        `${baseCName}.imag[_mtoc_dst] = ${rhsCName}.imag[_mtoc_k];`
+      );
+    } else if (baseIsComplex) {
+      pushStmt(
+        state,
+        inner,
+        `${baseCName}.real[_mtoc_dst] = ${rhsCName}.real[_mtoc_k];`
+      );
+      pushStmt(state, inner, `${baseCName}.imag[_mtoc_dst] = 0.0;`);
+    } else {
+      pushStmt(
+        state,
+        inner,
+        `${baseCName}.real[_mtoc_dst] = ${rhsCName}.real[_mtoc_k];`
+      );
+    }
+  }
+  for (let i = ndim - 1; i >= 0; i--) {
+    pushStmt(state, level + 1 + (ndim - 1 - i), `}`);
+  }
+  pushStmt(state, level, `}`);
+}
+
+/** Compute the linear column-major buffer offset for a scalar
+ *  IndexStore / IndexLoad with `indices.length` scalar indices into
+ *  a base with the given type. Handles 1-D linear, 2-D row-major
+ *  fast-path (char tensors use `.rows`, double tensors use `.dims[0]`),
+ *  and the general N-D formula `sum_i (idx_i − 1) * prod(dims[0..i-1])`. */
+function emitNdScalarOffset(
+  state: EmitState,
+  indices: ReadonlyArray<IRExpr>,
+  baseCName: string,
+  baseTy: NumericType
+): string {
+  if (indices.length === 1) {
+    return `(long)(${emitExpr(state, indices[0], 0)}) - 1L`;
+  }
+  if (indices.length === 2) {
+    const rowsField = tensorRowsField(baseTy);
+    return (
+      `(long)(${emitExpr(state, indices[0], 0)}) - 1L + ` +
+      `((long)(${emitExpr(state, indices[1], 0)}) - 1L) * ` +
+      `${baseCName}.${rowsField}`
+    );
+  }
+  const terms: string[] = [];
+  for (let i = 0; i < indices.length; i++) {
+    const idxStr = `((long)(${emitExpr(state, indices[i], 0)}) - 1L)`;
+    if (i === 0) {
+      terms.push(idxStr);
+    } else {
+      const strideParts: string[] = [];
+      for (let j = 0; j < i; j++) strideParts.push(`${baseCName}.dims[${j}]`);
+      terms.push(`${idxStr} * ${strideParts.join(" * ")}`);
+    }
+  }
+  return terms.join(" + ");
 }

@@ -128,25 +128,35 @@ export type IRExpr =
       span: Span;
     }
   | {
-      /** Range / colon read of a multi-element value, producing a
-       *  fresh tensor: `v(a:b)`, `v(a:s:b)`, `v(:)`. Today only one
-       *  index slot is supported (linear indexing into a vector or
-       *  matrix); 2D mixed scalar/range indices arrive in a later
-       *  commit.
+      /** Range / colon / scalar-mix read of a multi-element value,
+       *  producing a fresh tensor: `v(a:b)`, `v(a:s:b)`, `v(:)`,
+       *  `M(:, j)`, `T(:, i, :)`, …. `index` is a per-slot list whose
+       *  length is either 1 (single-slot linear indexing) or equal to
+       *  the base's `ndim` (full per-axis indexing). Mixed scalar +
+       *  range + colon slots are supported in the full per-axis form.
        *
-       *  Result-shape rules (matching numbl):
-       *    - `Range` slot, base is row-vec  → row-vec (preserves)
-       *    - `Range` slot, base is col-vec  → col-vec (preserves)
-       *    - `Range` slot, base is matrix   → col-vec (linearized)
-       *    - `Colon` slot                    → col-vec (always
-       *                                        linearizes to column)
+       *  Result-shape rules:
+       *    - Single-slot (`index.length === 1`), matching numbl's
+       *      linear-indexing semantics:
+       *        - `Range` slot, base is row-vec  → row-vec (preserves)
+       *        - `Range` slot, base is col-vec  → col-vec (preserves)
+       *        - `Range` slot, base is matrix   → row-vec (the range
+       *                                          is itself a row)
+       *        - `Colon` slot                    → col-vec (always
+       *                                          linearizes to column)
+       *    - Multi-slot (`index.length === base.ndim`), per axis:
+       *        - `Colon`  at axis k → result keeps `base.dims[k]`
+       *        - `Range`  at axis k → result has `{notOne}` at k
+       *        - `Scalar` at axis k → result has `{one}` at k
+       *      Trailing singletons in the result are stripped by
+       *      `numericTypeND`.
        *
        *  Like `TensorLit`, an `IndexSlice` is an owned-allocating
        *  producer — it can only appear at the top level of
        *  `Assign.rhs`. Nested uses are rejected by `validateIR`. */
       kind: "IndexSlice";
       base: Extract<IRExpr, { kind: "Var" }>;
-      index: IndexSliceArg;
+      index: readonly IndexSliceArg[];
       ty: MType;
       span: Span;
     }
@@ -166,11 +176,13 @@ export type IRExpr =
       baseCName: string;
       baseTy: MType;
       /** Which axis of the base this `end` refers to:
-       *    - "row"    : 2D index, slot 0  → `<base>.rows`
-       *    - "col"    : 2D index, slot 1  → `<base>.cols`
+       *    - number k : `end` in the k-th index slot of a multi-slot
+       *                 index expression. Resolves to `<base>.dims[k]`
+       *                 for double tensors and `<base>.rows`/.cols for
+       *                 the 2-D char-tensor special case.
        *    - "linear" : 1D index over a multi-element tensor →
-       *                 `<base>.rows * <base>.cols`. */
-      axis: "row" | "col" | "linear";
+       *                 `numel(<base>)` = product of every dim. */
+      axis: number | "linear";
       ty: MType;
       span: Span;
     };
@@ -184,10 +196,16 @@ export type CallTarget =
   | { kind: "builtin"; sig: BuiltinSig }
   | { kind: "userFunc"; mangled: string };
 
-/** One slot of an `IndexSlice` index. `Range` carries the lowered
- *  start / step / end IRExprs (`step` is always populated — the
- *  lowerer fills in a literal `1` when the source was `a:b`).
- *  `Colon` has no sub-expressions; it represents the bare `:`. */
+/** One slot of an `IndexSlice` / `IndexSliceStore` index. The variants:
+ *    - `Range`  : `start:step:end`. `step` is always populated — the
+ *                 lowerer fills in a literal `1` when the source was
+ *                 `a:b` (no explicit step).
+ *    - `Colon`  : bare `:`. No sub-expressions.
+ *    - `Scalar` : a single 1-based MATLAB index. Used only in the
+ *                 multi-slot form: e.g. slot 1 of `M(:, 3)` is
+ *                 `Scalar(3)`. Single-slot scalar reads stay on the
+ *                 `IndexLoad` IR node; this variant only ever appears
+ *                 alongside at least one Range or Colon slot. */
 export type IndexSliceArg =
   | {
       kind: "Range";
@@ -196,7 +214,8 @@ export type IndexSliceArg =
       end: IRExpr;
       span: Span;
     }
-  | { kind: "Colon"; span: Span };
+  | { kind: "Colon"; span: Span }
+  | { kind: "Scalar"; expr: IRExpr; span: Span };
 
 export type IRStmt =
   | {
@@ -220,11 +239,14 @@ export type IRStmt =
       span: Span;
     }
   | {
-      /** In-place range / colon write into a multi-element tensor:
-       *  `v(a:b) = w`, `v(:) = w`, `v(:) = scalar`. The base's heap
-       *  buffer is mutated in place (slots covered by the range are
-       *  overwritten). Today only single-slot range/colon writes are
-       *  supported, on real-or-complex double tensors.
+      /** In-place range / colon / scalar-mix write into a multi-element
+       *  tensor: `v(a:b) = w`, `v(:) = w`, `v(:) = scalar`,
+       *  `M(:, j) = w`, `T(:, i, :) = w`, … . The base's heap buffer
+       *  is mutated in place (slots covered by the slice are
+       *  overwritten); the buffer is reused, so this is NOT an owned
+       *  re-assignment. `index` follows the same per-slot list shape
+       *  as `IndexSlice.index` — length 1 for the linear single-slot
+       *  form, length `ndim` for full per-axis writes.
        *
        *  RHS shapes:
        *    - tensor RHS: a count match is enforced at runtime
@@ -237,7 +259,7 @@ export type IRStmt =
        *  is rejected at lowering. */
       kind: "IndexSliceStore";
       base: Extract<IRExpr, { kind: "Var" }>;
-      index: IndexSliceArg;
+      index: readonly IndexSliceArg[];
       rhs: IRExpr;
       span: Span;
     }

@@ -26,7 +26,13 @@
  * `isOwnedProducer` — every nested-use case becomes legal for free.
  */
 
-import type { IRExpr, IRProgram, IRStmt, VarBinding } from "./ir.js";
+import type {
+  IRExpr,
+  IRProgram,
+  IRStmt,
+  IndexSliceArg,
+  VarBinding,
+} from "./ir.js";
 import { isOwned, isString, type MType } from "./types.js";
 
 /** Counter shared across the whole program so synthetic temp names
@@ -187,15 +193,7 @@ function anfStmt(
     }
     case "IndexSliceStore": {
       const pre: IRStmt[] = [];
-      let newIndex = s.index;
-      if (s.index.kind === "Range") {
-        newIndex = {
-          ...s.index,
-          start: anfExpr(s.index.start, pre, av, c),
-          step: anfExpr(s.index.step, pre, av, c),
-          end: anfExpr(s.index.end, pre, av, c),
-        };
-      }
+      const newIndex = s.index.map(slot => anfSliceArg(slot, pre, av, c));
       const newRhs = anfExpr(s.rhs, pre, av, c);
       return [...pre, { ...s, index: newIndex, rhs: newRhs }];
     }
@@ -242,15 +240,9 @@ function anfExprChildren(
     case "IndexLoad":
       return { ...e, indices: e.indices.map(i => anfExpr(i, pre, av, c)) };
     case "IndexSlice":
-      if (e.index.kind === "Colon") return e;
       return {
         ...e,
-        index: {
-          ...e.index,
-          start: anfExpr(e.index.start, pre, av, c),
-          step: anfExpr(e.index.step, pre, av, c),
-          end: anfExpr(e.index.end, pre, av, c),
-        },
+        index: e.index.map(slot => anfSliceArg(slot, pre, av, c)),
       };
     case "NumLit":
     case "ImagLit":
@@ -260,6 +252,27 @@ function anfExprChildren(
     case "EndRef":
       return e;
   }
+}
+
+/** Recurse into an `IndexSliceArg` slot, normalizing any owned
+ *  producers inside its sub-expressions. `Colon` is a leaf — return
+ *  unchanged. */
+function anfSliceArg(
+  arg: IndexSliceArg,
+  pre: IRStmt[],
+  av: Map<string, VarBinding>,
+  c: AnfCounter
+): IndexSliceArg {
+  if (arg.kind === "Colon") return arg;
+  if (arg.kind === "Scalar") {
+    return { ...arg, expr: anfExpr(arg.expr, pre, av, c) };
+  }
+  return {
+    ...arg,
+    start: anfExpr(arg.start, pre, av, c),
+    step: anfExpr(arg.step, pre, av, c),
+    end: anfExpr(arg.end, pre, av, c),
+  };
 }
 
 /** Rewrite an expression: recurse into its children first, then if

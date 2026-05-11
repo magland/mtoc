@@ -104,12 +104,13 @@ export function renderExpr(e: IRExpr, parentPrec = 0): string {
       return `${e.base.name}(${args})`;
     }
     case "IndexSlice":
-      return `${e.base.name}(${renderSliceArg(e.index)})`;
+      return `${e.base.name}(${e.index.map(renderSliceArg).join(", ")})`;
   }
 }
 
 function renderSliceArg(arg: IndexSliceArg): string {
   if (arg.kind === "Colon") return ":";
+  if (arg.kind === "Scalar") return renderExpr(arg.expr, 0);
   const start = renderExpr(arg.start, 0);
   const end = renderExpr(arg.end, 0);
   if (arg.step.kind === "NumLit" && arg.step.value === 1) {
@@ -132,7 +133,7 @@ export function renderStmt(s: IRStmt): string | null {
       return `${s.base.name}(${idx}) = ${renderExpr(s.rhs, 0)}`;
     }
     case "IndexSliceStore":
-      return `${s.base.name}(${renderSliceArg(s.index)}) = ${renderExpr(s.rhs, 0)}`;
+      return `${s.base.name}(${s.index.map(renderSliceArg).join(", ")}) = ${renderExpr(s.rhs, 0)}`;
     case "Disp":
       return `disp(${renderExpr(s.arg, 0)})`;
     case "Error":

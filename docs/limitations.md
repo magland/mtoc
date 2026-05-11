@@ -78,25 +78,29 @@ workaround or a roadmap note.
   `||` stay scalar-only — there is no `&` / `|` parser shape yet for the
   element-wise logical conjunction / disjunction.
 - **Indexing covers scalar reads, range/colon reads, scalar writes,
-  and range/colon writes** — all on real-or-complex double tensors.
-  Scalar reads also work on char tensors; scalar reads / writes
-  accept one or two indices, so `v(i)`, `M(i, j)`, `v(end) = x`,
-  `M(end, end) = x` are all supported. Single-slot range / colon
-  reads (`v(a:b)`, `v(2:end)`, `v(:)`, `M(2:5)`, `M(:)`) preserve
-  the base's orientation for vectors and produce a row for matrix
-  linear indexing; `Colon` always linearizes to a column. Range /
-  colon writes (`v(a:b) = w`, `v(:) = w`, `v(:) = scalar`) mutate
+  and range/colon writes** — all on real-or-complex double tensors,
+  including N-D. Scalar reads also work on char tensors. Two acceptable
+  arities: one linear index (`v(k)`, `v(end)`) or one per axis
+  (`M(i, j)`, `T(i, j, k)`). Single-slot range / colon reads
+  (`v(a:b)`, `v(2:end)`, `v(:)`, `M(2:5)`, `M(:)`) preserve the base's
+  orientation for vectors and produce a row for matrix linear
+  indexing; `Colon` always linearizes to a column. Multi-slot mixed
+  scalar / range / colon (`M(:, j)`, `M(i, :)`, `M(a:b, c:d)`,
+  `T(:, j, :)`, `T(end, :, end)`) is supported on any-dim tensors —
+  each slot becomes one result axis, trailing singletons are stripped
+  via the same N-D normalization rule numbl's `reshape` uses, and `end`
+  resolves per-axis to `base.dims[<slot>]`. Range / colon writes
+  (`v(a:b) = w`, `v(:) = w`, `M(:, j) = w`, `M(:, :) = scalar`) mutate
   the base buffer in place; the RHS must be a scalar (broadcast) or
   a named tensor variable (per-slot copy with a runtime count check
   that aborts with a clear diagnostic on size mismatch). The range
-  step must be a numeric literal. Type rules across reads and
-  writes: a real RHS into a complex base zeros the imag side per
-  slot (numbl semantics); a complex RHS into a real base is rejected
-  at lowering. Still deferred: char-tensor writes, char-tensor range
-  reads, multi-slot mixed scalar/range (`M(:, j)`, `M(i, :)`,
-  `M(a:b, c:d)`), TensorLit / Binary / IndexSlice on the RHS of a
-  range write (assign to a name first), and indexing into a scalar
-  variable (`x(1)` returning `x`).
+  step must be a numeric literal. Type rules across reads and writes:
+  a real RHS into a complex base zeros the imag side per slot (numbl
+  semantics); a complex RHS into a real base is rejected at lowering.
+  Still deferred: char-tensor writes, char-tensor range reads,
+  TensorLit / Binary / IndexSlice on the RHS of a range write (assign
+  to a name first), and indexing into a scalar variable (`x(1)`
+  returning `x`).
 - **User functions can return owned values.** 1-output functions return
   the owned struct (`mtoc_tensor_t`, `mtoc_char_tensor_t`, `mtoc_string_t`)
   by value; the callee skips freeing the output's local at scope exit so

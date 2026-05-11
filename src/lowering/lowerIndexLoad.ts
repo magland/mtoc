@@ -19,7 +19,6 @@ import type { Expr, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
-  isHigherDim,
   isMultiElement,
   isNumeric,
   isScalar,
@@ -72,23 +71,27 @@ export function lowerIndexLoad(
       span
     );
   }
-  if (isHigherDim(baseTy)) {
-    throw new UnsupportedConstruct(
-      `indexing into a tensor with ndim > 2 is not yet supported ` +
-        `(reshape to 2-D first)`,
-      span
-    );
-  }
   if (argExprs.length === 0) {
     throw new UnsupportedConstruct(
       `indexing '${name}' requires at least one index`,
       span
     );
   }
-  if (argExprs.length > 2) {
+  const ndim = baseTy.dims.length;
+  if (argExprs.length !== 1 && argExprs.length !== ndim) {
     throw new UnsupportedConstruct(
-      `more than 2 indices into '${name}' is not yet supported ` +
-        `(got ${argExprs.length})`,
+      `${argExprs.length}-index access into a ${ndim}-D tensor is not yet ` +
+        `supported (use 1 linear index or ${ndim} per-axis indices)`,
+      span
+    );
+  }
+  // Char tensors stay 2-D-only; the codegen for `<char>.data[offset]`
+  // only emits the 2-D fast path. Reject higher-dim char up front
+  // (today the type system can't produce one anyway, but the guard
+  // documents the assumption).
+  if (baseTy.elem === "char" && ndim > 2) {
+    throw new UnsupportedConstruct(
+      `indexing into an N-D char tensor (ndim > 2) is not yet supported`,
       span
     );
   }
@@ -105,8 +108,7 @@ export function lowerIndexLoad(
   const indices: IRExpr[] = [];
   const numSlots = argExprs.length;
   for (let slot = 0; slot < numSlots; slot++) {
-    const axis: "row" | "col" | "linear" =
-      numSlots === 1 ? "linear" : slot === 0 ? "row" : "col";
+    const axis: number | "linear" = numSlots === 1 ? "linear" : slot;
     this.endStack.push({ baseCName, baseTy, axis });
     let lowered: IRExpr;
     try {

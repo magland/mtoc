@@ -1,11 +1,11 @@
 /**
- * Range / colon indexed-write lowering: `v(a:b) = w`, `v(:) = w`,
- * `v(:) = scalar`, `v(a:s:b) = scalar`.
+ * Range / colon / scalar-mix indexed-write lowering: `v(a:b) = w`,
+ * `v(:) = w`, `M(:, j) = w`, `T(:, i, :) = w`, … .
  *
- * Companion to `lowerIndexStore` for slice (multi-slot) writes.
- * Today only single-slot range/colon writes are supported, on
- * real-or-complex double tensors. The codegen runs a per-slot loop
- * that mutates the base buffer in place.
+ * Companion to `lowerIndexSlice` for slice writes. Same per-slot
+ * lowering and arity rules: 1 slot (linear) or `ndim` slots (full
+ * per-axis). The codegen runs a per-slot loop that mutates the base
+ * buffer in place.
  *
  * RHS shapes:
  *   - tensor RHS: copied slot-by-slot into the slice. A runtime
@@ -24,21 +24,12 @@
 import type { Expr, LValue, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IRStmt, IndexSliceArg } from "./ir.js";
-import {
-  isHigherDim,
-  isMultiElement,
-  isNumeric,
-  isScalar,
-  isScalarReal,
-  scalarDouble,
-  type MType,
-  type NumericType,
-  typeToString,
-} from "./types.js";
+import { isMultiElement, isNumeric, isScalar, typeToString } from "./types.js";
 import type { Lowerer } from "./lower.js";
+import { lowerSliceArg } from "./lowerIndexSlice.js";
 
-/** Lower `<v>(slice) = <expr>` where the lvalue's single index slot
- *  is a `Range` or bare `Colon`. */
+/** Lower `<v>(slice) = <expr>` where the lvalue has at least one
+ *  `Range` or bare `Colon` slot. */
 export function lowerIndexSliceStore(
   this: Lowerer,
   lvalue: Extract<LValue, { type: "Index" }>,
@@ -80,17 +71,12 @@ export function lowerIndexSliceStore(
       span
     );
   }
-  if (isHigherDim(baseTy)) {
+  const ndim = baseTy.dims.length;
+  if (lvalue.indices.length !== 1 && lvalue.indices.length !== ndim) {
     throw new UnsupportedConstruct(
-      `range/colon indexed write into a tensor with ndim > 2 is not yet ` +
-        `supported (reshape to 2-D first)`,
-      span
-    );
-  }
-  if (lvalue.indices.length !== 1) {
-    throw new UnsupportedConstruct(
-      `multi-slot range/colon indexed writes (got ${lvalue.indices.length} ` +
-        `slots) are not yet supported`,
+      `range/colon indexed write into a ${ndim}-D tensor requires either 1 ` +
+        `slot (linear) or ${ndim} slots (one per axis); got ` +
+        `${lvalue.indices.length}`,
       span
     );
   }
@@ -104,10 +90,14 @@ export function lowerIndexSliceStore(
     span: lvalue.base.span,
   };
 
-  // Lower the slice slot inside an `endStack` push so embedded `end`
-  // resolves to numel(base).
-  const arg = lvalue.indices[0];
-  const slice = lowerSliceSlot.call(this, baseCName, baseTy, arg);
+  const isSingleSlot = lvalue.indices.length === 1;
+  const slots: IndexSliceArg[] = [];
+  for (let i = 0; i < lvalue.indices.length; i++) {
+    const axis: number | "linear" = isSingleSlot ? "linear" : i;
+    slots.push(
+      lowerSliceArg.call(this, baseCName, baseTy, axis, lvalue.indices[i])
+    );
+  }
 
   // Lower the RHS — accepted shapes are scalar (broadcast) or any
   // multi-element tensor (copy, with a runtime count check).
@@ -146,81 +136,5 @@ export function lowerIndexSliceStore(
     );
   }
 
-  return { kind: "IndexSliceStore", base, index: slice, rhs, span };
-}
-
-/** Same as `lowerIndexSlice`'s slot lowering — kept inline here so
- *  the slice-write path doesn't depend on the slice-read module. */
-function lowerSliceSlot(
-  this: Lowerer,
-  baseCName: string,
-  baseTy: MType,
-  arg: Expr
-): IndexSliceArg {
-  if (arg.type === "Colon") {
-    return { kind: "Colon", span: arg.span };
-  }
-  if (arg.type !== "Range") {
-    throw new UnsupportedConstruct(
-      `internal: lowerIndexSliceStore reached lowerSliceSlot with a ` +
-        `non-Range/Colon arg ${arg.type}`,
-      arg.span
-    );
-  }
-  this.endStack.push({ baseCName, baseTy, axis: "linear" });
-  let start: IRExpr;
-  let step: IRExpr;
-  let end: IRExpr;
-  try {
-    start = this.lowerExpr(arg.start);
-    if (arg.step === null) {
-      step = {
-        kind: "NumLit",
-        value: 1,
-        ty: scalarRealOne(),
-        span: arg.span,
-      };
-    } else {
-      step = this.lowerExpr(arg.step);
-    }
-    end = this.lowerExpr(arg.end);
-  } finally {
-    this.endStack.pop();
-  }
-  if (!isScalarReal(start.ty)) {
-    throw new TypeError(
-      `range start must be a real scalar (got ${typeToString(start.ty)})`,
-      arg.start.span
-    );
-  }
-  if (!isScalarReal(end.ty)) {
-    throw new TypeError(
-      `range end must be a real scalar (got ${typeToString(end.ty)})`,
-      arg.end.span
-    );
-  }
-  if (!isScalarReal(step.ty)) {
-    throw new TypeError(
-      `range step must be a real scalar (got ${typeToString(step.ty)})`,
-      arg.step?.span ?? arg.span
-    );
-  }
-  if (step.kind !== "NumLit") {
-    throw new UnsupportedConstruct(
-      `range step in an index expression must be a numeric literal ` +
-        `(got expression)`,
-      arg.step?.span ?? arg.span
-    );
-  }
-  if (step.value === 0) {
-    throw new UnsupportedConstruct(
-      `range step in an index expression must be non-zero`,
-      arg.step?.span ?? arg.span
-    );
-  }
-  return { kind: "Range", start, step, end, span: arg.span };
-}
-
-function scalarRealOne(): NumericType {
-  return scalarDouble("positive");
+  return { kind: "IndexSliceStore", base, index: slots, rhs, span };
 }

@@ -196,15 +196,16 @@ export class Lowerer {
 
   /** Stack of contexts for resolving the `end` keyword. Each entry
    *  describes the indexing context an `end` token would refer to:
-   *  the base variable's C name + type plus the axis (`row`, `col`,
-   *  or `linear`). Pushed by `lowerIndexLoad` around each index slot
-   *  it lowers; consumed by the `EndKeyword` arm of `lowerExpr`.
-   *  Outside an index, the stack is empty and an `end` use raises
-   *  an `UnsupportedConstruct` with a span. */
+   *  the base variable's C name + type plus the axis (a 0-based axis
+   *  index, or `"linear"` for single-slot indexing whose `end` is
+   *  `numel(base)`). Pushed by `lowerIndexLoad` / `lowerIndexSlice`
+   *  around each index slot they lower; consumed by the `EndKeyword`
+   *  arm of `lowerExpr`. Outside an index, the stack is empty and an
+   *  `end` use raises an `UnsupportedConstruct` with a span. */
   endStack: Array<{
     baseCName: string;
     baseTy: MType;
-    axis: "row" | "col" | "linear";
+    axis: number | "linear";
   }> = [];
 
   /** Function-specialization cache + workspace handle. Helpers in
@@ -953,10 +954,14 @@ function validateStmt(s: IRStmt): void {
       rejectNestedOwnedExpr(b.right);
     } else if (top === "index-slice") {
       const slice = s.rhs as Extract<IRExpr, { kind: "IndexSlice" }>;
-      if (slice.index.kind === "Range") {
-        rejectNestedOwnedExpr(slice.index.start);
-        rejectNestedOwnedExpr(slice.index.step);
-        rejectNestedOwnedExpr(slice.index.end);
+      for (const slot of slice.index) {
+        if (slot.kind === "Range") {
+          rejectNestedOwnedExpr(slot.start);
+          rejectNestedOwnedExpr(slot.step);
+          rejectNestedOwnedExpr(slot.end);
+        } else if (slot.kind === "Scalar") {
+          rejectNestedOwnedExpr(slot.expr);
+        }
       }
     } else if (top === "user-call" || top === "builtin-call") {
       const call = s.rhs as Extract<IRExpr, { kind: "Call" }>;

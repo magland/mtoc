@@ -129,27 +129,34 @@ The subset is growing iteratively. Roughly:
   arithmetic on them, `sum`, `length`, `numel`
 - Index reads:
   - **Scalar** on any multi-element tensor (real / complex / char):
-    `v(i)`, `M(i, j)`, `v(end)`, `M(end, end)`. The `end` keyword
-    resolves to the relevant axis size at the index site (numel for
-    one-index, rows / cols for two-index).
-  - **Range / colon** on a real-or-complex double tensor (single
-    slot): `v(a:b)`, `v(a:s:b)`, `v(2:end)`, `v(:)`, `M(:)`,
-    `M(2:5)`. `Range` preserves orientation for vectors and produces
-    a row for matrix linear indexing; `Colon` always linearizes to a
-    column. The step must be a numeric literal.
+    `v(i)`, `M(i, j)`, `T(i, j, k)`, `v(end)`, `M(end, end)`. Two
+    arities: one linear index or one per axis. `end` resolves to the
+    relevant axis size at the index site (numel for one-index;
+    `base.dims[<slot>]` for per-axis).
+  - **Range / colon** on a real-or-complex double tensor: single-slot
+    linear forms (`v(a:b)`, `v(a:s:b)`, `v(2:end)`, `v(:)`, `M(:)`,
+    `M(2:5)`) and multi-slot per-axis forms with arbitrary mix of
+    scalar / range / colon slots (`M(:, j)`, `M(i, :)`, `M(:, :)`,
+    `M(1:2, c:d)`, `T(:, j, :)`, `T(end, :, end)`). For the linear
+    form, `Range` preserves orientation for vectors and produces a
+    row for matrix indexing; `Colon` always linearizes to a column.
+    For multi-slot, each slot becomes one result axis (colon keeps
+    `base.dims[k]`, range becomes a runtime count, scalar collapses
+    to 1), with trailing singletons stripped. The step must be a
+    numeric literal.
 - Indexed writes on real-or-complex double tensors:
-  - **Scalar**: `v(i) = x`, `M(i, j) = x`, `v(end) = x`. The base's
-    heap buffer is mutated in place.
-  - **Range / colon** (single slot): `v(a:b) = w`, `v(:) = w`,
-    `v(:) = scalar`. The RHS must be a scalar (broadcast) or a named
+  - **Scalar**: `v(i) = x`, `M(i, j) = x`, `T(i, j, k) = x`,
+    `v(end) = x`. The base's heap buffer is mutated in place.
+  - **Range / colon** (single-slot or multi-slot): `v(a:b) = w`,
+    `v(:) = w`, `v(:) = scalar`, `M(:, j) = w`, `M(:, :) = scalar`,
+    `T(:, j, :) = w`. The RHS must be a scalar (broadcast) or a named
     tensor variable (per-slot copy with a runtime count check that
     aborts on size mismatch). A TensorLit / IndexSlice / Binary RHS
     must be assigned to a name first.
   - Type rule: a real RHS into a complex base sets imag = 0 (numbl
     semantics); a complex RHS into a real base is rejected at
     lowering.
-- Still deferred: multi-slot range/colon (`M(:, j)`, `M(a:b, c:d)`),
-  char-tensor range reads, char-tensor writes.
+- Still deferred: char-tensor range reads, char-tensor writes.
 - Complex numbers (scalar and tensor): literals (`1i`, `2.5i`,
   `3+4i`, `[1+2i, 3+4i]`), unary `+`/`-`, arithmetic (`+ - * /`),
   comparisons + logicals (numbl semantics: ordering on real part,

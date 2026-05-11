@@ -280,27 +280,29 @@ export function emitExpr(
     }
 
     case "EndRef": {
-      // Resolve `end` to the relevant axis size of the base. All three
-      // forms render to a `long`-valued C expression that auto-promotes
-      // to `double` in arithmetic; the indexing site re-casts to long
+      // Resolve `end` to the relevant axis size of the base. The
+      // result is a `long`-valued C expression that auto-promotes to
+      // `double` in arithmetic; the indexing site re-casts to long
       // before forming the bracket index.
       //
-      // Double tensors carry shape in `dims[0..ndim-1]`; char tensors
-      // are 2-D only and keep their legacy `.rows`/`.cols` fields.
-      const rowsField = tensorRowsField(e.baseTy);
-      const colsField = tensorColsField(e.baseTy);
-      switch (e.axis) {
-        case "row":
-          return `${e.baseCName}.${rowsField}`;
-        case "col":
-          return `${e.baseCName}.${colsField}`;
-        case "linear":
-          return `(${e.baseCName}.${rowsField} * ${e.baseCName}.${colsField})`;
+      // Char tensors are 2-D only and keep their legacy `.rows`/`.cols`
+      // fields; double tensors carry shape in `dims[0..ndim-1]`.
+      const isChar = isNumeric(e.baseTy) && e.baseTy.elem === "char";
+      if (e.axis === "linear") {
+        if (isChar) {
+          return `(${e.baseCName}.rows * ${e.baseCName}.cols)`;
+        }
+        const ndim = isNumeric(e.baseTy) ? e.baseTy.dims.length : 2;
+        const parts: string[] = [];
+        for (let i = 0; i < ndim; i++) {
+          parts.push(`${e.baseCName}.dims[${i}]`);
+        }
+        return `(${parts.join(" * ")})`;
       }
-      // Exhaustiveness check.
-      throw new Error(
-        `codegen internal: unsupported EndRef axis ${(e as { axis: string }).axis}`
-      );
+      if (isChar) {
+        return e.axis === 0 ? `${e.baseCName}.rows` : `${e.baseCName}.cols`;
+      }
+      return `${e.baseCName}.dims[${e.axis}]`;
     }
 
     case "IndexLoad": {
@@ -310,7 +312,10 @@ export function emitExpr(
       // subtract 1 to reach the C 0-indexed slot. For 2D, codegen
       // emits the column-major formula `i + j * rows` using the base's
       // runtime row count (`.dims[0]` for double tensors, `.rows` for
-      // char tensors — see `tensorRowsField`).
+      // char tensors — see `tensorRowsField`). For N-D (N >= 3,
+      // double tensors only — char is 2-D-only), the general
+      // column-major formula stacks each axis's contribution scaled by
+      // its stride: `idx_k * prod(dims[0..k-1])`.
       //
       // The base is always rendered as the bare cName here — the per-
       // element iter rendering for multi-element Vars (`v.real[<iter>]`)
@@ -319,13 +324,31 @@ export function emitExpr(
       // rather than recursing through `emitExpr` on the base.
       const baseCName = e.base.cName;
       const baseTy = e.base.ty;
-      const baseRowsField = tensorRowsField(baseTy);
-      const offset =
-        e.indices.length === 1
-          ? `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L`
-          : `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L + ` +
-            `((long)(${emitExpr(state, e.indices[1], 0)}) - 1L) * ` +
-            `${baseCName}.${baseRowsField}`;
+      let offset: string;
+      if (e.indices.length === 1) {
+        offset = `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L`;
+      } else if (e.indices.length === 2) {
+        const baseRowsField = tensorRowsField(baseTy);
+        offset =
+          `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L + ` +
+          `((long)(${emitExpr(state, e.indices[1], 0)}) - 1L) * ` +
+          `${baseCName}.${baseRowsField}`;
+      } else {
+        const terms: string[] = [];
+        for (let i = 0; i < e.indices.length; i++) {
+          const idxStr = `((long)(${emitExpr(state, e.indices[i], 0)}) - 1L)`;
+          if (i === 0) {
+            terms.push(idxStr);
+          } else {
+            const strideParts: string[] = [];
+            for (let j = 0; j < i; j++) {
+              strideParts.push(`${baseCName}.dims[${j}]`);
+            }
+            terms.push(`${idxStr} * ${strideParts.join(" * ")}`);
+          }
+        }
+        offset = terms.join(" + ");
+      }
       // Char tensor: read `.data[offset]` — yields a scalar `char`.
       if (isNumeric(baseTy) && baseTy.elem === "char") {
         return `${baseCName}.data[${offset}]`;

@@ -65,12 +65,17 @@ export function forEachSubExpr(
       return;
     case "IndexSlice":
       // Visit the base Var first, then any sub-expressions inside
-      // the index slot. `Colon` has no sub-exprs — it's a leaf.
+      // each index slot. `Colon` has no sub-exprs (leaf); `Range`
+      // has start/step/end; `Scalar` carries one expr.
       forEachSubExpr(e.base, visit);
-      if (e.index.kind === "Range") {
-        forEachSubExpr(e.index.start, visit);
-        forEachSubExpr(e.index.step, visit);
-        forEachSubExpr(e.index.end, visit);
+      for (const slot of e.index) {
+        if (slot.kind === "Range") {
+          forEachSubExpr(slot.start, visit);
+          forEachSubExpr(slot.step, visit);
+          forEachSubExpr(slot.end, visit);
+        } else if (slot.kind === "Scalar") {
+          forEachSubExpr(slot.expr, visit);
+        }
       }
       return;
   }
@@ -156,10 +161,14 @@ export function forEachTopLevelExpr(s: IRStmt, fn: (e: IRExpr) => void): void {
       return;
     case "IndexSliceStore":
       fn(s.base);
-      if (s.index.kind === "Range") {
-        fn(s.index.start);
-        fn(s.index.step);
-        fn(s.index.end);
+      for (const slot of s.index) {
+        if (slot.kind === "Range") {
+          fn(slot.start);
+          fn(slot.step);
+          fn(slot.end);
+        } else if (slot.kind === "Scalar") {
+          fn(slot.expr);
+        }
       }
       fn(s.rhs);
       return;

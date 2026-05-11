@@ -82,7 +82,7 @@ describe("indexing — scalar reads", () => {
     expect(e.message).toMatch(/scalar/i);
   });
 
-  it("rejects more than 2 indices with a span", () => {
+  it("rejects more than 2 indices on a 2-D tensor with a span", () => {
     let err: unknown;
     try {
       translate("v = [1 2 3];\ndisp(v(1, 2, 3));\n");
@@ -93,7 +93,7 @@ describe("indexing — scalar reads", () => {
     const e = err as { name: string; message: string; span: unknown };
     expect(e.name).toBe("UnsupportedConstruct");
     expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/2 indices/i);
+    expect(e.message).toMatch(/per-axis indices/i);
   });
 
   it("rejects a non-scalar index expression with a TypeError", () => {
@@ -262,18 +262,80 @@ describe("indexing — range and colon reads", () => {
     expect(e.message).toMatch(/char tensor/i);
   });
 
-  it("rejects multi-slot range indexing on read (deferred)", () => {
-    let err: unknown;
-    try {
-      translate("M = [1 2; 3 4];\nw = M(:, 1);\n");
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/multi-slot/i);
+  it("emits a nested loop for multi-slot read M(:, j)", () => {
+    const c = translate("M = [1 2; 3 4];\nw = M(:, 1);\ndisp(w);\n");
+    // Per-slot count locals; one per axis.
+    expect(c).toContain("long _mtoc_n_0 = M.dims[0];");
+    expect(c).toContain("long _mtoc_src_1 = (long)(1.0) - 1L;");
+    expect(c).toContain("long _mtoc_n_1 = 1;");
+    // Result allocated via the N-D helper.
+    expect(c).toMatch(
+      /mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc_nd\(2, \(long\[\]\)\{_mtoc_n_0, _mtoc_n_1\}\)/
+    );
+    // Nested for-loops with slot 0 innermost.
+    expect(c).toContain("for (long _mtoc_k_1 = 0; _mtoc_k_1 < _mtoc_n_1");
+    expect(c).toContain("for (long _mtoc_k_0 = 0; _mtoc_k_0 < _mtoc_n_0");
+    // Source offset uses column-major stride; destination is linear.
+    expect(c).toMatch(
+      /long _mtoc_src_off = _mtoc_k_0 \+ _mtoc_src_1 \* M\.dims\[0\];/
+    );
+    expect(c).toMatch(
+      /long _mtoc_dst_off = _mtoc_k_0 \+ _mtoc_k_1 \* _mtoc_n_0;/
+    );
+    expect(c).toContain("_mtoc_t.real[_mtoc_dst_off] = M.real[_mtoc_src_off];");
+    expect(c).toContain("mtoc_tensor_assign(&w, _mtoc_t);");
+  });
+
+  it("emits a row-slice read M(i, :) with the slot order preserved", () => {
+    const c = translate("M = [1 2; 3 4];\nw = M(2, :);\ndisp(w);\n");
+    expect(c).toContain("long _mtoc_src_0 = (long)(2.0) - 1L;");
+    expect(c).toContain("long _mtoc_n_0 = 1;");
+    expect(c).toContain("long _mtoc_n_1 = M.dims[1];");
+    // Source contribution from the colon slot uses its loop var k_1.
+    expect(c).toMatch(
+      /long _mtoc_src_off = _mtoc_src_0 \+ _mtoc_k_1 \* M\.dims\[0\];/
+    );
+  });
+
+  it("supports a Range slot alongside a Colon: M(1:2, :)", () => {
+    const c = translate("M = [1 2; 3 4];\nw = M(1:2, :);\ndisp(w);\n");
+    expect(c).toContain("double _mtoc_start_0 = 1.0;");
+    expect(c).toContain("double _mtoc_end_0 = 2.0;");
+    expect(c).toContain(
+      "long _mtoc_n_0 = (long)floor((_mtoc_end_0 - _mtoc_start_0) / 1.0) + 1;"
+    );
+    expect(c).toContain("long _mtoc_n_1 = M.dims[1];");
+    // The range slot's source uses _mtoc_k_0 inside the loop body.
+    expect(c).toMatch(
+      /long _mtoc_src_off = \(\(long\)\(_mtoc_start_0 \+ 1\.0 \* \(double\)_mtoc_k_0\) - 1L\) \+ _mtoc_k_1 \* M\.dims\[0\];/
+    );
+  });
+
+  it("resolves M(end, :) and M(:, end) to per-axis dims", () => {
+    const c1 = translate("M = [1 2; 3 4];\nw = M(end, :);\ndisp(w);\n");
+    // slot 0's `end` resolves to base.dims[0] (rows of M).
+    expect(c1).toMatch(/long _mtoc_src_0 = \(long\)\(M\.dims\[0\]\) - 1L;/);
+    const c2 = translate("M = [1 2; 3 4];\nw = M(:, end);\ndisp(w);\n");
+    // slot 1's `end` resolves to base.dims[1] (cols of M).
+    expect(c2).toMatch(/long _mtoc_src_1 = \(long\)\(M\.dims\[1\]\) - 1L;/);
+  });
+
+  it("supports the 3-D slice T(:, j, :) on a reshaped 3-D tensor", () => {
+    const c = translate(
+      "v = [1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24];\n" +
+        "T = reshape(v, 2, 3, 4);\nw = T(:, 1, :);\ndisp(w);\n"
+    );
+    expect(c).toContain("long _mtoc_n_0 = T.dims[0];");
+    expect(c).toContain("long _mtoc_src_1 = (long)(1.0) - 1L;");
+    expect(c).toContain("long _mtoc_n_2 = T.dims[2];");
+    expect(c).toMatch(
+      /mtoc_tensor_t _mtoc_t = mtoc_tensor_alloc_nd\(3, \(long\[\]\)\{_mtoc_n_0, _mtoc_n_1, _mtoc_n_2\}\)/
+    );
+    // The nested-loop body's source offset uses the full N-D
+    // column-major stride formula.
+    expect(c).toMatch(
+      /long _mtoc_src_off = _mtoc_k_0 \+ _mtoc_src_1 \* T\.dims\[0\] \+ _mtoc_k_2 \* T\.dims\[0\] \* T\.dims\[1\];/
+    );
   });
 });
 

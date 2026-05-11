@@ -21,7 +21,6 @@ import type { Expr, LValue, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IRStmt } from "./ir.js";
 import {
-  isHigherDim,
   isMultiElement,
   isNumeric,
   isScalar,
@@ -71,23 +70,17 @@ export function lowerIndexStore(
       span
     );
   }
-  if (isHigherDim(baseTy)) {
-    throw new UnsupportedConstruct(
-      `indexed write into a tensor with ndim > 2 is not yet supported ` +
-        `(reshape to 2-D first)`,
-      span
-    );
-  }
   if (lvalue.indices.length === 0) {
     throw new UnsupportedConstruct(
       `indexed write requires at least one index`,
       span
     );
   }
-  if (lvalue.indices.length > 2) {
+  const ndim = baseTy.dims.length;
+  if (lvalue.indices.length !== 1 && lvalue.indices.length !== ndim) {
     throw new UnsupportedConstruct(
-      `more than 2 indices in an indexed write is not yet supported ` +
-        `(got ${lvalue.indices.length})`,
+      `${lvalue.indices.length}-index write into a ${ndim}-D tensor is ` +
+        `not yet supported (use 1 linear index or ${ndim} per-axis indices)`,
       span
     );
   }
@@ -116,8 +109,7 @@ export function lowerIndexStore(
   const indices: IRExpr[] = [];
   const numSlots = lvalue.indices.length;
   for (let slot = 0; slot < numSlots; slot++) {
-    const axis: "row" | "col" | "linear" =
-      numSlots === 1 ? "linear" : slot === 0 ? "row" : "col";
+    const axis: number | "linear" = numSlots === 1 ? "linear" : slot;
     this.endStack.push({ baseCName, baseTy, axis });
     let lowered: IRExpr;
     try {

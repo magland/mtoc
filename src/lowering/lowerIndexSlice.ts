@@ -1,22 +1,32 @@
 /**
- * Range / colon index lowering: `v(a:b)`, `v(a:s:b)`, `v(:)`.
+ * Range / colon / scalar-mix index lowering: `v(a:b)`, `v(:)`,
+ * `M(:, j)`, `T(:, i, :)`, … .
  *
  * The lowerer reaches this helper from `lowerFuncCall` whenever an
  * indexing FuncCall has any slot that is a `Range` or bare `Colon`
- * AST node. Today only single-slot slices are supported (linear
- * indexing into a vector or matrix); 2D mixed scalar/range slicing
- * arrives in a future commit.
+ * AST node. Two acceptable arities:
+ *   - 1 slot         → linear indexing into a multi-element tensor.
+ *   - `ndim` slots   → full per-axis indexing. Any mix of `Colon`,
+ *                       `Range`, and scalar slots is allowed.
+ * Any other arity is rejected with a span (numbl's "partial linear-
+ * trailing" semantics are not yet supported).
  *
- * Result-shape rules (matching numbl):
+ * Single-slot result-shape rules (matching numbl):
  *   - `Range` slot, base is row-vec  → row-vec (preserves)
  *   - `Range` slot, base is col-vec  → col-vec (preserves)
- *   - `Range` slot, base is matrix   → col-vec (linearized)
+ *   - `Range` slot, base is matrix   → row-vec (the range is itself
+ *                                       a row)
  *   - `Colon` slot                    → col-vec (always linearized)
+ *
+ * Multi-slot result-shape rules (one result axis per slot):
+ *   - `Colon`  at axis k → result.dims[k] = base.dims[k]
+ *   - `Range`  at axis k → result.dims[k] = {notOne}
+ *   - `Scalar` at axis k → result.dims[k] = {one}
+ * Trailing singletons are stripped by `numericTypeND`.
  *
  * Char-tensor slices and complex-step ranges are deferred — the
  * codegen path here assumes a real-or-complex `mtoc_tensor_t` base
- * with a numeric-literal step; non-conforming cases are rejected at
- * lowering with a span.
+ * with a numeric-literal step.
  */
 
 import type { Expr, Span } from "../parser/index.js";
@@ -24,12 +34,11 @@ import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IndexSliceArg } from "./ir.js";
 import {
   isColVec,
-  isHigherDim,
   isMultiElement,
   isNumeric,
   isRowVec,
   isScalarReal,
-  numericType,
+  numericTypeND,
   scalarDouble,
   type DimInfo,
   type MType,
@@ -72,17 +81,11 @@ export function lowerIndexSlice(
       span
     );
   }
-  if (isHigherDim(baseTy)) {
+  const ndim = baseTy.dims.length;
+  if (argExprs.length !== 1 && argExprs.length !== ndim) {
     throw new UnsupportedConstruct(
-      `range/colon indexing into a tensor with ndim > 2 is not yet ` +
-        `supported (reshape to 2-D first)`,
-      span
-    );
-  }
-  if (argExprs.length !== 1) {
-    throw new UnsupportedConstruct(
-      `multi-slot range/colon indexing (got ${argExprs.length} slots) is ` +
-        `not yet supported; use single-slot linear or full-colon forms`,
+      `range/colon indexing of a ${ndim}-D tensor requires either 1 slot ` +
+        `(linear) or ${ndim} slots (one per axis); got ${argExprs.length}`,
       span
     );
   }
@@ -96,81 +99,111 @@ export function lowerIndexSlice(
     span,
   };
 
-  // The single index slot. The lowerer's endStack is pushed for the
-  // duration of lowering each Range component so an embedded `end`
-  // resolves to the right axis size of the base. Colon has no sub-
-  // expressions and so doesn't need the stack push.
-  const arg = argExprs[0];
-  const slice = lowerSliceArg.call(this, baseCName, baseTy, arg);
-
-  // Result shape (matching numbl):
-  //   - Colon            → always linearizes to a column vector.
-  //   - Range, base row  → row vector (preserves base orientation).
-  //   - Range, base col  → col vector (preserves base orientation).
-  //   - Range, base mtx  → row vector (since the range `a:b` is itself
-  //                        a row, and the index orientation wins for
-  //                        a matrix base under linear indexing).
-  let resultRows: DimInfo;
-  let resultCols: DimInfo;
-  if (slice.kind === "Colon") {
-    resultRows = { kind: "notOne" };
-    resultCols = { kind: "one" };
-  } else if (isRowVec(baseTy)) {
-    resultRows = { kind: "one" };
-    resultCols = { kind: "notOne" };
-  } else if (isColVec(baseTy)) {
-    resultRows = { kind: "notOne" };
-    resultCols = { kind: "one" };
-  } else {
-    // Matrix base under range indexing: row result.
-    resultRows = { kind: "one" };
-    resultCols = { kind: "notOne" };
+  // Lower each slot. The `end` axis is "linear" for the single-slot
+  // form (so `end` resolves to numel(base)); for the multi-slot form
+  // it is the slot index (so `M(end, :)` → rows of M, `M(:, end)` →
+  // cols of M, etc.).
+  const isSingleSlot = argExprs.length === 1;
+  const slots: IndexSliceArg[] = [];
+  for (let i = 0; i < argExprs.length; i++) {
+    const axis: number | "linear" = isSingleSlot ? "linear" : i;
+    slots.push(lowerSliceArg.call(this, baseCName, baseTy, axis, argExprs[i]));
   }
-  const resultTy: NumericType = numericType(
-    resultRows,
-    resultCols,
-    baseTy.isComplex,
-    baseTy.isComplex ? "unknown" : "unknown"
-  );
+
+  // Build the result type. The single-slot path keeps the legacy
+  // shape rules; the multi-slot path takes one result axis per slot.
+  let resultTy: NumericType;
+  if (isSingleSlot) {
+    const slot = slots[0];
+    let resultRows: DimInfo;
+    let resultCols: DimInfo;
+    if (slot.kind === "Colon") {
+      resultRows = { kind: "notOne" };
+      resultCols = { kind: "one" };
+    } else if (slot.kind === "Range") {
+      if (isRowVec(baseTy)) {
+        resultRows = { kind: "one" };
+        resultCols = { kind: "notOne" };
+      } else if (isColVec(baseTy)) {
+        resultRows = { kind: "notOne" };
+        resultCols = { kind: "one" };
+      } else {
+        // Matrix base under linear range: range is itself a row.
+        resultRows = { kind: "one" };
+        resultCols = { kind: "notOne" };
+      }
+    } else {
+      throw new UnsupportedConstruct(
+        `internal: single-slot scalar slice should have routed through ` +
+          `lowerIndexLoad`,
+        span
+      );
+    }
+    resultTy = numericTypeND(
+      [resultRows, resultCols],
+      baseTy.isComplex,
+      "unknown"
+    );
+  } else {
+    const resultDims: DimInfo[] = slots.map((slot, k) => {
+      if (slot.kind === "Colon") return baseTy.dims[k];
+      if (slot.kind === "Range") return { kind: "notOne" };
+      return { kind: "one" };
+    });
+    resultTy = numericTypeND(resultDims, baseTy.isComplex, "unknown");
+  }
 
   return {
     kind: "IndexSlice",
     base,
-    index: slice,
+    index: slots,
     ty: resultTy,
     span,
   };
 }
 
-/** Lower a `Range` or `Colon` AST node into an `IndexSliceArg`. The
- *  endStack is pushed for the duration of lowering the Range's
- *  sub-expressions so an embedded `end` token resolves correctly. */
-function lowerSliceArg(
+/** Lower a `Range` / `Colon` / scalar AST node into an `IndexSliceArg`.
+ *  The `endStack` is pushed for the duration of lowering each slot's
+ *  sub-expressions so an embedded `end` token resolves against the
+ *  right axis of the base. Exported so the sibling store-side helper
+ *  can reuse the slot-lowering logic. */
+export function lowerSliceArg(
   this: Lowerer,
   baseCName: string,
   baseTy: MType,
+  axis: number | "linear",
   arg: Expr
 ): IndexSliceArg {
   if (arg.type === "Colon") {
     return { kind: "Colon", span: arg.span };
   }
   if (arg.type !== "Range") {
-    throw new UnsupportedConstruct(
-      `internal: lowerSliceArg called with non-Range/Colon arg ${arg.type}`,
-      arg.span
-    );
+    // Scalar slot — accepted only in the multi-slot mixed form. The
+    // caller drives that distinction (single-slot scalar would route
+    // through lowerIndexLoad instead).
+    this.endStack.push({ baseCName, baseTy, axis });
+    let expr: IRExpr;
+    try {
+      expr = this.lowerExpr(arg);
+    } finally {
+      this.endStack.pop();
+    }
+    if (!isScalarReal(expr.ty)) {
+      throw new TypeError(
+        `index slot must be a real scalar (got ${typeToString(expr.ty)})`,
+        arg.span
+      );
+    }
+    return { kind: "Scalar", expr, span: arg.span };
   }
-  // Single-slot context → axis is "linear" for `end` resolution.
-  this.endStack.push({ baseCName, baseTy, axis: "linear" });
+  this.endStack.push({ baseCName, baseTy, axis });
   let start: IRExpr;
   let step: IRExpr;
   let end: IRExpr;
   try {
     start = this.lowerExpr(arg.start);
     if (arg.step === null) {
-      // Implicit step of 1. Synthesize the IR node directly so the
-      // codegen path stays uniform — a numeric-literal step lets
-      // codegen emit a well-typed iteration-count expression.
+      // Implicit step of 1.
       step = {
         kind: "NumLit",
         value: 1,
@@ -202,9 +235,6 @@ function lowerSliceArg(
       arg.step?.span ?? arg.span
     );
   }
-  // Codegen requires a literal step today (matches the for-loop
-  // convention) — a runtime step changes the iteration-count
-  // formula and isn't worth the extra complexity for the first cut.
   if (step.kind !== "NumLit") {
     throw new UnsupportedConstruct(
       `range step in an index expression must be a numeric literal ` +
@@ -221,9 +251,6 @@ function lowerSliceArg(
   return { kind: "Range", start, step, end, span: arg.span };
 }
 
-/** Local helper: `scalarDouble("positive")` for the implicit step.
- *  Defined inline here so this file doesn't need to thread through
- *  the broader sign helpers. */
 function scalarRealOne(): NumericType {
   return scalarDouble("positive");
 }
