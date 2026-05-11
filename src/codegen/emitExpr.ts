@@ -248,6 +248,12 @@ export function emitExpr(
         return p < parentPrec ? `(${inner})` : inner;
       }
       if (e.op === "Pow" || e.op === "ElemPow") {
+        // Complex-result Pow (negative base, non-integer exponent —
+        // see lowerPow). C99 implicitly promotes the real operand
+        // strings to `double _Complex` at the cpow call boundary.
+        if (isNumeric(e.ty) && e.ty.isComplex) {
+          return `cpow(${emitExpr(state, e.left, 0)}, ${emitExpr(state, e.right, 0)})`;
+        }
         return `pow(${emitExpr(state, e.left, 0)}, ${emitExpr(state, e.right, 0)})`;
       }
       throw new Error(

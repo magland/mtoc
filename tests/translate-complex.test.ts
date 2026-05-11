@@ -63,4 +63,29 @@ describe("complex scalar codegen", () => {
     expect(c).not.toContain("mtoc_cdiv");
     expect(c).toMatch(/x \/ y/);
   });
+
+  it("lifts (negative)^(non-integer-const) to cpow with complex result", () => {
+    const c = translate("r = (-1)^0.5;\ndisp(r);\n");
+    expect(c).toContain("double _Complex r");
+    expect(c).toContain("cpow(-1.0, 0.5)");
+  });
+
+  it("folds (negative)^(1/3) to cpow (constant-folds the divide)", () => {
+    const c = translate("r = (-8)^(1/3);\ndisp(r);\n");
+    expect(c).toContain("double _Complex r");
+    expect(c).toContain("cpow(-8.0, 1.0 / 3.0)");
+  });
+
+  it("keeps (negative)^(integer-const) on real pow", () => {
+    const c = translate("r = (-2)^2;\ndisp(r);\n");
+    expect(c).not.toContain("cpow");
+    expect(c).toContain("pow(-2.0, 2.0)");
+    expect(c).not.toContain("double _Complex r");
+  });
+
+  it("keeps (positive)^(non-integer-const) on real pow", () => {
+    const c = translate("r = 4^0.5;\ndisp(r);\n");
+    expect(c).not.toContain("cpow");
+    expect(c).toContain("pow(4.0, 0.5)");
+  });
 });

@@ -12,6 +12,7 @@
 arithmetic/basic_ops.m
 arithmetic/fortran_exponent_literal.m
 arithmetic/test_complex_div_zero.m
+arithmetic/test_negative_base_power.m
 arrays/end_range_debug_.m
 builtins/test_angle_nan.m
 builtins/test_block_comment_syntax.m

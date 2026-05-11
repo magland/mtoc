@@ -307,15 +307,59 @@ function lowerComparison(
   };
 }
 
+/** Try to evaluate `e` as a compile-time numeric constant. Returns
+ *  the value or `null` if not foldable. Handles NumLit, plus Binary
+ *  / Unary chains over numeric literals (used by `^` to detect a
+ *  non-integer exponent like `1/3` so the result can be widened to
+ *  complex). Conservative — anything beyond literal arithmetic
+ *  returns `null`. */
+function tryConstExprValue(e: IRExpr): number | null {
+  if (e.kind === "NumLit") return e.value;
+  if (e.kind === "Unary") {
+    const v = tryConstExprValue(e.operand);
+    if (v === null) return null;
+    if (e.op === "Plus") return v;
+    if (e.op === "Minus") return -v;
+    return null;
+  }
+  if (e.kind === "Binary") {
+    const l = tryConstExprValue(e.left);
+    const r = tryConstExprValue(e.right);
+    if (l === null || r === null) return null;
+    switch (e.op) {
+      case "Add":
+        return l + r;
+      case "Sub":
+        return l - r;
+      case "Mul":
+      case "ElemMul":
+        return l * r;
+      case "Div":
+      case "ElemDiv":
+        return l / r;
+      case "Pow":
+      case "ElemPow":
+        return Math.pow(l, r);
+      default:
+        return null;
+    }
+  }
+  return null;
+}
+
 /** Power ops:
- *    - `^` stays scalar-real only (matrix power is a separate codegen
- *      path; we surface a clear message pointing at `.^`).
+ *    - `^` is scalar-real; lifts to complex when the base is
+ *      statically negative AND the exponent folds to a non-integer
+ *      constant (e.g. `(-1)^0.5`). Matrix power on two tensors is
+ *      rejected with a pointer to `.^`.
  *    - `.^` is element-wise: scalar-real, or broadcastable real-elem
- *      tensors. Complex is deferred for both forms — C99 has no
- *      direct `cpow` integration in the runtime yet.
- *  Codegen renders both as `pow(<left>, <right>)`; inside an iter loop
- *  the operand strings already reduce to per-slot scalar reads, so the
- *  same `emit` path covers tensor `.^` for free. */
+ *      tensors. The negative-base / non-integer-exponent lift is
+ *      scalar-only for now.
+ *  Codegen renders the real path as `pow(<left>, <right>)`; the
+ *  complex-result path emits `cpow(...)` and the variable receiving
+ *  it is typed `double _Complex`. Inside an iter loop the operand
+ *  strings already reduce to per-slot scalar reads, so the same emit
+ *  path covers tensor `.^` for free. */
 function lowerPow(
   e: Extract<Expr, { type: "Binary" }>,
   left: IRExpr,
@@ -329,6 +373,41 @@ function lowerPow(
       `binary ${e.op} on complex operands is not yet supported`,
       e.span
     );
+  }
+  // Mirror numbl: a statically negative base raised to a non-integer
+  // constant exponent produces a complex principal-value result
+  // (e.g. `(-1)^0.5 == 1i`). Without this lift the C-emitted `pow`
+  // returns NaN and any program that relied on the complex root
+  // silently fails. Limited to constant exponents — for a non-folded
+  // exponent (variable, complex sub-expression) we keep the real path
+  // since most callers feed integer exponents and a blanket lift
+  // would force `(-2)^2 → 4 + ε*i`, breaking `== 4` assertions.
+  const leftSign = isNumeric(left.ty) ? left.ty.sign : "unknown";
+  const baseDefinitelyNegative =
+    leftSign === "negative" || leftSign === "nonpositive";
+  if (baseDefinitelyNegative) {
+    const expVal = tryConstExprValue(right);
+    if (
+      expVal !== null &&
+      Number.isFinite(expVal) &&
+      !Number.isInteger(expVal)
+    ) {
+      if (!isScalar(left.ty) || !isScalar(right.ty)) {
+        throw new UnsupportedConstruct(
+          `binary ${e.op} producing a complex result is only supported on ` +
+            `scalar operands today`,
+          e.span
+        );
+      }
+      return {
+        kind: "Binary",
+        op: e.op,
+        left,
+        right,
+        ty: scalarComplex(),
+        span: e.span,
+      };
+    }
   }
   if (e.op === "Pow") {
     if (!isScalar(left.ty) || !isScalar(right.ty)) {
