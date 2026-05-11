@@ -136,6 +136,10 @@ export function forEachTopLevelExpr(s: IRStmt, fn: (e: IRExpr) => void): void {
       fn(s.cond);
       if (s.msg !== null) fn(s.msg);
       return;
+    case "Fprintf":
+      fn(s.fmt);
+      for (const a of s.args) fn(a);
+      return;
     case "If":
       fn(s.cond);
       for (const eif of s.elseifs) fn(eif.cond);
@@ -206,6 +210,7 @@ export function forEachStmtInTree(
       case "Disp":
       case "Error":
       case "Assert":
+      case "Fprintf":
       case "MultiAssignCall":
       case "IndexStore":
       case "IndexSliceStore":

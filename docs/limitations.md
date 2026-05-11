@@ -194,8 +194,10 @@ workaround or a roadmap note.
   - **String arrays** (`["a", "b"]`, `string(...)`) — strings are
     scalar-only today.
   - **Indexing** (`s(1)`, `s(2:3)`).
-  - **Most string builtins**: `sprintf`, `strcat`, `num2str`,
+  - **Most string builtins**: `strcat`, `num2str`,
     `strsplit`, `strrep`, `strtrim`, `upper`, `lower`, etc.
+    (`sprintf` is supported — single-quoted format → char result,
+    double-quoted format → string result, matching numbl.)
   - **String + numeric coercion.** numbl converts e.g. `"v=" + 1`
     to `"v=1"`; mtoc rejects with a `TypeError` requiring the other
     operand of `+` to be a string or char array.
@@ -216,7 +218,18 @@ workaround or a roadmap note.
     functions still require scalar-numeric returns.
   - **Most char builtins**: `upper`, `lower`, `num2str`, etc.
 - **No cell arrays, structs, classes.**
-- **No `fprintf`** beyond the `disp` runtime helper.
+- **`fprintf` and `sprintf` partial**: the format engine
+  (`runtime/format_engine.h`) mirrors numbl's `sprintfFormat`
+  byte-for-byte (spec set `d i u f e E g s c x X o %`, flags
+  `- + 0 # space`, precision, `*` width, `\n` / `\t` / `\\` escapes
+  interpreted at format time, numeric tensor flattening,
+  format cycling). Remaining gaps:
+  - **fid restricted to literal 1 or 2** at lowering. Numbl routes
+    fid=2 to its single `output` stream, so both surface on stdout.
+    Other fids and runtime-fid expressions are deferred until
+    file-I/O support lands.
+  - **Value-returning `n = fprintf(...)`** deferred; statement form
+    only. `sprintf(...)` does return its value.
 - **`tic` / `toc` clock origin differs from numbl.** mtoc reads
   `clock_gettime(CLOCK_MONOTONIC)`; numbl reads `performance.now()`.
   Both are monotonic, so _elapsed_ durations agree, but the absolute

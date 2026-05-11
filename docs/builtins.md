@@ -69,12 +69,53 @@ several entries share a non-trivial closure shape.
 - **`expr` builtins** lower to `IRExpr.Call` and end up in the value position
   of an expression. The vast majority.
 - **`stmt` builtins** are accepted at statement position only. Today
-  `disp`, `error`, and `assert` are in this group. Lowering routes
-  `ExprStmt(disp(x))` into `IRStmt.Disp`, `ExprStmt(error(s))` into
-  `IRStmt.Error`, and `ExprStmt(assert(c))` into `IRStmt.Assert`
-  directly; the registry entries exist so `Workspace.resolve` has a
-  single lookup path and value-position uses reject with a clear
-  message.
+  `disp`, `error`, `assert`, and `fprintf` are in this group.
+  Lowering routes `ExprStmt(disp(x))` into `IRStmt.Disp`,
+  `ExprStmt(error(s))` into `IRStmt.Error`, `ExprStmt(assert(c))`
+  into `IRStmt.Assert`, and `ExprStmt(fprintf(fmt, args…))` into
+  `IRStmt.Fprintf`. The registry entries exist so `Workspace.resolve`
+  has a single lookup path and value-position uses reject with a
+  clear message.
+
+## fprintf / sprintf
+
+Both share one C runtime engine — `runtime/format_engine.h` — that
+mirrors numbl's `sprintfFormat`
+(`numbl/src/numbl-core/helpers/string.ts`) byte-for-byte: same spec
+set (`d i u f e E g s c x X o %`), same flag handling, same `\n` /
+`\t` / `\\` escape interpretation (numbl preserves backslash bytes
+through the lexer, then the engine resolves them at format time),
+same column-major tensor flattening, same format-cycling rule.
+
+The split:
+
+- `fprintf` is statement-only. The lowering hook
+  (`fprintfLowerStmt` in `workspace/builtins.ts`) resolves an
+  optional literal-`1`-or-`2` fid (numbl routes both fids to its
+  single output stream — mtoc emits both to stdout for byte parity),
+  validates the format and value args, and produces an
+  `IRStmt.Fprintf`. Codegen emits one call into `mtoc_fprintf` with
+  a C99 compound-literal `mtoc_fprintf_arg_t[]` carrying tagged
+  payloads (double / complex / text view / tensor pointer).
+- `sprintf` is an expression builtin whose return type tracks
+  numbl: char-typed format → char-array result, string-typed format
+  → string result. The lowering hook (`sprintfLowerExpr`) builds a
+  fresh `BuiltinSig` with `producesOwnedDirectly: true` so ANF
+  hoists the call into its own owned-LHS Assign whenever it appears
+  in a nested position. The synthetic sig's `emit` closure selects
+  between `mtoc_sprintf_str` and `mtoc_sprintf_char` based on the
+  format's static text type.
+
+The compound-literal arg encoding (`mtoc_fprintf_arg_t`) lets the
+emit site stay a single C expression regardless of arity, which is
+what makes `producesOwnedDirectly: true` viable for sprintf — the
+ANF hoist sees a normal `Call` node and lifts it like any other
+owned producer (zeros / size / reshape).
+
+Format strings and `%s` arguments accept both string and char-array
+sources interchangeably via the existing `mtoc_text_view_t` adapter
+(`runtime/text_view.h`), reusing the same path that disp, error,
+assert(\_, msg), strcmp, and `+` concat already use.
 
 ## Codegen interaction
 

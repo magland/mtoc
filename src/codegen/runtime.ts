@@ -397,4 +397,30 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     "mtoc_assert_double_msg_text",
     loadSnippet("assert_double_msg_text.h", ["mtoc_text_view_t"]),
   ],
+  // Format engine — shared walker that drives `fprintf` and `sprintf`,
+  // mirroring numbl's `sprintfFormat` byte-for-byte. `fprintf.h`
+  // writes to a FILE* sink; `sprintf.h` writes to a growable buffer
+  // and returns an owned string / char-array depending on the format
+  // arg's static type.
+  [
+    "mtoc_format_engine",
+    loadSnippet("format_engine.h", [
+      "mtoc_text_view_t",
+      "mtoc_tensor_t",
+      "mtoc_format_complex",
+    ]),
+  ],
+  ["mtoc_fprintf", loadSnippet("fprintf.h", ["mtoc_format_engine"])],
+  // `sprintf.h` defines BOTH `mtoc_sprintf_str` and `mtoc_sprintf_char`
+  // (same idiom as `mtoc_rng` / `mtoc_tic`). Codegen activates the
+  // umbrella key `mtoc_sprintf` regardless of which entry it emits in
+  // the rendered C, so the snippet body is included exactly once.
+  [
+    "mtoc_sprintf",
+    loadSnippet("sprintf.h", [
+      "mtoc_format_engine",
+      "mtoc_string_t",
+      "mtoc_char_tensor_t",
+    ]),
+  ],
 ]);

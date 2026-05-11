@@ -317,6 +317,28 @@ export type IRStmt =
       span: Span;
     }
   | {
+      /** `fprintf(fmt, args...)` / `fprintf(fid, fmt, args...)` —
+       *  formatted output to stdout. Statement-only in v1 (the
+       *  value-returning form `n = fprintf(...)` is deferred — the
+       *  byte count is rarely consumed in practice and adds an
+       *  expression-position path with no test corpus). Lowering
+       *  restricts `fid` to a literal `1` or `2` and routes both to
+       *  stdout, matching numbl's runtime (numbl's `output` stream
+       *  receives both fid=1 and fid=2 — see specialBuiltins.ts).
+       *
+       *  Codegen emits one call:
+       *      mtoc_fprintf(stdout, <fmt-view>, N, (mtoc_fprintf_arg_t[]){…})
+       *  The args array is a C99 compound literal whose entries
+       *  discriminate on the IR arg type (double, complex, text,
+       *  tensor). The runtime helper mirrors numbl's `sprintfFormat`
+       *  byte-for-byte (specs, escape handling, arg cycling, tensor
+       *  flattening). See `runtime/format_engine.h`. */
+      kind: "Fprintf";
+      fmt: IRExpr;
+      args: IRExpr[];
+      span: Span;
+    }
+  | {
       kind: "If";
       cond: IRExpr;
       thenBody: IRStmt[];

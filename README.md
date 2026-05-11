@@ -113,7 +113,14 @@ The subset is growing iteratively. Roughly:
   both runtimes are seeded.
 - Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`,
   `assert(cond, msg)` (msg may be a string or char-array literal /
-  variable; tensor-condition form is deferred)
+  variable; tensor-condition form is deferred), `fprintf(fmt, …)` /
+  `fprintf(fid, fmt, …)` (fid restricted to literal 1 or 2 — numbl
+  routes both to stdout). Value-returning `n = fprintf(...)` deferred.
+- `sprintf(fmt, args…)` — returns a `char` value for single-quoted
+  formats and a `string` value for double-quoted formats, matching
+  numbl's `RuntimeChar` / `RuntimeString` distinction. Shares its
+  C runtime with `fprintf`: a numbl-compatible format engine
+  (`runtime/format_engine.h`) drives both.
 - Timing: `tic` / `toc` — `tic` records a monotonic timestamp and
   returns it; `toc` returns the elapsed seconds since the last `tic`
   (or since the handle in `toc(h)`). The bare-statement form `toc;` /

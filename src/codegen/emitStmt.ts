@@ -139,6 +139,56 @@ function emitEarlyFrees(
   }
 }
 
+/** Render a single fprintf / sprintf value arg as a `mtoc_fprintf_arg_t`
+ *  designated-initializer expression. Dispatches on the arg's static
+ *  type — text views go through the existing `mtoc_text_from_*`
+ *  adapters; scalar numerics promote to `double` (scalar char widens
+ *  to its numeric value); complex scalars pass through unchanged;
+ *  multi-element tensors travel as a pointer to the caller's
+ *  predeclared `mtoc_tensor_t` local. Wrapping owned-producing RHS
+ *  forms in arg position is moot — the surrounding lowering rejects
+ *  anything but a Var / literal here. */
+export function formatArgInit(state: EmitState, e: IRExpr): string {
+  // Activate the format-engine umbrella so the tag enums + struct
+  // definition are in scope at the call site. `mtoc_fprintf` /
+  // `mtoc_sprintf` callers have already activated their own
+  // umbrella, but doing it here keeps this helper self-contained
+  // for any future statement that calls it directly.
+  useRuntimeByName(state, "mtoc_format_engine");
+  const ty = e.ty;
+  const c = emitExpr(state, e, 0);
+  if (isText(ty)) {
+    const view = wrapTextView(state, ty, c);
+    return `{.kind=MTOC_FA_TEXT, .u.t=${view}}`;
+  }
+  if (isScalarComplex(ty)) {
+    return `{.kind=MTOC_FA_COMPLEX, .u.z=${c}}`;
+  }
+  if (isCharScalar(ty)) {
+    // Scalar char promotes to its code-unit value for numeric specs
+    // (matches numbl's toNumber on a 1-char RuntimeChar). %s of a
+    // scalar char isn't supported in v1 — the test corpus doesn't
+    // hit it.
+    return `{.kind=MTOC_FA_DOUBLE, .u.d=(double)(unsigned char)(${c})}`;
+  }
+  if (isScalarReal(ty)) {
+    return `{.kind=MTOC_FA_DOUBLE, .u.d=${c}}`;
+  }
+  if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
+    useRuntimeByName(state, "mtoc_tensor_t");
+    // Post-ANF, every tensor-typed arg here is a `Var` (or an
+    // already-rendered owned producer that ANF hoisted into one);
+    // emitExpr renders it as the bare struct cName, so `&<cName>`
+    // is a valid pointer to the caller's stack-allocated handle.
+    return `{.kind=MTOC_FA_TENSOR, .u.tensor=&${c}}`;
+  }
+  throw new Error(
+    `codegen internal: fprintf/sprintf arg with unsupported type ` +
+      `${typeToString(ty)} reached formatArgInit (should have been ` +
+      `rejected at lowering)`
+  );
+}
+
 export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   // Drop a numbl-style comment above each emitted statement so a
   // reader of the generated C can follow the original program shape
@@ -485,6 +535,37 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           state,
           level,
           `mtoc_assert_double_msg_text(${condC}, ${view});`
+        );
+      }
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
+    }
+
+    case "Fprintf": {
+      // Build a C99 compound-literal array of `mtoc_fprintf_arg_t`
+      // entries, one per value arg, then pass it to the runtime
+      // helper. The helper does the format walk (numbl-compatible
+      // engine — see `runtime/format_engine.h`) and writes to stdout.
+      // Activates the umbrella `mtoc_fprintf` snippet; deps pull in
+      // the engine, text view, tensor struct, and complex formatter.
+      useRuntimeByName(state, "mtoc_fprintf");
+      const fmtView = wrapTextView(state, s.fmt.ty, emitExpr(state, s.fmt, 0));
+      if (s.args.length === 0) {
+        // No value args — pass a NULL pointer and count 0 so the
+        // helper still walks the format string (which may contain
+        // escape sequences like `\n` we need to interpret).
+        pushStmt(
+          state,
+          level,
+          `mtoc_fprintf(stdout, ${fmtView}, 0, (const mtoc_fprintf_arg_t *)0);`
+        );
+      } else {
+        const initList = s.args.map(a => formatArgInit(state, a)).join(", ");
+        pushStmt(
+          state,
+          level,
+          `mtoc_fprintf(stdout, ${fmtView}, ${s.args.length}, ` +
+            `(mtoc_fprintf_arg_t[]){${initList}});`
         );
       }
       emitEarlyFrees(state, level, deadAfterStmt(state, s));

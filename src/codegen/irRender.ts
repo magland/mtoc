@@ -142,6 +142,13 @@ export function renderStmt(s: IRStmt): string | null {
       return s.msg === null
         ? `assert(${renderExpr(s.cond, 0)})`
         : `assert(${renderExpr(s.cond, 0)}, ${renderExpr(s.msg, 0)})`;
+    case "Fprintf": {
+      const parts = [
+        renderExpr(s.fmt, 0),
+        ...s.args.map(a => renderExpr(a, 0)),
+      ];
+      return `fprintf(${parts.join(", ")})`;
+    }
     case "If":
       return `if ${renderExpr(s.cond, 0)}`;
     case "While":

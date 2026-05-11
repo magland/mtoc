@@ -157,6 +157,7 @@ function touchStmt(
     case "Disp":
     case "Error":
     case "Assert":
+    case "Fprintf":
     case "MultiAssignCall":
     case "IndexStore":
     case "IndexSliceStore": {

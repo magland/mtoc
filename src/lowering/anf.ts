@@ -135,6 +135,12 @@ function anfStmt(
       const newMsg = s.msg === null ? null : anfExpr(s.msg, pre, av, c);
       return [...pre, { ...s, cond: newCond, msg: newMsg }];
     }
+    case "Fprintf": {
+      const pre: IRStmt[] = [];
+      const newFmt = anfExpr(s.fmt, pre, av, c);
+      const newArgs = s.args.map(a => anfExpr(a, pre, av, c));
+      return [...pre, { ...s, fmt: newFmt, args: newArgs }];
+    }
     case "If": {
       const pre: IRStmt[] = [];
       const newCond = anfExpr(s.cond, pre, av, c);

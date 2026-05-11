@@ -22,11 +22,15 @@ import type { Expr, Span } from "../parser/index.js";
 import { UnsupportedConstruct } from "../lowering/errors.js";
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
+  charArrayType,
   dimIsOne,
   isCharArray,
+  isCharScalar,
+  isHigherDim,
   isMultiElement,
   isNumeric,
   isScalar,
+  isScalarComplex,
   isScalarReal,
   isString,
   isText,
@@ -34,6 +38,7 @@ import {
   rowVecDouble,
   scalarComplex,
   scalarDouble,
+  STRING,
   typeToString,
   type DimInfo,
   type MType,
@@ -632,6 +637,65 @@ const BUILTINS: BuiltinSig[] = [
       }
       return { kind: "Error", arg, span };
     },
+  },
+
+  // `fprintf(fmt, args...)` / `fprintf(fid, fmt, args...)` — formatted
+  // output to stdout. Statement-only in v1; the value-returning form
+  // `n = fprintf(...)` is deferred (no test corpus consumes the byte
+  // count, and the expression-position shape would need a separate
+  // owned-call path). Lowering restricts the fid to a literal 1 or 2:
+  // numbl's runtime routes both to its single `output` stream, and
+  // mtoc matches by emitting both to stdout. Other fids surface as
+  // UnsupportedConstruct until file-I/O lands.
+  {
+    name: "fprintf",
+    category: "stmt",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => ({ kind: "Void" }),
+    emit: () => {
+      throw new Error(
+        "internal: BuiltinSig 'fprintf'.emit should not be called — " +
+          "fprintf lowers to IRStmt.Fprintf"
+      );
+    },
+    lowerStmt: (ctx, args, span) => fprintfLowerStmt(ctx, args, span),
+  },
+
+  // `sprintf(fmt, args...)` — return formatted text as an owned value.
+  // The return *type* tracks numbl: a char-typed format ('single-quoted')
+  // returns a char-array (`mtoc_char_tensor_t`); a string-typed format
+  // ("double-quoted") returns a string (`mtoc_string_t`). Both routes
+  // share the same C engine — `mtoc_sprintf_char` and `mtoc_sprintf_str`
+  // are thin wrappers in `sprintf.h`. The synthetic sig built by
+  // `sprintfLowerExpr` carries `producesOwnedDirectly: true` so the
+  // ANF pass hoists the call into its own Assign at non-top-level
+  // positions.
+  {
+    name: "sprintf",
+    category: "expr",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: null,
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "internal: BuiltinSig 'sprintf'.emit should not be called — " +
+          "sprintf is lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: (_ctx, args, span) => sprintfLowerExpr(args, span),
   },
 
   // ── 1-arg libm — real-only legacy ────────────────────────────────────
@@ -1982,6 +2046,267 @@ function randLowerExpr(
     ty: resultTy,
     span,
   };
+}
+
+// ── fprintf / sprintf helpers ──────────────────────────────────────────
+//
+// Format engine is shared with the C runtime (`runtime/format_engine.h`);
+// the lowering split is:
+//   - `fprintf` builds an `IRStmt.Fprintf` with the resolved format
+//     and value-args. The codegen renders one `mtoc_fprintf` call
+//     wrapping a C99 compound-literal `mtoc_fprintf_arg_t[]`.
+//   - `sprintf` synthesizes a fresh one-shot `BuiltinSig` (mirroring
+//     `variadicTensorCtor`'s pattern) whose `emit` renders the same
+//     compound-literal form against `mtoc_sprintf_str` /
+//     `mtoc_sprintf_char` (chosen on the format's static text type).
+//     `producesOwnedDirectly: true` so ANF hoists the call out of
+//     nested positions into its own Assign.
+
+/** Lower a `fprintf(...)` statement. Validates the format string and
+ *  value args, resolves the optional leading numeric `fid`, and
+ *  returns an `IRStmt.Fprintf`. */
+function fprintfLowerStmt(
+  ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<Expr>,
+  span: Span
+): IRStmt | null {
+  if (args.length === 0) {
+    throw new UnsupportedConstruct(
+      `'fprintf' requires at least 1 argument (format string)`,
+      span
+    );
+  }
+  const lowered = args.map(a => ctx.lowerExpr(a));
+  let fmtIdx = 0;
+  // numbl's `fprintf` resolves the optional fid as "first arg is
+  // numeric AND there are ≥ 2 args". mtoc keeps the same rule but
+  // restricts the fid to a literal 1 or 2 — both route to stdout.
+  if (lowered.length >= 2 && isScalarReal(lowered[0].ty)) {
+    const fid = lowered[0];
+    if (fid.kind !== "NumLit" || (fid.value !== 1 && fid.value !== 2)) {
+      throw new UnsupportedConstruct(
+        `'fprintf' with a file descriptor other than 1 or 2 is not yet ` +
+          `supported (file I/O is deferred); use fid=1 (stdout) or ` +
+          `fid=2 (numbl routes both to stdout)`,
+        args[0].span
+      );
+    }
+    fmtIdx = 1;
+  }
+  const fmt = lowered[fmtIdx];
+  validateFormatArg("fprintf", fmt, args[fmtIdx].span);
+  const valArgs = lowered.slice(fmtIdx + 1);
+  for (let i = 0; i < valArgs.length; i++) {
+    validateFprintfValueArg(
+      "fprintf",
+      valArgs[i],
+      i + 1,
+      args[fmtIdx + 1 + i].span
+    );
+  }
+  return { kind: "Fprintf", fmt, args: valArgs, span };
+}
+
+/** Lower a `sprintf(...)` expression. Validates the format string and
+ *  value args, then synthesizes a one-shot `BuiltinSig` whose `emit`
+ *  closure renders `mtoc_sprintf_str(...)` or `mtoc_sprintf_char(...)`
+ *  depending on the format arg's static text type. */
+function sprintfLowerExpr(
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  if (args.length === 0) {
+    throw new UnsupportedConstruct(
+      `'sprintf' requires at least 1 argument (format string)`,
+      span
+    );
+  }
+  const fmt = args[0];
+  validateFormatArg("sprintf", fmt, fmt.span);
+  const valArgs = args.slice(1);
+  for (let i = 0; i < valArgs.length; i++) {
+    validateFprintfValueArg("sprintf", valArgs[i], i + 1, valArgs[i].span);
+  }
+  // Format-arg type drives the result type. A scalar char format
+  // (`sprintf('hello')` with a 1-char literal) is still text and
+  // produces a char-array result (numbl's `RuntimeChar` doesn't
+  // distinguish length; mtoc's static type does, so we widen the
+  // scalar-char case here to char-array).
+  const fmtTy = fmt.ty;
+  const isStrFormat = isString(fmtTy);
+  const resultTy: MType = isStrFormat
+    ? STRING
+    : charArrayType({ kind: "notOne" });
+  const helperName = isStrFormat ? "mtoc_sprintf_str" : "mtoc_sprintf_char";
+  const params: ParamConstraint[] = args.map(
+    (): ParamConstraint => ({
+      shape: "any",
+      domain: null,
+      elem: null,
+      complexDomain: "real-or-complex",
+    })
+  );
+  const sig: BuiltinSig = {
+    name: "sprintf",
+    category: "expr",
+    params,
+    result: () => resultTy,
+    emit: (argStrs, argTys, state) => {
+      // The runtime helper umbrella registration; deps pull in the
+      // format engine, text view, string + char-tensor structs, and
+      // complex formatter.
+      state.useRuntime("mtoc_sprintf");
+      state.useRuntime("mtoc_text_view_t");
+      state.useRuntime("mtoc_format_engine");
+      const fmtTyHere = argTys[0];
+      const fmtView = isString(fmtTyHere)
+        ? `mtoc_text_from_string(${argStrs[0]})`
+        : `mtoc_text_from_char_tensor(${argStrs[0]})`;
+      const nVal = argTys.length - 1;
+      if (nVal === 0) {
+        return (
+          `${helperName}(${fmtView}, 0, ` + `(const mtoc_fprintf_arg_t *)0)`
+        );
+      }
+      const initList: string[] = [];
+      for (let i = 1; i < argTys.length; i++) {
+        initList.push(renderSprintfArgInit(state, argStrs[i], argTys[i]));
+      }
+      return (
+        `${helperName}(${fmtView}, ${nVal}, ` +
+        `(mtoc_fprintf_arg_t[]){${initList.join(", ")}})`
+      );
+    },
+    producesOwnedDirectly: true,
+  };
+  return {
+    kind: "Call",
+    name: "sprintf",
+    callee: { kind: "builtin", sig },
+    args: [...args],
+    ty: resultTy,
+    span,
+  };
+}
+
+/** Reject ill-typed / non-addressable format-string args. The format
+ *  must be text (string or char array) OR a scalar char (we route
+ *  the latter through a synthetic 1-byte text view at codegen time).
+ *  Owned-producing text expressions are allowed — ANF hoists them
+ *  to a Var before codegen — but other complex sub-expressions must
+ *  already be a Var or literal. */
+function validateFormatArg(name: string, fmt: IRExpr, span: Span): void {
+  if (!isText(fmt.ty) && !isCharScalar(fmt.ty)) {
+    throw new UnsupportedConstruct(
+      `'${name}' format must be a string or char value ` +
+        `(got ${typeToString(fmt.ty)})`,
+      span
+    );
+  }
+  const isLiteralKind =
+    (isString(fmt.ty) && fmt.kind === "StringLit") ||
+    ((isCharArray(fmt.ty) || isCharScalar(fmt.ty)) && fmt.kind === "CharLit");
+  if (fmt.kind !== "Var" && !isLiteralKind && !isOwnedProducer(fmt)) {
+    throw new UnsupportedConstruct(
+      `'${name}' format must be a literal or variable; ` +
+        `assign the value to a name first`,
+      span
+    );
+  }
+}
+
+/** Reject ill-typed value args to fprintf/sprintf. Accepts numeric
+ *  scalars (real / complex / char) and multi-element numeric tensors
+ *  (real or complex, including N-D), and text values (string or
+ *  char array) which route through %s as a single value. Owned
+ *  producers in arg position must be ANF-hoistable. */
+function validateFprintfValueArg(
+  name: string,
+  e: IRExpr,
+  position: number,
+  span: Span
+): void {
+  const ty = e.ty;
+  const okText = isText(ty);
+  const okNumeric =
+    isNumeric(ty) &&
+    (isScalarReal(ty) ||
+      isScalarComplex(ty) ||
+      isCharScalar(ty) ||
+      (isMultiElement(ty) && ty.elem === "double"));
+  if (!okText && !okNumeric) {
+    throw new UnsupportedConstruct(
+      `'${name}' argument ${position} has unsupported type ${typeToString(ty)}`,
+      span
+    );
+  }
+  if (isHigherDim(ty)) {
+    // N-D tensors are supported by the engine (it walks .ndim/.dims
+    // for the flatten count); the lowering accepts them too.
+    void position;
+  }
+  // Owned producers (TensorLit, IndexSlice, user-call returning an
+  // owned value, string concat) at non-top-level positions are
+  // accepted here because the post-lowering ANF pass hoists each
+  // one into its own `_mtoc_anf_<N>` Assign so codegen ultimately
+  // sees a `Var`. Other multi-element shapes (Binary / Unary /
+  // elementwise builtin Call on tensors) without a name to be
+  // released through still reject — mirrors the `disp` rule.
+  if (
+    isOwned(ty) &&
+    e.kind !== "Var" &&
+    e.kind !== "StringLit" &&
+    e.kind !== "CharLit" &&
+    !isOwnedProducer(e)
+  ) {
+    throw new UnsupportedConstruct(
+      `'${name}' argument ${position} of type ${typeToString(ty)} must be ` +
+        `a literal or variable; assign the value to a name first`,
+      span
+    );
+  }
+}
+
+/** Render a single `sprintf` value arg as a `mtoc_fprintf_arg_t`
+ *  designated-initializer expression. Same dispatch as the
+ *  `Fprintf` codegen arm — kept in this file so the sprintf one-shot
+ *  sig's `emit` closure doesn't import from codegen. */
+function renderSprintfArgInit(
+  state: BuiltinEmitState,
+  c: string,
+  ty: MType
+): string {
+  state.useRuntime("mtoc_format_engine");
+  if (isText(ty)) {
+    state.useRuntime("mtoc_text_view_t");
+    const view = isString(ty)
+      ? `mtoc_text_from_string(${c})`
+      : `mtoc_text_from_char_tensor(${c})`;
+    return `{.kind=MTOC_FA_TEXT, .u.t=${view}}`;
+  }
+  if (isScalarComplex(ty)) {
+    return `{.kind=MTOC_FA_COMPLEX, .u.z=${c}}`;
+  }
+  if (isCharScalar(ty)) {
+    return `{.kind=MTOC_FA_DOUBLE, .u.d=(double)(unsigned char)(${c})}`;
+  }
+  if (isScalarReal(ty)) {
+    return `{.kind=MTOC_FA_DOUBLE, .u.d=${c}}`;
+  }
+  if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
+    return `{.kind=MTOC_FA_TENSOR, .u.tensor=&${c}}`;
+  }
+  throw new Error(
+    `codegen internal: sprintf arg with unsupported type ${typeToString(ty)} ` +
+      `reached renderSprintfArgInit (should have been rejected at lowering)`
+  );
+}
+
+/** True when `t` is heap-owned (tensor / string / char tensor) — local
+ *  shim to avoid pulling another import. Mirrors `isOwned` from
+ *  types.ts; kept inline because the lookup is one place. */
+function isOwned(t: MType): boolean {
+  return isMultiElement(t) || isString(t);
 }
 
 const BY_NAME = new Map<string, BuiltinSig>(BUILTINS.map(b => [b.name, b]));
