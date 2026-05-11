@@ -170,6 +170,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_clog10", loadSnippet("clog10.h")],
   ["mtoc_clog1p", loadSnippet("clog1p.h")],
   ["mtoc_cexpm1", loadSnippet("cexpm1.h")],
+  ["mtoc_cdiv", loadSnippet("cdiv.h")],
   ["mtoc_sign_complex", loadSnippet("sign_complex.h")],
   ["mtoc_min_complex", loadSnippet("min_complex.h")],
   ["mtoc_max_complex", loadSnippet("max_complex.h")],

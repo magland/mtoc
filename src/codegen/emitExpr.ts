@@ -228,6 +228,17 @@ export function emitExpr(
       if ((lc || rc) && CMP_OR_LOGICAL.has(e.op)) {
         return emitComplexCmpOrLogical(state, e, parentPrec);
       }
+      // Complex division: C99's bare `/` on `double _Complex` produces
+      // NaN+NaN*I on divide-by-zero, but numbl's interpreter carves
+      // out signed-Inf parts via `complexDivide` (see cdiv.h). Route
+      // every complex-involving Div / ElemDiv through the helper so
+      // the divide-by-zero shape matches numbl byte-for-byte.
+      if ((lc || rc) && (e.op === "Div" || e.op === "ElemDiv")) {
+        useRuntimeByName(state, "mtoc_cdiv");
+        const left = emitExpr(state, e.left, 0);
+        const right = emitExpr(state, e.right, 0);
+        return `mtoc_cdiv(${left}, ${right})`;
+      }
       const cOp = BIN_OP_C[e.op];
       if (cOp) {
         const p = precedence(e.op);

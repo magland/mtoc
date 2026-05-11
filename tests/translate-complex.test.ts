@@ -41,4 +41,26 @@ describe("complex scalar codegen", () => {
     expect(c).toContain("z = (2.5 * I);");
     expect(c).toContain("mtoc_disp_complex(z);");
   });
+
+  it("routes complex `/` through mtoc_cdiv (not C99's bare /)", () => {
+    // C99's `/` on `double _Complex` produces NaN+NaN*I on divide-by-
+    // zero; numbl's `complexDivide` carves out signed-Inf parts. The
+    // helper preserves that semantic, so any complex-involving Div /
+    // ElemDiv must route through it.
+    const c = translate("a = 1 + 2i;\ndisp(a / 0);\n");
+    expect(c).toContain("mtoc_cdiv(a, 0.0)");
+    // And the helper body itself should be pulled into the prelude.
+    expect(c).toContain("static double _Complex mtoc_cdiv(");
+  });
+
+  it("uses mtoc_cdiv for elementwise `./` with a complex operand", () => {
+    const c = translate("a = 1 + 2i;\ndisp(a ./ 2);\n");
+    expect(c).toContain("mtoc_cdiv(a, 2.0)");
+  });
+
+  it("leaves all-real `/` alone (no mtoc_cdiv activation)", () => {
+    const c = translate("x = 5;\ny = 2;\ndisp(x / y);\n");
+    expect(c).not.toContain("mtoc_cdiv");
+    expect(c).toMatch(/x \/ y/);
+  });
 });
