@@ -5,7 +5,7 @@
 
 import { readFileSync, readdirSync, statSync } from "fs";
 import { join } from "path";
-import type { WorkspaceFile } from "./numbl-core/workspace/types.js";
+import { WorkspaceFile } from "../workspace/workspace";
 
 export function scanMFiles(
   dirPath: string,
