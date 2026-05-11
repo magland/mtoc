@@ -123,9 +123,9 @@ export function ExecutionSettingsDialog({
               color="text.secondary"
               sx={{ display: "block", mt: 1 }}
             >
-              Run from the mtoc repo root. The passkey is paired with this
-              browser session — if you regenerate it, restart the server with
-              the new key.
+              Run from the mtoc repo root. The passkey is stored in this browser
+              and persists until you clear site data or regenerate it — if you
+              regenerate, restart the server with the new key.
             </Typography>
           </Box>
 

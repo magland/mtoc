@@ -35,23 +35,22 @@ export function setRemoteExecutionEnabled(enabled: boolean): void {
   localStorage.setItem(ENABLED_KEY, String(enabled));
 }
 
-/** A passkey persists across page reloads in the same tab/origin (so
- *  the user doesn't have to re-paste the `mtoc serve` command on every
- *  refresh) but is regenerated when the user explicitly does so via the
- *  settings dialog. Stored in sessionStorage so it doesn't outlive the
- *  browser session. */
+/** The passkey persists in localStorage so the user doesn't have to
+ *  re-paste the `mtoc serve` command after closing the browser; it sticks
+ *  around until the browser's site data is cleared or until the user
+ *  explicitly regenerates it via the settings dialog. */
 export function getPasskey(): string {
-  let key = sessionStorage.getItem(PASSKEY_KEY);
+  let key = localStorage.getItem(PASSKEY_KEY);
   if (!key) {
     key = generatePasskey();
-    sessionStorage.setItem(PASSKEY_KEY, key);
+    localStorage.setItem(PASSKEY_KEY, key);
   }
   return key;
 }
 
 export function regeneratePasskey(): string {
   const key = generatePasskey();
-  sessionStorage.setItem(PASSKEY_KEY, key);
+  localStorage.setItem(PASSKEY_KEY, key);
   return key;
 }
 

@@ -116,10 +116,11 @@ client-side (the Stop button) closes the SSE stream, which the server
 detects and uses to SIGTERM the child process.
 
 The passkey is generated in the browser by `src/utils/remoteExecution.ts` and
-stored in `sessionStorage` (so it survives reloads but not browser restarts).
-The settings dialog shows the user the full `mtoc serve --passkey …` command
-to paste into a terminal. `regeneratePasskey` cycles it; the server has to be
-restarted with the new key for the IDE to reconnect.
+stored in `localStorage` (so it sticks around until the user clears the
+browser's site data or hits "Regenerate passkey"). The settings dialog shows
+the user the full `mtoc serve --passkey …` command to paste into a terminal.
+`regeneratePasskey` cycles it; the server has to be restarted with the new
+key for the IDE to reconnect.
 
 `src/hooks/useRemoteExecution.ts` is the React-side state machine: holds
 `{status, connection, lines}`, exposes `run(c)`, `stop()`, and a
