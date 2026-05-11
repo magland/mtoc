@@ -684,20 +684,26 @@ function arithSign(op: ArithKind, a: Sign, b: Sign): Sign {
   }
 }
 
-/** Pointwise dim compatibility for tensor⊙tensor arithmetic. The only
- *  categorical incompatibility under the coarse lattice is `one` vs
- *  `notOne` — provably-1 against provably-not-1 in the same axis;
- *  that's the rowVec-vs-colVec broadcast case mtoc doesn't support
- *  yet. Anything involving `unknown` admits a runtime match (the
- *  type system can't disprove it). Same-kind pairs are compatible. */
+/** Per-axis compatibility for tensor⊙tensor arithmetic. mtoc accepts
+ *  elementwise ops only when both operands share the same shape at
+ *  runtime — no implicit expansion. Statically that rules out any
+ *  axis pair where one side is provably 1 and the other is provably
+ *  larger (rowVec-vs-colVec) *or* unknown (where the unknown side
+ *  might be larger and trigger broadcasting). Same-category pairs
+ *  and (notOne, unknown) survive — the latter could still mismatch
+ *  at runtime, where `mtoc_check_shape` traps it. */
 function dimAccept(a: DimInfo, b: DimInfo): boolean {
-  if (a.kind === "one" && b.kind === "notOne") return false;
-  if (a.kind === "notOne" && b.kind === "one") return false;
+  if (a.kind === "one" && b.kind !== "one") return false;
+  if (b.kind === "one" && a.kind !== "one") return false;
   return true;
 }
 
-/** Most-refined of two compatible dims. Assumes `dimAccept(a,b)`. */
-function dimMeet(a: DimInfo, b: DimInfo): DimInfo {
+/** Result dim under the same-shape-required rule. Assumes
+ *  `dimAccept(a, b)`, so the (one, ¬one) pair never reaches here.
+ *  For surviving pairs the result is whichever side is more
+ *  refined: a `notOne` wins over `unknown` because if both runtime
+ *  sizes agree, the size is the `notOne` side's. */
+function dimJoin(a: DimInfo, b: DimInfo): DimInfo {
   if (a.kind === b.kind) return a;
   if (a.kind === "unknown") return b;
   if (b.kind === "unknown") return a;
@@ -705,11 +711,12 @@ function dimMeet(a: DimInfo, b: DimInfo): DimInfo {
   return { kind: "unknown" };
 }
 
-/** Broadcast two shape arrays. Pads the shorter with `{kind: "one"}`
- *  to `max(a.length, b.length, 2)`, then takes `dimMeet` element-wise.
- *  Returns `null` when any axis fails `dimAccept` (categorical
- *  mismatch — the rowVec-vs-colVec case the coarse lattice can prove
- *  incompatible).
+/** Combine two shape arrays under the same-shape-required elementwise
+ *  rule. Pads the shorter with `{kind: "one"}` to
+ *  `max(a.length, b.length, 2)`, then joins per-axis. Returns `null`
+ *  when any axis fails `dimAccept` — the static "would-need-implicit-
+ *  expansion" cases. Same-shape-but-different-sizes still slips
+ *  through (runtime data); `mtoc_check_shape` covers it at runtime.
  *
  *  Result is unnormalized — caller passes through `numericTypeND` /
  *  `normalizeDims` to strip trailing singletons. */
@@ -723,7 +730,7 @@ export function broadcastShape(
     const ai = a[i] ?? DIM_ONE;
     const bi = b[i] ?? DIM_ONE;
     if (!dimAccept(ai, bi)) return null;
-    result.push(dimMeet(ai, bi));
+    result.push(dimJoin(ai, bi));
   }
   return result;
 }

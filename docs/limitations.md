@@ -67,6 +67,16 @@ workaround or a roadmap note.
   `y = bump(helper(x), 7)` all compile cleanly. Auto-materialization of
   _non_-owned intermediate tensors (e.g. Binary on two tensors as a
   disp arg) is still a known TODO.
+- **No implicit expansion between tensors.** Tensor⊙tensor elementwise
+  ops (`+ - .* ./ .^`, comparisons) require operands with the same
+  runtime shape — colVec + rowVec, matrix + colVec, and other
+  outer-product / broadcast patterns are rejected at lowering with an
+  "incompatible result type" diagnostic. The rejection fires whenever
+  one operand has a statically-`one` axis where the other doesn't,
+  even if the other axis is `unknown`. Scalar⊙tensor broadcast is
+  unaffected (different code path); same-shape mismatches the lattice
+  can't see at compile time still trap at runtime via
+  `mtoc_check_shape`.
 - **No matrix multiply / divide / power yet.** `*`/`/`/`^` between two
   tensors is explicitly rejected at lowering with a message pointing the user
   at `.* ./ .^` for elementwise. Matrix ops will need a separate codegen path
