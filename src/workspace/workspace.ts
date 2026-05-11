@@ -19,7 +19,7 @@
  */
 
 import type { AbstractSyntaxTree, Span, Stmt } from "../parser/index.js";
-import { allBuiltinNames, getBuiltin } from "./builtins.js";
+import { allBuiltinNames } from "./builtins.js";
 import { LoweringContext } from "../numbl-core/lowering/loweringContext.js";
 import { resolveFunction } from "../numbl-core/functionResolve.js";
 import type { CallSite } from "../numbl-core/runtime/runtimeHelpers.js";
@@ -70,6 +70,11 @@ export class Workspace {
    *  when the resolved target is a local function in the main file. */
   private mainAstStmts: Stmt[] = [];
 
+  /** Set by `finalize()` so a subsequent `resolve()` can finalize-on-demand
+   *  if the caller forgot to do it explicitly. Prevents a silent
+   *  empty-index failure. */
+  private finalized = false;
+
   constructor(mainFile: string, searchPaths: ReadonlyArray<string> = []) {
     this.mainFile = mainFile;
     this.searchPaths = searchPaths;
@@ -91,14 +96,19 @@ export class Workspace {
 
   /** Build the function index. Call once after every file has been
    *  added and the main file's top-level function definitions have
-   *  been registered via `registerLocalFunction`. */
+   *  been registered via `registerLocalFunction`. Idempotent — a
+   *  second call is a no-op. `resolve()` calls this lazily so a
+   *  caller that forgets the explicit step still gets a populated
+   *  index instead of an empty one. */
   finalize(): void {
+    if (this.finalized) return;
     // Build the workspace-file list (everything except the main file).
     const wsFiles = [...this.files.values()]
       .filter(f => f.name !== this.mainFile)
       .map(f => ({ name: f.name, source: f.source }));
     this.ctx.registerWorkspaceFiles(wsFiles);
     this.ctx.buildFunctionIndex();
+    this.finalized = true;
   }
 
   /** Register a top-level function definition from the main file. Mirrors
@@ -113,6 +123,7 @@ export class Workspace {
    *  its own narrow `ResolvedTarget`. Unsupported kinds raise
    *  `UnsupportedConstruct` at the call site. */
   resolve(name: string, callSite: CallSite, span: Span): ResolvedTarget | null {
+    this.finalize();
     const target = resolveFunction(name, [], callSite, this.ctx.functionIndex);
     if (!target) return null;
     switch (target.kind) {
@@ -245,5 +256,3 @@ export class Workspace {
     return null;
   }
 }
-
-void getBuiltin;
