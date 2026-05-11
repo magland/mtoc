@@ -15,6 +15,7 @@ arithmetic/test_complex_div_zero.m
 arithmetic/test_negative_base_power.m
 arrays/end_range_debug_.m
 arrays/newline_row_separator.m
+arrays/slicing.m
 builtins/test_angle_nan.m
 builtins/test_block_comment_syntax.m
 builtins/test_realmin.m
@@ -24,6 +25,8 @@ control_flow/if_else.m
 control_flow/test_for_loop_var_value.m
 control_flow/while_loops.m
 functions/prototype_name_functions.m
+indexing/test_loop_indexed_assign.m
+indexing/test_loop_slice_read.m
 jit/jit_length_empty_tensor.m
 math/complex_log2_log10.m
 math/rounding.m
