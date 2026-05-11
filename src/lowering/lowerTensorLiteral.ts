@@ -129,6 +129,17 @@ export function lowerTensorLiteral(
     }
     elements.push(loweredRow);
   }
+  // A 1×1 tensor literal `[x]` collapses to the cell's IR. The static
+  // type is already scalar (both dims are `one`), so keeping a
+  // TensorLit IR node would create an owned-producer node whose result
+  // is scalar — the ANF pass would still hoist it, and the scalar-LHS
+  // assignment that consumes it has no `mtoc_tensor_assign` lhs to
+  // accept the tensor handle. Folding here keeps the rest of the
+  // pipeline consistent: TensorLit always means a real multi-element
+  // tensor needing heap storage.
+  if (numRows === 1 && numCols === 1) {
+    return { ...elements[0][0], span: e.span };
+  }
   // The literal's coarse dim shape: each axis is `one` if the literal
   // has exactly that many cells in that axis, else `notOne`. The
   // specific size is carried by the IR node's `elements` array;
