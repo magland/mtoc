@@ -101,9 +101,12 @@ describe("translate scalar example", () => {
     expect(dispStmts.length).toBe(1);
   });
 
-  it("rejects log(x) when x is not provably positive", () => {
-    expect(() => translate("x = 0;\ndisp(log(x));\n")).toThrow(
-      /log requires .* to be statically positive/
+  it("rejects log(x) when x is not provably nonneg", () => {
+    // A function arg has `unknown` sign; log(x) refuses to translate
+    // without an `abs(...)` wrapper. (Zero is accepted — numbl defines
+    // log(0) = -Inf, matching C's log(0.0).)
+    expect(() => translate("disp(log(-1));\n")).toThrow(
+      /log requires .* to be statically nonnegative/
     );
   });
 

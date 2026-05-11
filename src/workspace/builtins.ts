@@ -731,7 +731,7 @@ const BUILTINS: BuiltinSig[] = [
     complexCName: "csqrt",
   }),
   libm("exp", 1, "exp", "positive", [], { complexCName: "cexp" }),
-  libm("log", 1, "log", "unknown", ["positive"], { complexCName: "clog" }),
+  libm("log", 1, "log", "unknown", ["nonnegative"], { complexCName: "clog" }),
   libm("sin", 1, "sin", "unknown", [], { complexCName: "csin" }),
   libm("cos", 1, "cos", "unknown", [], { complexCName: "ccos" }),
   libm("tan", 1, "tan", "unknown", [], { complexCName: "ctan" }),
@@ -754,11 +754,11 @@ const BUILTINS: BuiltinSig[] = [
   // express them via `clog(z) / log(2)` etc. so complex `log2(z)` /
   // `log10(z)` / `log1p(z)` / `expm1(z)` work in mtoc identically to
   // numbl. Real inputs go straight to libm.
-  runtime("log2", 1, "log2", "unknown", ["positive"], {
+  runtime("log2", 1, "log2", "unknown", ["nonnegative"], {
     complexHelperName: "mtoc_clog2",
     realIsLibm: true,
   }),
-  runtime("log10", 1, "log10", "unknown", ["positive"], {
+  runtime("log10", 1, "log10", "unknown", ["nonnegative"], {
     complexHelperName: "mtoc_clog10",
     realIsLibm: true,
   }),
@@ -766,7 +766,9 @@ const BUILTINS: BuiltinSig[] = [
     complexHelperName: "mtoc_cexpm1",
     realIsLibm: true,
   }),
-  runtime("log1p", 1, "log1p", "unknown", ["positive"], {
+  // log1p's true domain is x >= -1, but the sign lattice can't represent
+  // bounded intervals — `nonnegative` is the closest expressible bound.
+  runtime("log1p", 1, "log1p", "unknown", ["nonnegative"], {
     complexHelperName: "mtoc_clog1p",
     realIsLibm: true,
   }),

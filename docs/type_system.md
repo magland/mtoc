@@ -145,9 +145,10 @@ Sign = positive | nonnegative | negative | nonpositive | zero | nonzero | unknow
 ```
 
 Tracked on every `NumericType`. Used by builtins to refuse translation when an
-input could land outside the function's domain — `sqrt(x)` requires `x` to be
-statically `nonnegative`; `log(x)` requires `positive`. The canonical pattern
-when a user has only `unknown` info is `sqrt(abs(x))`.
+input could land outside the function's domain — `sqrt(x)` and `log(x)` both
+require `x` to be statically `nonnegative` (numbl defines `log(0) = -Inf`, so
+the zero-input case is well-formed and matches C's `log(0.0)`). The canonical
+pattern when a user has only `unknown` info is `sqrt(abs(x))`.
 
 The sign lattice has its own helpers (`signNegate`, `signAdd`, `signSub`,
 `signMul`, `signDiv`, `joinSign`, `signFromValue`). The rules are conservative
@@ -159,6 +160,11 @@ A handful of _structural_ refinements live alongside the lattice:
 - `x * x` (same variable) is detected as `nonneg` regardless of `x`'s sign.
 - `for k = 1:n` ⇒ `k` is `positive` inside the body, `nonneg` after the loop
   (the latter accounts for the "loop never ran" path).
+- `x .^ n` / `x ^ n` infer a refined sign from the base and a foldable
+  exponent: positive base stays `positive`; constant positive even-integer
+  exponent gives `nonneg` (or `positive` when the base is known nonzero);
+  positive odd-integer exponent propagates the base sign; nonneg base with
+  any non-negative constant exponent stays `nonneg`.
 
 ## Operations
 

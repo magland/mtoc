@@ -32,6 +32,7 @@ import {
   STRING,
   type MType,
   type NumericType,
+  type Sign,
   typeToString,
 } from "./types.js";
 import type { Lowerer } from "./lower.js";
@@ -337,6 +338,41 @@ function tryConstExprValue(e: IRExpr): number | null {
   return null;
 }
 
+/** Infer the sign of `base ^ exp` (real path only — complex lift is
+ *  handled separately). Rules:
+ *    - base strictly positive ⇒ result strictly positive (any real exp).
+ *    - constant exponent that's a positive even integer ⇒ result is
+ *      nonneg; further positive if the base avoids zero.
+ *    - constant exponent that's a positive odd integer ⇒ result sign
+ *      matches the base sign (incl. zero / nonzero).
+ *    - nonneg base + constant non-negative integer exponent ⇒ nonneg.
+ *  Otherwise "unknown". The caller is responsible for clamping to
+ *  "unknown" when the result is complex. */
+function inferPowSign(baseSign: Sign, expVal: number | null): Sign {
+  if (baseSign === "positive") return "positive";
+  if (expVal !== null && Number.isFinite(expVal)) {
+    if (Number.isInteger(expVal)) {
+      if (expVal === 0) return "positive"; // x^0 = 1
+      if (expVal > 0) {
+        const isEven = expVal % 2 === 0;
+        if (isEven) {
+          if (baseSign === "negative" || baseSign === "nonzero")
+            return "positive";
+          return "nonnegative";
+        }
+        // positive odd integer: sign matches base
+        return baseSign;
+      }
+    }
+    // Non-integer constant exponent: by this point a negative base would
+    // have lifted to complex above, so any real-path base is in
+    // {positive, nonnegative, zero, nonzero, unknown}. Only nonneg base
+    // gives a useful refinement.
+    if (expVal >= 0 && baseSign === "nonnegative") return "nonnegative";
+  }
+  return "unknown";
+}
+
 /** Power ops:
  *    - `^` is scalar-real; lifts to complex when the base is
  *      statically negative AND the exponent folds to a non-integer
@@ -399,6 +435,8 @@ function lowerPow(
       };
     }
   }
+  const expVal = tryConstExprValue(right);
+  const resultSign = inferPowSign(leftSign, expVal);
   if (e.op === "Pow") {
     if (!isScalar(left.ty) || !isScalar(right.ty)) {
       throw new UnsupportedConstruct(
@@ -412,7 +450,7 @@ function lowerPow(
       op: e.op,
       left,
       right,
-      ty: scalarDouble("unknown"),
+      ty: scalarDouble(resultSign),
       span: e.span,
     };
   }
@@ -423,7 +461,7 @@ function lowerPow(
       op: e.op,
       left,
       right,
-      ty: scalarDouble("unknown"),
+      ty: scalarDouble(resultSign),
       span: e.span,
     };
   }
@@ -435,7 +473,7 @@ function lowerPow(
       e.span
     );
   }
-  const resultTy: NumericType = numericTypeND(shape.dims, false, "unknown");
+  const resultTy: NumericType = numericTypeND(shape.dims, false, resultSign);
   return {
     kind: "Binary",
     op: e.op,
