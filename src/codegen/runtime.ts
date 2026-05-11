@@ -180,6 +180,12 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   // even when they emit `mtoc_rng_random()` / `mtoc_rng_seed(...)`
   // / `mtoc_rng_randn()` in the rendered C.
   ["mtoc_rng", loadSnippet("rng.h")],
+  // `tic` / `toc` share a single snippet (one static for the last-tic
+  // timestamp, plus the value / handle / print variants). Call sites
+  // activate via `state.useRuntime("mtoc_tic")` regardless of which
+  // entry they emit (mtoc_tic / mtoc_toc / mtoc_toc_h /
+  // mtoc_toc_print / mtoc_toc_print_h) — the snippet defines them all.
+  ["mtoc_tic", loadSnippet("tic.h")],
   [
     "mtoc_rand_nd",
     loadSnippet("tensor_rand.h", [

@@ -154,6 +154,21 @@ The lowerer and codegen consume it generically.
 These hooks are how non-uniform builtin behavior stays declarative
 in the registry instead of accumulating special cases in `lower.ts`.
 
+A builtin can register BOTH hooks to give the statement form
+different codegen from the expression form. `toc` does this: at
+expression position (`t = toc;`) the `lowerExpr` hook synthesizes a
+one-shot sig that emits `mtoc_toc()` (value-returning, silent); at
+statement position (`toc;`) the `lowerStmt` hook builds an
+`ExprStmt(Call(...))` over a `Void`-returning sig that emits
+`mtoc_toc_print()` (matches numbl's "print on bare statement" rule).
+
+`tic` / `toc` also exercise the bare-Ident dispatch in `lower.ts`:
+the parser produces an `Ident` for `tic` / `toc` without parens, and
+the lowerer's `case "Ident"` arm forwards to `lowerBuiltinCall(name,
+[], span)` when the name isn't a variable or constant. This is how
+numbl treats unresolved Idents; mtoc matches so `t = tic;`, `toc;`,
+and `e = toc` all compile the same as their parens form.
+
 ## Text-aware builtins (string ↔ char-array interchange)
 
 numbl treats `string` (double-quoted) and `char` arrays (single-quoted)

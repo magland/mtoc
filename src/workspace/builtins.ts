@@ -1060,7 +1060,193 @@ const BUILTINS: BuiltinSig[] = [
         span
       ),
   },
+
+  // ── tic / toc ─────────────────────────────────────────────────────────
+  //
+  // numbl semantics (numbl/src/numbl-core/interpreter/builtins/time-system.ts
+  // and runtime/specialBuiltins.ts):
+  //   - `tic` records `performance.now()` into a static and returns the
+  //     same value (seconds since the monotonic origin). Statement form
+  //     discards the return.
+  //   - `toc` (0 args) returns elapsed since the last tic. When invoked
+  //     at statement position (nargout=0) it ALSO prints
+  //     `Elapsed time is X.XXXXXX seconds.` — at expression position
+  //     (`t = toc;` / `disp(toc)`) it just returns the value silently.
+  //   - `toc(h)` uses the handle returned by `tic` as the start; same
+  //     print-on-statement-position rule applies.
+  //
+  // mtoc mirrors this by registering two helper variants per form
+  // (value-returning and print-side-effect) and routing the statement
+  // case through a `lowerStmt` hook that swaps the value-returning
+  // emit for the print one. The two forms share `mtoc_tic` (the
+  // runtime snippet defines all entry points together).
+  {
+    name: "tic",
+    category: "expr",
+    params: [],
+    result: () => scalarDouble("nonnegative"),
+    emit: (_args, _argTys, state) => {
+      state.useRuntime("mtoc_tic");
+      return `mtoc_tic()`;
+    },
+  },
+  {
+    name: "toc",
+    category: "expr",
+    params: [],
+    result: () => scalarDouble("nonnegative"),
+    emit: () => {
+      throw new Error(
+        "codegen internal: toc must be lowered through its lowerExpr / lowerStmt hook"
+      );
+    },
+    lowerExpr: (_ctx, args, span) => tocLowerExpr(args, span),
+    lowerStmt: (ctx, args, span) => tocLowerStmt(ctx, args, span),
+  },
 ];
+
+/** Expression-position lowering for `toc` / `toc(h)`. Synthesizes a
+ *  one-shot `BuiltinSig` whose emit renders `mtoc_toc()` (no-arg) or
+ *  `mtoc_toc_h(h)` (handle form). Both return a real-scalar elapsed
+ *  in seconds without printing. */
+function tocLowerExpr(args: ReadonlyArray<IRExpr>, span: Span): IRExpr | null {
+  if (args.length > 1) {
+    throw new UnsupportedConstruct(
+      `toc takes 0 or 1 arguments (got ${args.length})`,
+      span
+    );
+  }
+  if (args.length === 1) {
+    const h = args[0];
+    if (!isScalarReal(h.ty)) {
+      throw new UnsupportedConstruct(
+        `toc(handle) requires a real scalar (got ${typeToString(h.ty)})`,
+        span
+      );
+    }
+    const sig: BuiltinSig = {
+      name: "toc",
+      category: "expr",
+      params: [
+        {
+          shape: "scalar",
+          domain: null,
+          elem: "double",
+          complexDomain: "real-only",
+        },
+      ],
+      result: () => scalarDouble("nonnegative"),
+      emit: (argStrs, _argTys, state) => {
+        state.useRuntime("mtoc_tic");
+        return `mtoc_toc_h(${argStrs[0]})`;
+      },
+    };
+    return {
+      kind: "Call",
+      name: "toc",
+      callee: { kind: "builtin", sig },
+      args: [h],
+      ty: scalarDouble("nonnegative"),
+      span,
+    };
+  }
+  const sig: BuiltinSig = {
+    name: "toc",
+    category: "expr",
+    params: [],
+    result: () => scalarDouble("nonnegative"),
+    emit: (_argStrs, _argTys, state) => {
+      state.useRuntime("mtoc_tic");
+      return `mtoc_toc()`;
+    },
+  };
+  return {
+    kind: "Call",
+    name: "toc",
+    callee: { kind: "builtin", sig },
+    args: [],
+    ty: scalarDouble("nonnegative"),
+    span,
+  };
+}
+
+/** Statement-position lowering for `toc;` / `toc(h);`. numbl prints
+ *  `Elapsed time is X.XXXXXX seconds.` when toc is invoked at stmt
+ *  position; mtoc routes the same shape through a void-returning
+ *  runtime helper (`mtoc_toc_print` / `mtoc_toc_print_h`) so codegen
+ *  emits a clean `(void)(mtoc_toc_print(...));` at the call site. */
+function tocLowerStmt(
+  ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<Expr>,
+  span: Span
+): IRStmt | null {
+  if (args.length > 1) {
+    throw new UnsupportedConstruct(
+      `toc takes 0 or 1 arguments (got ${args.length})`,
+      span
+    );
+  }
+  if (args.length === 1) {
+    const h = ctx.lowerExpr(args[0]);
+    if (!isScalarReal(h.ty)) {
+      throw new UnsupportedConstruct(
+        `toc(handle) requires a real scalar (got ${typeToString(h.ty)})`,
+        args[0].span
+      );
+    }
+    const sig: BuiltinSig = {
+      name: "toc",
+      category: "expr",
+      params: [
+        {
+          shape: "scalar",
+          domain: null,
+          elem: "double",
+          complexDomain: "real-only",
+        },
+      ],
+      result: () => ({ kind: "Void" }),
+      emit: (argStrs, _argTys, state) => {
+        state.useRuntime("mtoc_tic");
+        return `mtoc_toc_print_h(${argStrs[0]})`;
+      },
+    };
+    return {
+      kind: "ExprStmt",
+      expr: {
+        kind: "Call",
+        name: "toc",
+        callee: { kind: "builtin", sig },
+        args: [h],
+        ty: { kind: "Void" },
+        span,
+      },
+      span,
+    };
+  }
+  const sig: BuiltinSig = {
+    name: "toc",
+    category: "expr",
+    params: [],
+    result: () => ({ kind: "Void" }),
+    emit: (_argStrs, _argTys, state) => {
+      state.useRuntime("mtoc_tic");
+      return `mtoc_toc_print()`;
+    },
+  };
+  return {
+    kind: "ExprStmt",
+    expr: {
+      kind: "Call",
+      name: "toc",
+      callee: { kind: "builtin", sig },
+      args: [],
+      ty: { kind: "Void" },
+      span,
+    },
+    span,
+  };
+}
 
 function lengthLikeLowerExpr(name: string): BuiltinLowerExpr {
   return (_ctx, args, span) => {

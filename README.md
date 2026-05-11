@@ -107,6 +107,12 @@ The subset is growing iteratively. Roughly:
 - Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`,
   `assert(cond, msg)` (msg may be a string or char-array literal /
   variable; tensor-condition form is deferred)
+- Timing: `tic` / `toc` — `tic` records a monotonic timestamp and
+  returns it; `toc` returns the elapsed seconds since the last `tic`
+  (or since the handle in `toc(h)`). The bare-statement form `toc;` /
+  `toc(h);` also prints `Elapsed time is X.XXXXXX seconds.` to match
+  numbl. Bare-identifier syntax (`tic`, `toc` without parens) works at
+  both statement and expression position
 - User-defined functions with 0, 1, or N≥2 outputs. Each output can
   be a scalar (real / complex) or an owned kind (real / complex
   double tensor, char tensor, scalar string). One specialization per

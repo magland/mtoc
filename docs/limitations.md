@@ -207,6 +207,15 @@ workaround or a roadmap note.
   - **Most char builtins**: `upper`, `lower`, `num2str`, etc.
 - **No cell arrays, structs, classes.**
 - **No `fprintf`** beyond the `disp` runtime helper.
+- **`tic` / `toc` clock origin differs from numbl.** mtoc reads
+  `clock_gettime(CLOCK_MONOTONIC)`; numbl reads `performance.now()`.
+  Both are monotonic, so _elapsed_ durations agree, but the absolute
+  value returned by `tic` (and the `toc(h)` handle) differs between
+  runtimes — numbl's origin is process start, mtoc's is system boot.
+  Cross-runner test scripts should not print the raw `tic` value or
+  the elapsed duration; print derived predicates (`disp(e >= 0)`)
+  instead. The bare-statement `Elapsed time is X.XXXXXX seconds.`
+  output is intentionally non-deterministic in both runtimes.
 
 ## Codegen
 

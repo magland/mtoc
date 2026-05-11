@@ -60,6 +60,7 @@ import { lowerBinary } from "./lowerBinary.js";
 import { lowerUnary } from "./lowerUnary.js";
 import {
   isElementwiseBuiltin,
+  lowerBuiltinCall,
   lowerFuncCall,
   lowerMultiAssignCall,
 } from "./lowerFuncCall.js";
@@ -548,6 +549,22 @@ export class Lowerer {
         // before the default expression-call path; that's how `disp`
         // and `error` produce dedicated `IRStmt.Disp` / `IRStmt.Error`
         // nodes without lower.ts hardcoding their names.
+        // A bare-Ident statement `tic;` / `toc;` parses as
+        // `ExprStmt(Ident)`. numbl evaluates such an Ident as a no-arg
+        // function call; mtoc forwards to the builtin's `lowerStmt`
+        // hook with `args=[]` so the print-side-effect path runs (for
+        // `toc;`) and a value-discarding ExprStmt is produced for
+        // `tic;`.
+        if (
+          s.expr.type === "Ident" &&
+          this.envLookup(s.expr.name) === undefined
+        ) {
+          const builtin = getBuiltin(s.expr.name);
+          if (builtin?.lowerStmt) {
+            const lowered = builtin.lowerStmt(this, [], s.span);
+            if (lowered !== null) return lowered;
+          }
+        }
         if (s.expr.type === "FuncCall") {
           // Resolve to decide between the user-function `MultiAssignCall`
           // route (0-output / N≥2-output) and the regular expression
@@ -808,6 +825,17 @@ export class Lowerer {
             ty: scalarDouble(k.sign),
             span: e.span,
           };
+        }
+        // numbl evaluates a bare identifier that isn't a variable or
+        // constant as a no-arg call (interpreterExec.ts `case "Ident"` —
+        // see `tic` / `toc` / `pi`-style names). mtoc dispatches the
+        // same way for known no-arg builtins so `t = tic;` and `e = toc`
+        // work alongside their parens form. Mismatched arity (e.g. bare
+        // `sqrt`) surfaces at the builtin's own arity check with a
+        // clearer message than "undefined variable".
+        const builtin = getBuiltin(e.name);
+        if (builtin && builtin.category === "expr") {
+          return lowerBuiltinCall.call(this, e.name, [], e.span);
         }
         throw new TypeError(`use of undefined variable '${e.name}'`, e.span);
       }
