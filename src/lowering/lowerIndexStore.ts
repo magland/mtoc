@@ -20,14 +20,9 @@
 import type { Expr, LValue, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IRStmt } from "./ir.js";
-import {
-  isMultiElement,
-  isNumeric,
-  isScalar,
-  isScalarReal,
-  typeToString,
-} from "./types.js";
+import { isNumeric, isScalar, isScalarReal, typeToString } from "./types.js";
 import type { Lowerer } from "./lower.js";
+import { resolveIndexBase } from "./indexResolve.js";
 
 /** Lower `<lvalue> = <expr>` where `lvalue` is an `Index` LValue. */
 export function lowerIndexStore(
@@ -44,46 +39,18 @@ export function lowerIndexStore(
     );
   }
   const name = lvalue.base.name;
-  const baseTy = this.envLookup(name);
-  if (baseTy === undefined) {
-    throw new TypeError(
-      `use of undefined variable '${name}'`,
-      lvalue.base.span
-    );
-  }
-  if (!isNumeric(baseTy)) {
-    throw new UnsupportedConstruct(
-      `indexed write into ${typeToString(baseTy)} is not yet supported`,
-      span
-    );
-  }
-  if (!isMultiElement(baseTy)) {
-    throw new UnsupportedConstruct(
-      `indexed write requires a multi-element tensor (got ` +
-        `${typeToString(baseTy)})`,
-      span
-    );
-  }
-  if (baseTy.elem === "char") {
-    throw new UnsupportedConstruct(
-      `indexed write into a char tensor is not yet supported`,
-      span
-    );
-  }
-  if (lvalue.indices.length === 0) {
-    throw new UnsupportedConstruct(
-      `indexed write requires at least one index`,
-      span
-    );
-  }
-  const ndim = baseTy.dims.length;
-  if (lvalue.indices.length !== 1 && lvalue.indices.length !== ndim) {
-    throw new UnsupportedConstruct(
-      `${lvalue.indices.length}-index write into a ${ndim}-D tensor is ` +
-        `not yet supported (use 1 linear index or ${ndim} per-axis indices)`,
-      span
-    );
-  }
+  const { baseTy, baseCName, base } = resolveIndexBase.call(
+    this,
+    name,
+    lvalue.indices.length,
+    span,
+    {
+      baseSpan: lvalue.base.span,
+      notInScope: "user-facing",
+      operation: "write",
+    }
+  );
+
   // Range/colon writes are dispatched to lowerIndexSliceStore by the
   // caller (see lower.ts). If we ever reach here with a slice slot,
   // the dispatcher logic is wrong — surface it as an internal error.
@@ -96,15 +63,6 @@ export function lowerIndexStore(
       );
     }
   }
-
-  const baseCName = this.currentCNameFor(name);
-  const base: Extract<IRExpr, { kind: "Var" }> = {
-    kind: "Var",
-    name,
-    cName: baseCName,
-    ty: baseTy,
-    span: lvalue.base.span,
-  };
 
   const indices: IRExpr[] = [];
   const numSlots = lvalue.indices.length;

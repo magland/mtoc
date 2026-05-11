@@ -16,12 +16,9 @@
  */
 
 import type { Expr, Span } from "../parser/index.js";
-import { TypeError, UnsupportedConstruct } from "./errors.js";
+import { TypeError } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
-  isMultiElement,
-  isNumeric,
-  isScalar,
   isScalarReal,
   scalarChar,
   scalarComplex,
@@ -30,6 +27,7 @@ import {
   type MType,
 } from "./types.js";
 import type { Lowerer } from "./lower.js";
+import { resolveIndexBase } from "./indexResolve.js";
 
 /** Lower an index-read of an in-scope variable.
  *
@@ -43,67 +41,13 @@ export function lowerIndexLoad(
   argExprs: ReadonlyArray<Expr>,
   span: Span
 ): IRExpr {
-  const baseTy = this.envLookup(name);
-  if (baseTy === undefined) {
-    throw new UnsupportedConstruct(
-      `internal: lowerIndexLoad called for '${name}' which is not in scope`,
-      span
-    );
-  }
-  if (!isNumeric(baseTy)) {
-    throw new UnsupportedConstruct(
-      `indexing into ${typeToString(baseTy)} is not yet supported`,
-      span
-    );
-  }
-  if (isScalar(baseTy)) {
-    // MATLAB allows `x(1)` for a scalar (returning x), but the static
-    // codegen path for scalars doesn't carry an addressable buffer.
-    // Defer until there's a concrete need.
-    throw new UnsupportedConstruct(
-      `indexing into a scalar variable '${name}' is not yet supported`,
-      span
-    );
-  }
-  if (!isMultiElement(baseTy)) {
-    throw new UnsupportedConstruct(
-      `cannot index variable '${name}' with type ${typeToString(baseTy)}`,
-      span
-    );
-  }
-  if (argExprs.length === 0) {
-    throw new UnsupportedConstruct(
-      `indexing '${name}' requires at least one index`,
-      span
-    );
-  }
-  const ndim = baseTy.dims.length;
-  if (argExprs.length !== 1 && argExprs.length !== ndim) {
-    throw new UnsupportedConstruct(
-      `${argExprs.length}-index access into a ${ndim}-D tensor is not yet ` +
-        `supported (use 1 linear index or ${ndim} per-axis indices)`,
-      span
-    );
-  }
-  // Char tensors stay 2-D-only; the codegen for `<char>.data[offset]`
-  // only emits the 2-D fast path. Reject higher-dim char up front
-  // (today the type system can't produce one anyway, but the guard
-  // documents the assumption).
-  if (baseTy.elem === "char" && ndim > 2) {
-    throw new UnsupportedConstruct(
-      `indexing into an N-D char tensor (ndim > 2) is not yet supported`,
-      span
-    );
-  }
-
-  const baseCName = this.currentCNameFor(name);
-  const base: Extract<IRExpr, { kind: "Var" }> = {
-    kind: "Var",
+  const { baseTy, baseCName, base } = resolveIndexBase.call(
+    this,
     name,
-    cName: baseCName,
-    ty: baseTy,
+    argExprs.length,
     span,
-  };
+    { allowCharArray: true, notInScope: "internal", operation: "read" }
+  );
 
   const indices: IRExpr[] = [];
   const numSlots = argExprs.length;

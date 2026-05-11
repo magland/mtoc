@@ -36,6 +36,7 @@ import {
 import { Lowerer, assertNotMtocReserved, cNameFor } from "./lower.js";
 import { lowerIndexLoad } from "./lowerIndexLoad.js";
 import { lowerIndexSlice } from "./lowerIndexSlice.js";
+import { isSliceArg } from "./indexResolve.js";
 
 /** Top-level dispatcher for `name(args)` syntax. Splits out the
  *  reserved `disp` (only valid as a stmt) and routes user functions
@@ -50,8 +51,6 @@ export function lowerFuncCall(
   // The `IndexSlice` path handles any slot that's a `Range` or
   // bare `Colon`; everything else is scalar-index `IndexLoad`.
   if (this.envLookup(e.name) !== undefined) {
-    const isSliceArg = (a: Expr): boolean =>
-      a.type === "Range" || a.type === "Colon";
     if (e.args.some(isSliceArg)) {
       return lowerIndexSlice.call(this, e.name, e.args, e.span);
     }

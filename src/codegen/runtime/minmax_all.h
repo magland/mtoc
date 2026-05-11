@@ -12,38 +12,28 @@
  *     / `mtoc_max_real_default`.
  *
  * Real-only — complex sibling lives in `minmax_complex_all.h`.
+ * Both functions are generated from one macro; only the comparison
+ * operator differs (< for min, > for max).
  */
 
 #include <math.h>
 
-static double mtoc_min_real_all(mtoc_tensor_t t) {
-  long n = 1;
-  for (int i = 0; i < t.ndim; i++) n *= t.dims[i];
-  double m = 0.0;
-  int found = 0;
-  for (long i = 0; i < n; i++) {
-    double v = t.real[i];
-    if (v != v) continue;
-    if (!found || v < m) {
-      m = v;
-      found = 1;
-    }
-  }
-  return found ? m : NAN;
+/* Helper macro: expand a real min or max linear-scan reduction.
+ * CMP is the comparison operator (< or >) that selects the winner. */
+#define MTOC_MINMAX_REAL_ALL(FNAME, CMP)              \
+static double FNAME(mtoc_tensor_t t) {                \
+  long n = 1;                                         \
+  for (int i = 0; i < t.ndim; i++) n *= t.dims[i];  \
+  double m = 0.0;                                     \
+  int found = 0;                                      \
+  for (long i = 0; i < n; i++) {                     \
+    double v = t.real[i];                             \
+    if (v != v) continue;                             \
+    if (!found || v CMP m) { m = v; found = 1; }     \
+  }                                                   \
+  return found ? m : NAN;                             \
 }
 
-static double mtoc_max_real_all(mtoc_tensor_t t) {
-  long n = 1;
-  for (int i = 0; i < t.ndim; i++) n *= t.dims[i];
-  double m = 0.0;
-  int found = 0;
-  for (long i = 0; i < n; i++) {
-    double v = t.real[i];
-    if (v != v) continue;
-    if (!found || v > m) {
-      m = v;
-      found = 1;
-    }
-  }
-  return found ? m : NAN;
-}
+MTOC_MINMAX_REAL_ALL(mtoc_min_real_all, <)
+MTOC_MINMAX_REAL_ALL(mtoc_max_real_all, >)
+#undef MTOC_MINMAX_REAL_ALL

@@ -100,7 +100,7 @@ export type IRExpr =
       /** MATLAB name (for diagnostics). */
       name: string;
       callee: CallTarget;
-      args: IRExpr[];
+      args: ReadonlyArray<IRExpr>;
       ty: MType;
       span: Span;
     }

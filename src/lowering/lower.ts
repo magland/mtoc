@@ -67,6 +67,7 @@ import {
 import { lowerIndexStore } from "./lowerIndexStore.js";
 import { lowerIndexSliceStore } from "./lowerIndexSliceStore.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
+import { isSliceArg } from "./indexResolve.js";
 import {
   forEachStmtInTree,
   forEachSubExpr,
@@ -530,8 +531,6 @@ export class Lowerer {
         }
         // Range/colon slot routes to the slice-write path; otherwise
         // it's a scalar IndexStore.
-        const isSliceArg = (a: Expr): boolean =>
-          a.type === "Range" || a.type === "Colon";
         if (s.lvalue.indices.some(isSliceArg)) {
           return lowerIndexSliceStore.call(this, s.lvalue, s.expr, s.span);
         }
@@ -909,6 +908,9 @@ function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
       return "builtin-call";
     }
   }
+  // `Var` and `StringLit` are intentionally absent: `Var` reads an
+  // already-owned heap value without allocating; `StringLit` points at
+  // .rodata and performs no heap allocation.
   return null;
 }
 

@@ -132,8 +132,15 @@ function lowerNonConjugateTranspose(operand: IRExpr, span: Span): IRExpr {
   if (isScalar(operand.ty)) {
     return { ...operand, span };
   }
-  // Operand is numeric (lowerUnary already gated on isNumeric before
-  // dispatching here) and not a scalar, so it's a multi-element tensor.
+  // Caller (lowerUnary) gated on isNumeric before dispatching here; the
+  // re-check narrows `operand.ty` from `MType` to `NumericType` so the
+  // field accesses below type-check without a cast.
+  if (!isNumeric(operand.ty)) {
+    throw new UnsupportedConstruct(
+      `.' on a ${operand.ty.kind} value is not supported`,
+      span
+    );
+  }
   if (operand.ty.elem === "char") {
     throw new UnsupportedConstruct(
       `.' on a char array is not yet supported`,

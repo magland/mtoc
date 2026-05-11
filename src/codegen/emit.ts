@@ -12,7 +12,10 @@
  *   - `emitFormat.ts`   — pure formatters (NumLit, StringLit, op tables, precedence).
  *   - `emitState.ts`    — `EmitState` + runtime-helper activation + line plumbing.
  *   - `emitExpr.ts`     — `emitExpr` / `analyzeExpr` / complex helper / arg-copy wrapper.
- *   - `emitStmt.ts`     — `emitStmt` / `analyzeStmts` / tensor-lit + elementwise emit / shape walkers / early-frees.
+ *   - `emitAnalysis.ts` — `analyzeStmts` / `deadAfterStmt` / `emitEarlyFrees` / `formatArgInit`.
+ *   - `emitStmt.ts`     — `emitStmt` dispatch over IRStmt kinds.
+ *   - `emitTensor.ts`   — tensor-literal and elementwise-loop Assign emitters.
+ *   - `emitSlice.ts`    — indexed read (`IndexSlice`) and write (`IndexSliceStore`) emitters.
  *   - `emitOwned.ts`    — owned-kind declarations + scope-exit frees + per-fn free set.
  *   - `emitFunction.ts` — `emitFunction` + body-emission + header comment.
  *   - `ownedKinds.ts`   — registry mapping owned MType → C helper names.
@@ -28,7 +31,8 @@
 import type { IRProgram } from "../lowering/ir.js";
 import { computeFutureTouches } from "./liveness.js";
 import { type EmitState } from "./emitState.js";
-import { analyzeStmts, emitStmt } from "./emitStmt.js";
+import { analyzeStmts } from "./emitAnalysis.js";
+import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
 

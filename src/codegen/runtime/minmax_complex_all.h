@@ -8,69 +8,45 @@
  * Magnitude is `sqrt(re*re + im*im)` (NOT `hypot`) to match numbl's
  * computation byte-for-byte — `hypot`'s overflow handling diverges
  * on extreme inputs.
+ *
+ * Both functions are generated from one macro; only the comparison
+ * operator differs (< for min, > for max) applied to both magnitude
+ * and angle tiebreak.
  */
 
 #include <complex.h>
 #include <math.h>
 
-static double _Complex mtoc_min_complex_all(mtoc_tensor_t t) {
-  long n = 1;
-  for (int i = 0; i < t.ndim; i++) n *= t.dims[i];
-  double mRe = 0.0, mIm = 0.0;
-  double mMag = 0.0, mAng = 0.0;
-  int found = 0;
-  for (long i = 0; i < n; i++) {
-    double re = t.real[i], im = t.imag[i];
-    if (re != re || im != im) continue;
-    double mag = sqrt(re * re + im * im);
-    double ang = atan2(im, re);
-    int better;
-    if (!found) {
-      better = 1;
-    } else if (mag != mMag) {
-      better = mag < mMag;
-    } else {
-      better = ang < mAng;
-    }
-    if (better) {
-      mRe = re;
-      mIm = im;
-      mMag = mag;
-      mAng = ang;
-      found = 1;
-    }
-  }
-  if (!found) return NAN + 0.0 * I;
-  return mRe + mIm * I;
+/* Helper macro: expand a complex min or max linear-scan reduction.
+ * CMP is the comparison operator (< or >) applied to magnitude and angle. */
+#define MTOC_MINMAX_COMPLEX_ALL(FNAME, CMP)                      \
+static double _Complex FNAME(mtoc_tensor_t t) {                  \
+  long n = 1;                                                    \
+  for (int i = 0; i < t.ndim; i++) n *= t.dims[i];             \
+  double mRe = 0.0, mIm = 0.0;                                  \
+  double mMag = 0.0, mAng = 0.0;                                \
+  int found = 0;                                                 \
+  for (long i = 0; i < n; i++) {                                \
+    double re = t.real[i], im = t.imag[i];                      \
+    if (re != re || im != im) continue;                          \
+    double mag = sqrt(re * re + im * im);                        \
+    double ang = atan2(im, re);                                  \
+    int better;                                                  \
+    if (!found) {                                                \
+      better = 1;                                               \
+    } else if (mag != mMag) {                                   \
+      better = mag CMP mMag;                                     \
+    } else {                                                     \
+      better = ang CMP mAng;                                     \
+    }                                                            \
+    if (better) {                                               \
+      mRe = re; mIm = im; mMag = mag; mAng = ang; found = 1;  \
+    }                                                            \
+  }                                                             \
+  if (!found) return NAN + 0.0 * I;                             \
+  return mRe + mIm * I;                                         \
 }
 
-static double _Complex mtoc_max_complex_all(mtoc_tensor_t t) {
-  long n = 1;
-  for (int i = 0; i < t.ndim; i++) n *= t.dims[i];
-  double mRe = 0.0, mIm = 0.0;
-  double mMag = 0.0, mAng = 0.0;
-  int found = 0;
-  for (long i = 0; i < n; i++) {
-    double re = t.real[i], im = t.imag[i];
-    if (re != re || im != im) continue;
-    double mag = sqrt(re * re + im * im);
-    double ang = atan2(im, re);
-    int better;
-    if (!found) {
-      better = 1;
-    } else if (mag != mMag) {
-      better = mag > mMag;
-    } else {
-      better = ang > mAng;
-    }
-    if (better) {
-      mRe = re;
-      mIm = im;
-      mMag = mag;
-      mAng = ang;
-      found = 1;
-    }
-  }
-  if (!found) return NAN + 0.0 * I;
-  return mRe + mIm * I;
-}
+MTOC_MINMAX_COMPLEX_ALL(mtoc_min_complex_all, <)
+MTOC_MINMAX_COMPLEX_ALL(mtoc_max_complex_all, >)
+#undef MTOC_MINMAX_COMPLEX_ALL

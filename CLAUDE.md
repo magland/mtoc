@@ -46,7 +46,10 @@ subsystems and file _roles_ so the docs survive routine refactors.
 
 A change is "done" when:
 
-- `npx tsc --noEmit` is clean.
+- `npx tsc -b` is clean. (`--noEmit` only checks the default tsconfig;
+  `-b` walks the project references — `tsconfig.app.json` and
+  `tsconfig.cli.json` — so test files and CLI-only sources are also
+  type-checked.)
 - `npx tsx scripts/run_test_scripts.ts` is at full pass.
 - `npx vitest run` is at full pass.
 - `npm run lint` and `npm run format:check` are both clean.

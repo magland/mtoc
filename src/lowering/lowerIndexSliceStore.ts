@@ -23,10 +23,11 @@
 
 import type { Expr, LValue, Span } from "../parser/index.js";
 import { TypeError, UnsupportedConstruct } from "./errors.js";
-import type { IRExpr, IRStmt, IndexSliceArg } from "./ir.js";
-import { isMultiElement, isNumeric, isScalar, typeToString } from "./types.js";
+import type { IRStmt, IndexSliceArg } from "./ir.js";
+import { isNumeric, isScalar, typeToString } from "./types.js";
 import type { Lowerer } from "./lower.js";
 import { lowerSliceArg } from "./lowerIndexSlice.js";
+import { resolveIndexBase } from "./indexResolve.js";
 
 /** Lower `<v>(slice) = <expr>` where the lvalue has at least one
  *  `Range` or bare `Colon` slot. */
@@ -44,51 +45,17 @@ export function lowerIndexSliceStore(
     );
   }
   const name = lvalue.base.name;
-  const baseTy = this.envLookup(name);
-  if (baseTy === undefined) {
-    throw new TypeError(
-      `use of undefined variable '${name}'`,
-      lvalue.base.span
-    );
-  }
-  if (!isNumeric(baseTy)) {
-    throw new UnsupportedConstruct(
-      `range/colon indexed write into ${typeToString(baseTy)} is not yet ` +
-        `supported`,
-      span
-    );
-  }
-  if (!isMultiElement(baseTy)) {
-    throw new UnsupportedConstruct(
-      `range/colon indexed write requires a multi-element tensor (got ` +
-        `${typeToString(baseTy)})`,
-      span
-    );
-  }
-  if (baseTy.elem === "char") {
-    throw new UnsupportedConstruct(
-      `range/colon indexed write into a char tensor is not yet supported`,
-      span
-    );
-  }
-  const ndim = baseTy.dims.length;
-  if (lvalue.indices.length !== 1 && lvalue.indices.length !== ndim) {
-    throw new UnsupportedConstruct(
-      `range/colon indexed write into a ${ndim}-D tensor requires either 1 ` +
-        `slot (linear) or ${ndim} slots (one per axis); got ` +
-        `${lvalue.indices.length}`,
-      span
-    );
-  }
-
-  const baseCName = this.currentCNameFor(name);
-  const base: Extract<IRExpr, { kind: "Var" }> = {
-    kind: "Var",
+  const { baseTy, baseCName, base } = resolveIndexBase.call(
+    this,
     name,
-    cName: baseCName,
-    ty: baseTy,
-    span: lvalue.base.span,
-  };
+    lvalue.indices.length,
+    span,
+    {
+      baseSpan: lvalue.base.span,
+      notInScope: "user-facing",
+      operation: "sliceWrite",
+    }
+  );
 
   const isSingleSlot = lvalue.indices.length === 1;
   const slots: IndexSliceArg[] = [];

@@ -34,8 +34,6 @@ import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr, IndexSliceArg } from "./ir.js";
 import {
   isColVec,
-  isMultiElement,
-  isNumeric,
   isRowVec,
   isScalarReal,
   numericTypeND,
@@ -46,6 +44,7 @@ import {
   typeToString,
 } from "./types.js";
 import type { Lowerer } from "./lower.js";
+import { resolveIndexBase } from "./indexResolve.js";
 
 /** Lower an index-read of an in-scope variable when at least one
  *  index slot is a `Range` or `Colon`. */
@@ -55,49 +54,13 @@ export function lowerIndexSlice(
   argExprs: ReadonlyArray<Expr>,
   span: Span
 ): IRExpr {
-  const baseTy = this.envLookup(name);
-  if (baseTy === undefined) {
-    throw new UnsupportedConstruct(
-      `internal: lowerIndexSlice called for '${name}' which is not in scope`,
-      span
-    );
-  }
-  if (!isNumeric(baseTy)) {
-    throw new UnsupportedConstruct(
-      `range/colon indexing into ${typeToString(baseTy)} is not yet supported`,
-      span
-    );
-  }
-  if (!isMultiElement(baseTy)) {
-    throw new UnsupportedConstruct(
-      `range/colon indexing requires a multi-element tensor (got ` +
-        `${typeToString(baseTy)})`,
-      span
-    );
-  }
-  if (baseTy.elem === "char") {
-    throw new UnsupportedConstruct(
-      `range/colon indexing into a char tensor is not yet supported`,
-      span
-    );
-  }
-  const ndim = baseTy.dims.length;
-  if (argExprs.length !== 1 && argExprs.length !== ndim) {
-    throw new UnsupportedConstruct(
-      `range/colon indexing of a ${ndim}-D tensor requires either 1 slot ` +
-        `(linear) or ${ndim} slots (one per axis); got ${argExprs.length}`,
-      span
-    );
-  }
-
-  const baseCName = this.currentCNameFor(name);
-  const base: Extract<IRExpr, { kind: "Var" }> = {
-    kind: "Var",
+  const { baseTy, baseCName, base } = resolveIndexBase.call(
+    this,
     name,
-    cName: baseCName,
-    ty: baseTy,
+    argExprs.length,
     span,
-  };
+    { notInScope: "internal", operation: "sliceRead" }
+  );
 
   // Lower each slot. The `end` axis is "linear" for the single-slot
   // form (so `end` resolves to numel(base)); for the multi-slot form

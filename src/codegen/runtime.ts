@@ -87,6 +87,10 @@ function loadSnippet(
 // `useRuntimeByName(state, key)` and the activator pulls the dep
 // closure in transitively.
 
+/** Fiber-walk scaffold macros shared by the four axis-reduction helpers
+ *  (sum_default, sum_complex_default, minmax_default, minmax_complex_default).
+ *  Emitted before any of those four snippets so macros are in scope. */
+const MTOC_REDUCTION_WALK = loadSnippet("reduction_walk.h");
 const MTOC_FORMAT_DOUBLE = loadSnippet("format_double.h");
 const MTOC_DISP_DOUBLE = loadSnippet("disp_double.h", ["mtoc_format_double"]);
 const MTOC_FORMAT_COMPLEX = loadSnippet("format_complex.h", [
@@ -121,6 +125,7 @@ const MTOC_DISP_TENSOR_COMPLEX = loadSnippet("disp_tensor_complex.h", [
  * a name in this map, it activates the helper. New helpers go here.
  */
 export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
+  ["mtoc_reduction_walk", MTOC_REDUCTION_WALK],
   ["mtoc_format_double", MTOC_FORMAT_DOUBLE],
   ["mtoc_disp_double", MTOC_DISP_DOUBLE],
   ["mtoc_format_complex", MTOC_FORMAT_COMPLEX],
@@ -275,6 +280,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   [
     "mtoc_sum_default",
     loadSnippet("sum_default.h", [
+      "mtoc_reduction_walk",
       "mtoc_tensor_t",
       "mtoc_tensor_alloc",
       "mtoc_tensor_alloc_nd",
@@ -283,6 +289,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   [
     "mtoc_sum_complex_default",
     loadSnippet("sum_complex_default.h", [
+      "mtoc_reduction_walk",
       "mtoc_tensor_t",
       "mtoc_tensor_alloc_nd_complex",
     ]),
@@ -304,6 +311,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   [
     "mtoc_minmax_real_default",
     loadSnippet("minmax_default.h", [
+      "mtoc_reduction_walk",
       "mtoc_tensor_t",
       "mtoc_tensor_alloc",
       "mtoc_tensor_alloc_nd",
@@ -312,6 +320,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   [
     "mtoc_minmax_complex_default",
     loadSnippet("minmax_complex_default.h", [
+      "mtoc_reduction_walk",
       "mtoc_tensor_t",
       "mtoc_tensor_alloc_nd_complex",
     ]),

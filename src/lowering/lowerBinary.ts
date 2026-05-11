@@ -15,6 +15,7 @@ import { TypeError, UnsupportedConstruct } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
   arithResult,
+  broadcastShape,
   isCharArray,
   isCharScalar,
   isHigherDim,
@@ -257,19 +258,23 @@ function lowerComparison(
         e.span
       );
     }
-    const shape = arithResult("Add", left.ty, right.ty);
-    if (!isNumeric(shape)) {
+    // Scalar broadcasts to the tensor's shape; for tensor vs. tensor,
+    // use broadcastShape (returns null on shape mismatch).
+    const leftTy = left.ty as NumericType;
+    const rightTy = right.ty as NumericType;
+    const dims = isScalar(leftTy)
+      ? rightTy.dims
+      : isScalar(rightTy)
+        ? leftTy.dims
+        : broadcastShape(leftTy.dims, rightTy.dims);
+    if (dims === null) {
       throw new UnsupportedConstruct(
         `comparison ${e.op} on ${typeToString(left.ty)} and ` +
           `${typeToString(right.ty)} produces an incompatible result type`,
         e.span
       );
     }
-    const resultTy: NumericType = numericTypeND(
-      shape.dims,
-      false,
-      "nonnegative"
-    );
+    const resultTy: NumericType = numericTypeND(dims, false, "nonnegative");
     return {
       kind: "Binary",
       op: e.op,
@@ -469,15 +474,23 @@ function lowerPow(
       span: e.span,
     };
   }
-  const shape = arithResult("Add", left.ty, right.ty);
-  if (!isNumeric(shape)) {
+  // Scalar broadcasts to the tensor's shape; for tensor vs. tensor,
+  // use broadcastShape (returns null on shape mismatch).
+  const leftTy = left.ty as NumericType;
+  const rightTy = right.ty as NumericType;
+  const dims = isScalar(leftTy)
+    ? rightTy.dims
+    : isScalar(rightTy)
+      ? leftTy.dims
+      : broadcastShape(leftTy.dims, rightTy.dims);
+  if (dims === null) {
     throw new UnsupportedConstruct(
       `binary .^ on ${typeToString(left.ty)} and ${typeToString(right.ty)} ` +
         `produces an incompatible result type`,
       e.span
     );
   }
-  const resultTy: NumericType = numericTypeND(shape.dims, false, resultSign);
+  const resultTy: NumericType = numericTypeND(dims, false, resultSign);
   return {
     kind: "Binary",
     op: e.op,
