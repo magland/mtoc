@@ -691,9 +691,13 @@ function specialize(
     for (const p of fnAst.params) assertNotMtocReserved(p, fnAst.span);
     for (const o of fnAst.outputs) assertNotMtocReserved(o, fnAst.span);
 
+    // `~` params are positional placeholders for ignored arguments — the
+    // body cannot reference them. Give each one a synthetic C identifier
+    // so the emitted signature is valid C; the MATLAB-side `name` stays
+    // `~` for diagnostics (header comment, error messages).
     const paramBindings = fnAst.params.map((p, i) => ({
       name: p,
-      cName: cNameFor(p),
+      cName: p === "~" ? `_mtoc_ignored_p${i}` : cNameFor(p),
       ty: argTypes[i],
     }));
     const inner = new Lowerer(
