@@ -338,6 +338,19 @@ export function isHigherDim(t: MType): boolean {
   return isNumeric(t) && t.dims.length > 2;
 }
 
+/** True when `t` is something a "text-accepting" runtime helper can
+ *  consume via `mtoc_text_view_t` — today: a `string` handle or a
+ *  multi-element `char` array. Scalar chars (bare C `char`) are
+ *  intentionally excluded; they keep their numeric character role
+ *  (`'A' + 1`, `disp('a')` prints the byte as text via the dedicated
+ *  `mtoc_disp_char`). The shared predicate lets builtins like
+ *  `disp` / `error` / `assert(_, msg)` / `strcmp` and the `+`
+ *  concatenation path write one code path that accepts both source
+ *  kinds. */
+export function isText(t: MType): boolean {
+  return isString(t) || isCharArray(t);
+}
+
 /** True when the value of type `t` is backed by a heap allocation that
  *  the generated code is responsible for releasing — currently
  *  multi-element tensors (double and char) and strings. Drives the

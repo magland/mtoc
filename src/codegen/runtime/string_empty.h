@@ -3,7 +3,7 @@
  * Used at every predeclaration site so a string variable starts in a
  * known state; `mtoc_string_assign` will overwrite it on first
  * assignment. The empty handle is treated as the empty string by the
- * read helpers (`mtoc_disp_string` skips the write when `data` is
+ * text-view helpers (`mtoc_disp_text` skips the write when `data` is
  * NULL or `len` is 0). `owned` starts as 0 so a stray free of an
  * uninitialized variable is a no-op.
  */

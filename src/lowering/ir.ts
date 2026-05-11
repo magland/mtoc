@@ -287,12 +287,13 @@ export type IRStmt =
   | { kind: "ExprStmt"; expr: IRExpr; span: Span }
   | { kind: "Disp"; arg: IRExpr; span: Span }
   | {
-      /** `error(s)` — raises a runtime error with the given string
+      /** `error(s)` — raises a runtime error with the given text
        *  message. Statement-only (numbl's `error` never returns).
-       *  Codegen emits `mtoc_error_string(<arg>);` which prints
-       *  to stderr and aborts. Lowering accepts a `StringLit` or
-       *  string `Var` as the argument; nested string expressions
-       *  must be assigned to a name first. */
+       *  Codegen emits `mtoc_error_text(<view>);` (the arg is
+       *  wrapped in a text view at the call site, so the same path
+       *  serves both string and char-array messages). Lowering
+       *  accepts a `StringLit` / `CharLit` / `Var` as the argument;
+       *  nested text expressions must be assigned to a name first. */
       kind: "Error";
       arg: IRExpr;
       span: Span;
@@ -302,12 +303,14 @@ export type IRStmt =
        *  `cond` is a falsy or NaN scalar; otherwise a no-op. Statement-
        *  only (numbl's `assert` returns nothing on success and throws
        *  on failure). Codegen emits `mtoc_assert_double` (1-arg form,
-       *  prints "Assertion failed") or `mtoc_assert_double_msg`
-       *  (2-arg form, prints the user-supplied message). Lowering
+       *  prints "Assertion failed") or `mtoc_assert_double_msg_text`
+       *  (2-arg form, prints the user-supplied message; the msg is
+       *  wrapped in a text view at the call site, so both string and
+       *  char-array messages funnel through the same helper). Lowering
        *  today accepts a scalar real `cond`; the multi-element tensor
-       *  form is deferred. The optional `msg` must be a string `Var`
-       *  or `StringLit` (mirroring the `error` rule — nested string
-       *  expressions have no name to be released through). */
+       *  form is deferred. The optional `msg` must be a `Var`,
+       *  `StringLit`, or `CharLit` (mirroring the `error` rule —
+       *  nested text expressions have no name to be released through). */
       kind: "Assert";
       cond: IRExpr;
       msg: IRExpr | null;

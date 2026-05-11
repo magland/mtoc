@@ -13,14 +13,16 @@ describe("strings", () => {
     expect(c).toMatch(
       /mtoc_string_assign\(&s, mtoc_string_from_literal\("hi", 2\)\);/
     );
-    expect(c).toContain("mtoc_disp_string(s);");
+    expect(c).toContain("mtoc_disp_text(mtoc_text_from_string(s));");
     // Scope-exit free.
     expect(c).toContain("mtoc_string_free(&s);");
   });
 
   it("emits mtoc_string_concat for `+` on two strings", () => {
     const c = translate('a = "x";\nb = "y";\nc = a + b;\ndisp(c);\n');
-    expect(c).toMatch(/mtoc_string_assign\(&c, mtoc_string_concat\(a, b\)\);/);
+    expect(c).toMatch(
+      /mtoc_string_assign\(&c, mtoc_string_concat\(mtoc_text_from_string\(a\), mtoc_text_from_string\(b\)\)\);/
+    );
   });
 
   it("hoists nested string concat via ANF", () => {
@@ -32,10 +34,10 @@ describe("strings", () => {
     // The inner (a + b) concat lands in the ANF temp; the outer
     // concat lands in `d`. Both shapes appear verbatim in main().
     expect(c).toMatch(
-      /mtoc_string_assign\(&_mtoc_anf_\d+, mtoc_string_concat\(a, b\)\);/
+      /mtoc_string_assign\(&_mtoc_anf_\d+, mtoc_string_concat\(mtoc_text_from_string\(a\), mtoc_text_from_string\(b\)\)\);/
     );
     expect(c).toMatch(
-      /mtoc_string_assign\(&d, mtoc_string_concat\(_mtoc_anf_\d+, c\)\);/
+      /mtoc_string_assign\(&d, mtoc_string_concat\(mtoc_text_from_string\(_mtoc_anf_\d+\), mtoc_text_from_string\(c\)\)\);/
     );
     // The lifted temp gets freed (either early-free or scope-exit).
     expect(c).toMatch(/mtoc_string_free\(&_mtoc_anf_/);
@@ -66,7 +68,27 @@ describe("strings", () => {
     const e = err as { name: string; message: string; span: unknown };
     expect(e.name).toBe("TypeError");
     expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/both operands to be strings/);
+    expect(e.message).toMatch(/string or char array/);
+  });
+
+  it("concatenates string + char-array via the text view", () => {
+    // Mixed `+` with a string and a char-array bridges both arms
+    // through `mtoc_text_view_t`; the result is a string handle.
+    const c = translate("a = \"hi\";\nb = a + 'lo';\ndisp(b);\n");
+    expect(c).toContain("mtoc_string_t b = mtoc_string_empty();");
+    expect(c).toMatch(
+      /mtoc_string_assign\(&b, mtoc_string_concat\(mtoc_text_from_string\(a\), mtoc_text_from_char_tensor\(mtoc_char_tensor_from_literal\("lo", 2\)\)\)\);/
+    );
+    expect(c).toContain("mtoc_disp_text(mtoc_text_from_string(b));");
+  });
+
+  it("concatenates char-array + string via the text view", () => {
+    // The symmetric case: char-array on the left, string on the right.
+    const c = translate("a = 'hi';\nb = a + \"lo\";\ndisp(b);\n");
+    expect(c).toContain("mtoc_string_t b = mtoc_string_empty();");
+    expect(c).toMatch(
+      /mtoc_string_concat\(mtoc_text_from_char_tensor\(a\), mtoc_text_from_string\(mtoc_string_from_literal\("lo", 2\)\)\)/
+    );
   });
 
   it("folds length(s) and numel(s) to the constant 1 (numbl semantics)", () => {
@@ -91,26 +113,39 @@ describe("strings", () => {
   it("error(s) emits the runtime helper call", () => {
     const c = translate('error("boom");\n');
     expect(c).toMatch(
-      /mtoc_error_string\(mtoc_string_from_literal\("boom", 4\)\);/
+      /mtoc_error_text\(mtoc_text_from_string\(mtoc_string_from_literal\("boom", 4\)\)\);/
     );
   });
 
-  it("strcmp(string, string) emits the string helper", () => {
+  it("error(s) accepts a char-array message", () => {
+    // Numbl treats `error('msg')` and `error("msg")` interchangeably;
+    // mtoc bridges via the text view.
+    const c = translate("error('boom');\n");
+    expect(c).toMatch(
+      /mtoc_error_text\(mtoc_text_from_char_tensor\(mtoc_char_tensor_from_literal\("boom", 4\)\)\);/
+    );
+  });
+
+  it("strcmp emits the text-view helper for two strings", () => {
     const c = translate('a = "x";\nb = "y";\ndisp(strcmp(a, b));\n');
-    expect(c).toContain("mtoc_strcmp_string(a, b)");
-    expect(c).toContain("static double mtoc_strcmp_string");
+    expect(c).toContain(
+      "mtoc_strcmp_text(mtoc_text_from_string(a), mtoc_text_from_string(b))"
+    );
+    expect(c).toContain("static double mtoc_strcmp_text");
   });
 
-  it("strcmp(char_array, char_array) emits the char-tensor helper", () => {
+  it("strcmp emits the text-view helper for two char arrays", () => {
     const c = translate("a = 'hello';\ndisp(strcmp(a, 'hello'));\n");
-    expect(c).toContain("mtoc_strcmp_char_tensor(a, ");
-    expect(c).toContain("static double mtoc_strcmp_char_tensor");
+    expect(c).toContain(
+      "mtoc_strcmp_text(mtoc_text_from_char_tensor(a), mtoc_text_from_char_tensor("
+    );
   });
 
-  it("strcmp on mixed char-array × string bridges via from_literal", () => {
+  it("strcmp emits the text-view helper for mixed char-array × string", () => {
     const c = translate("a = 'hi';\ndisp(strcmp(a, \"hi\"));\n");
-    expect(c).toContain("mtoc_strcmp_string(");
-    expect(c).toMatch(/mtoc_string_from_literal\(a\.data, a\.cols\)/);
+    expect(c).toContain(
+      "mtoc_strcmp_text(mtoc_text_from_char_tensor(a), mtoc_text_from_string("
+    );
   });
 
   it("strcmp rejects non-text arguments with a clear message", () => {
@@ -128,11 +163,11 @@ describe("strings", () => {
 
   it("hoists a string concat expression as a disp arg via ANF", () => {
     // ANF lifts the string-concat to a `_mtoc_anf_<N>` Assign and
-    // disp consumes the resulting `Var` via `mtoc_disp_string`.
+    // disp consumes the resulting `Var` via `mtoc_disp_text`.
     const c = translate('a = "x";\nb = "y";\ndisp(a + b);\n');
     expect(c).toMatch(/_mtoc_anf_/);
     expect(c).toMatch(/mtoc_string_concat/);
-    expect(c).toMatch(/mtoc_disp_string/);
+    expect(c).toMatch(/mtoc_disp_text\(mtoc_text_from_string\(_mtoc_anf_/);
   });
 
   it("splits a string -> numeric top-level reassignment via a fresh binding", () => {
@@ -154,7 +189,7 @@ describe("strings", () => {
     const aFreeIdx = c.indexOf("mtoc_string_free(&a);");
     const bFreeIdx = c.indexOf("mtoc_string_free(&b);");
     const cFreeIdx = c.indexOf("mtoc_string_free(&c);");
-    const dispIdx = c.indexOf("mtoc_disp_string(c);");
+    const dispIdx = c.indexOf("mtoc_disp_text(mtoc_text_from_string(c));");
     expect(aFreeIdx).toBeGreaterThan(-1);
     expect(bFreeIdx).toBeGreaterThan(-1);
     expect(cFreeIdx).toBeGreaterThan(-1);

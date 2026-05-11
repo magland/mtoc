@@ -22,7 +22,6 @@
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
   cTypeFor,
-  isCharArray,
   isCharScalar,
   isColVec,
   isMultiElement,
@@ -32,6 +31,7 @@ import {
   isScalar,
   isScalarComplex,
   isScalarReal,
+  isText,
   typeToString,
   type NumericType,
 } from "../lowering/types.js";
@@ -51,6 +51,7 @@ import {
   tensorColsField,
   tensorRowsField,
   wrapOwnedArgCopy,
+  wrapTextView,
 } from "./emitExpr.js";
 import { formatNumLit } from "./emitFormat.js";
 import { renderStmt, sanitizeForBlockComment } from "./irRender.js";
@@ -327,14 +328,20 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
 
     case "Disp": {
       const ty = s.arg.ty;
+      if (isText(ty)) {
+        // Strings and char arrays share one disp path via the text
+        // view — `mtoc_disp_text` prints the bytes + newline regardless
+        // of the source struct shape.
+        useRuntimeByName(state, "mtoc_disp_text");
+        const view = wrapTextView(state, ty, emitExpr(state, s.arg, 0));
+        pushStmt(state, level, `mtoc_disp_text(${view});`);
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
+        break;
+      }
       const owned = ownedOps(ty);
-      if (owned !== null) {
-        // Owned-kind disp: same shape across strings / char arrays /
-        // tensors — activate the typedef snippet and the kind-specific
-        // disp helper, pass the arg by value. The lowering pass
-        // restricts each kind's accepted arg shapes (Var or
-        // literal-handle for strings; Var-only for tensors); emitExpr
-        // renders each safely.
+      if (owned !== null && owned.disp !== undefined) {
+        // Owned-kind disp for tensors. The lowering pass restricts arg
+        // shapes (Var-only for tensors); emitExpr renders safely.
         useRuntimeByName(state, owned.structSnippet);
         const helper = owned.disp(ty);
         useRuntimeByName(state, helper);
@@ -447,14 +454,11 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // this statement is unreachable at runtime. We don't try to
       // free heap-owned tensors / strings before the call: the OS
       // reclaims everything on `exit`, and matching numbl's behavior
-      // is what we care about for cross-runner parity.
-      useRuntimeByName(state, "mtoc_string_t");
-      useRuntimeByName(state, "mtoc_error_string");
-      pushStmt(
-        state,
-        level,
-        `mtoc_error_string(${emitExpr(state, s.arg, 0)});`
-      );
+      // is what we care about for cross-runner parity. Strings and
+      // char arrays funnel through the same text-view helper.
+      useRuntimeByName(state, "mtoc_error_text");
+      const view = wrapTextView(state, s.arg.ty, emitExpr(state, s.arg, 0));
+      pushStmt(state, level, `mtoc_error_text(${view});`);
       break;
     }
 
@@ -464,9 +468,8 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // or NaN. On success the helper is a no-op so anything after
       // this stmt runs normally — unlike Error, we still need to
       // free dead-after vars on the success path. The 2-arg form
-      // routes to a sibling helper that takes an mtoc_string_t and
-      // prints the user-supplied message instead of "Assertion
-      // failed".
+      // routes through the text-view helper, accepting either a
+      // string or a char-array msg uniformly.
       if (s.msg === null) {
         useRuntimeByName(state, "mtoc_assert_double");
         pushStmt(
@@ -476,24 +479,13 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         );
       } else {
         const condC = emitExpr(state, s.cond, 0);
-        const msgTy = s.msg.ty;
-        if (isCharArray(msgTy)) {
-          useRuntimeByName(state, "mtoc_char_tensor_t");
-          useRuntimeByName(state, "mtoc_assert_double_msg_char");
-          pushStmt(
-            state,
-            level,
-            `mtoc_assert_double_msg_char(${condC}, ${emitExpr(state, s.msg, 0)});`
-          );
-        } else {
-          useRuntimeByName(state, "mtoc_string_t");
-          useRuntimeByName(state, "mtoc_assert_double_msg");
-          pushStmt(
-            state,
-            level,
-            `mtoc_assert_double_msg(${condC}, ${emitExpr(state, s.msg, 0)});`
-          );
-        }
+        useRuntimeByName(state, "mtoc_assert_double_msg_text");
+        const view = wrapTextView(state, s.msg.ty, emitExpr(state, s.msg, 0));
+        pushStmt(
+          state,
+          level,
+          `mtoc_assert_double_msg_text(${condC}, ${view});`
+        );
       }
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
       break;

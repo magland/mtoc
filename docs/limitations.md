@@ -160,17 +160,17 @@ workaround or a roadmap note.
   supported. `floor`/`ceil`/`round`/`fix` would need a componentwise
   runtime helper; `mod`/`rem` are real-only by numbl semantics.
 - **Strings are partial.** Double-quoted scalar strings (`"hello"`)
-  work for `disp`, `error("...")`, `+` concatenation between two
-  strings, and `length(s)` / `numel(s)` (folded to `1`). What's
-  deferred:
+  work for `disp`, `error`, `assert(_, msg)`, `strcmp`, `+`
+  concatenation with another string or char-array, and `length(s)` /
+  `numel(s)` (folded to `1`). What's deferred:
   - **String arrays** (`["a", "b"]`, `string(...)`) — strings are
     scalar-only today.
   - **Indexing** (`s(1)`, `s(2:3)`).
   - **Most string builtins**: `sprintf`, `strcat`, `num2str`,
     `strsplit`, `strrep`, `strtrim`, `upper`, `lower`, etc.
   - **String + numeric coercion.** numbl converts e.g. `"v=" + 1`
-    to `"v=1"`; mtoc rejects with a `TypeError` requiring both
-    operands of `+` to be strings.
+    to `"v=1"`; mtoc rejects with a `TypeError` requiring the other
+    operand of `+` to be a string or char array.
   - **Nested string concat** (`(a + b) + c`). Allowed only as the
     top-level RHS of an assignment; intermediates need a name.
   - **String returns from user functions.** Function returns are
@@ -178,9 +178,11 @@ workaround or a roadmap note.
 - **Char is partially supported.** Single-quoted char literals
   (`'a'`, `'hello'`) work for `disp`, assignment, `length`/`numel`,
   char arithmetic (`'a' + 1 == 98`, `'abc' + 1`), char comparisons
-  (`'a' == 'a'`), and horzcat (`['ab' 'cd']`). What's deferred:
+  (`'a' == 'a'`), horzcat (`['ab' 'cd']`), `error('msg')`,
+  `assert(cond, 'msg')`, `strcmp` with any combination of char-array
+  / string, and mixed `+` concatenation with a string. What's
+  deferred:
   - **2D char matrices** (`['ab'; 'cd']`).
-  - **Mixed char + string binary ops** (`'a' + "b"`).
   - **Indexing into char arrays** (`s(1)`, `s(2:3)`).
   - **Char function parameters and char return types.** User
     functions still require scalar-numeric returns.

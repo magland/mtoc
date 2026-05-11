@@ -241,11 +241,13 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_max_complex", loadSnippet("max_complex.h")],
   ["mtoc_angle_real", loadSnippet("angle_real.h")],
   // String runtime helpers. The struct typedef seeds the dependency
-  // graph; literal / copy / concat / free / assign / disp / error all
-  // pull it in. `mtoc_string_alloc_bytes` is the char-buffer
-  // allocator (siblng to `mtoc_alloc` for tensor data); copy and
-  // concat depend on it. `error` calls `exit(1)` after writing the
-  // message to stderr.
+  // graph; literal / copy / concat / free / assign all pull it in.
+  // `mtoc_string_alloc_bytes` is the char-buffer allocator (sibling
+  // to `mtoc_alloc` for tensor data); copy and concat depend on it.
+  // `disp` / `error` / `strcmp` / `string_concat` consume a
+  // `mtoc_text_view_t`; the caller wraps either source struct via
+  // `mtoc_text_from_string` / `mtoc_text_from_char_tensor` so a
+  // single helper accepts both `string` and `char` arrays.
   ["mtoc_string_t", MTOC_STRING_STRUCT],
   ["mtoc_string_empty", loadSnippet("string_empty.h", ["mtoc_string_t"])],
   [
@@ -261,6 +263,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     "mtoc_string_concat",
     loadSnippet("string_concat.h", [
       "mtoc_string_t",
+      "mtoc_text_view_t",
       "mtoc_string_alloc_bytes",
     ]),
   ],
@@ -269,14 +272,12 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     "mtoc_string_assign",
     loadSnippet("string_assign.h", ["mtoc_string_t", "mtoc_string_free"]),
   ],
-  ["mtoc_disp_string", loadSnippet("disp_string.h", ["mtoc_string_t"])],
-  ["mtoc_error_string", loadSnippet("error_string.h", ["mtoc_string_t"])],
   // Char-tensor runtime helpers. The struct typedef seeds the graph;
-  // from_literal / empty / alloc / copy / free / assign / disp_char /
-  // disp_char_tensor all pull it in. Copy depends on alloc (for the
-  // heap buffer). Free and assign are shape-agnostic (free(NULL) is
-  // well-defined). disp_char is for scalar chars (bare C `char`);
-  // disp_char_tensor is for 1×N char arrays.
+  // from_literal / empty / alloc / copy / free / assign / disp_char
+  // all pull it in. Copy depends on alloc (for the heap buffer).
+  // Free and assign are shape-agnostic (free(NULL) is well-defined).
+  // disp_char is for scalar chars (bare C `char`); multi-element
+  // char arrays route through `mtoc_disp_text` like strings.
   ["mtoc_char_tensor_t", MTOC_CHAR_TENSOR_STRUCT],
   [
     "mtoc_char_tensor_empty",
@@ -309,30 +310,27 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     ]),
   ],
   ["mtoc_disp_char", loadSnippet("disp_char.h")],
+  // Text-view runtime helpers. `mtoc_text_view_t` is the
+  // {data, len} pair every "accepts text" helper consumes; the
+  // adapters `mtoc_text_from_string` / `mtoc_text_from_char_tensor`
+  // are inlined into the same snippet because they're tiny and
+  // always travel together. `disp_text` / `error_text` /
+  // `strcmp_text` / `assert_double_msg_text` are the unified
+  // implementations.
   [
-    "mtoc_disp_char_tensor",
-    loadSnippet("disp_char_tensor.h", ["mtoc_char_tensor_t"]),
+    "mtoc_text_view_t",
+    loadSnippet("text_view.h", ["mtoc_string_t", "mtoc_char_tensor_t"]),
   ],
+  ["mtoc_disp_text", loadSnippet("disp_text.h", ["mtoc_text_view_t"])],
+  ["mtoc_error_text", loadSnippet("error_text.h", ["mtoc_text_view_t"])],
+  ["mtoc_strcmp_text", loadSnippet("strcmp_text.h", ["mtoc_text_view_t"])],
   // `assert(cond)` runtime helper. Reads a real-scalar `cond` and
   // exits non-zero on failure, no-op on success. Has no struct
   // dependencies — the only headers it pulls are <math.h> for
   // `isnan`, plus stdio/stdlib for the abort path.
   ["mtoc_assert_double", loadSnippet("assert_double.h")],
   [
-    "mtoc_assert_double_msg",
-    loadSnippet("assert_double_msg.h", ["mtoc_string_t"]),
-  ],
-  [
-    "mtoc_assert_double_msg_char",
-    loadSnippet("assert_double_msg_char.h", ["mtoc_char_tensor_t"]),
-  ],
-  // String / char-array equality. Both helpers return a real scalar
-  // (1.0 / 0.0); the BuiltinSig dispatches between them based on the
-  // arg types and bridges char-array × string mixes via
-  // `mtoc_string_from_literal` over the char-tensor's data buffer.
-  ["mtoc_strcmp_string", loadSnippet("strcmp_string.h", ["mtoc_string_t"])],
-  [
-    "mtoc_strcmp_char_tensor",
-    loadSnippet("strcmp_char_tensor.h", ["mtoc_char_tensor_t"]),
+    "mtoc_assert_double_msg_text",
+    loadSnippet("assert_double_msg_text.h", ["mtoc_text_view_t"]),
   ],
 ]);

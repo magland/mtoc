@@ -36,10 +36,10 @@ describe("translate scalar example", () => {
   it("translates a char-array literal to mtoc_char_tensor_from_literal", () => {
     // Char literals are now supported. A multi-element char ('hi')
     // assigns via mtoc_char_tensor_assign / mtoc_char_tensor_from_literal,
-    // and disp via mtoc_disp_char_tensor.
+    // and disp via the unified text-view helper.
     const c = translate("s = 'hi'; disp(s);");
     expect(c).toContain('mtoc_char_tensor_from_literal("hi", 2)');
-    expect(c).toContain("mtoc_disp_char_tensor(s);");
+    expect(c).toContain("mtoc_disp_text(mtoc_text_from_char_tensor(s));");
     expect(c).toContain("mtoc_char_tensor_t s = mtoc_char_tensor_empty();");
   });
 
@@ -313,16 +313,26 @@ describe("translate scalar example", () => {
     expect(c).toMatch(/static void mtoc_assert_double\(double cond\)/);
   });
 
-  it("assert(cond, msg) lowers to mtoc_assert_double_msg", () => {
+  it("assert(cond, msg) lowers to mtoc_assert_double_msg_text", () => {
     const c = translate('assert(1 == 1, "boom");\n');
     expect(c).toMatch(
-      /mtoc_assert_double_msg\(1\.0 == 1\.0, mtoc_string_from_literal\("boom", 4\)\);/
+      /mtoc_assert_double_msg_text\(1\.0 == 1\.0, mtoc_text_from_string\(mtoc_string_from_literal\("boom", 4\)\)\);/
     );
   });
 
   it("assert(cond, msg) accepts a string variable", () => {
     const c = translate('m = "boom";\nassert(0, m);\n');
-    expect(c).toContain("mtoc_assert_double_msg(0.0, m);");
+    expect(c).toContain(
+      "mtoc_assert_double_msg_text(0.0, mtoc_text_from_string(m));"
+    );
+  });
+
+  it("assert(cond, msg) accepts a char-array message", () => {
+    // Numbl accepts `assert(cond, 'msg')`; mtoc bridges via the text view.
+    const c = translate("assert(1, 'boom');\n");
+    expect(c).toMatch(
+      /mtoc_assert_double_msg_text\(1\.0, mtoc_text_from_char_tensor\(mtoc_char_tensor_from_literal\("boom", 4\)\)\);/
+    );
   });
 
   it("assert rejects a non-string msg with a clear message", () => {
@@ -341,11 +351,11 @@ describe("translate scalar example", () => {
   it("assert accepts a nested-string msg expression via ANF", () => {
     // ANF lifts the string concat into its own `_mtoc_anf_<N>` Assign,
     // so the assert's msg arg ends up as a `Var` that codegen routes
-    // through `mtoc_assert_double_msg`.
+    // through `mtoc_assert_double_msg_text`.
     const c = translate('a = "x";\nb = "y";\nassert(0, a + b);\n');
     expect(c).toMatch(/_mtoc_anf_/);
     expect(c).toMatch(/mtoc_string_concat/);
-    expect(c).toMatch(/mtoc_assert_double_msg/);
+    expect(c).toMatch(/mtoc_assert_double_msg_text/);
   });
 
   it("assert rejects a non-scalar-real argument with a clear message", () => {

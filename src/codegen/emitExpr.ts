@@ -15,6 +15,7 @@
 
 import type { IRExpr } from "../lowering/ir.js";
 import {
+  isCharArray,
   isMultiElement,
   isNumeric,
   isScalar,
@@ -50,6 +51,30 @@ export function tensorRowsField(ty: MType): string {
 /** C-side struct field name for the column count of a tensor handle. */
 export function tensorColsField(ty: MType): string {
   return isNumeric(ty) && ty.elem === "char" ? "cols" : "dims[1]";
+}
+
+/** Wrap an already-emitted text expression in the appropriate
+ *  `mtoc_text_from_*` adapter so it can be passed to any helper that
+ *  takes `mtoc_text_view_t` (`mtoc_disp_text`, `mtoc_error_text`,
+ *  `mtoc_strcmp_text`, `mtoc_assert_double_msg_text`,
+ *  `mtoc_string_concat`). Activates `mtoc_text_view_t` plus the
+ *  source-specific adapter as a side effect. Throws on non-text
+ *  types — callers must gate on `isText` first. */
+export function wrapTextView(
+  state: EmitState,
+  ty: MType,
+  inner: string
+): string {
+  useRuntimeByName(state, "mtoc_text_view_t");
+  if (isString(ty)) {
+    return `mtoc_text_from_string(${inner})`;
+  }
+  if (isCharArray(ty)) {
+    return `mtoc_text_from_char_tensor(${inner})`;
+  }
+  throw new Error(
+    `codegen internal: wrapTextView called on non-text type ${typeToString(ty)}`
+  );
 }
 
 /** Copy-on-arg-pass: wrap an owned-typed argument in its kind's `copy`
@@ -232,8 +257,12 @@ export function emitExpr(
         }
         useRuntimeByName(state, "mtoc_string_t");
         useRuntimeByName(state, "mtoc_string_concat");
-        const left = emitExpr(state, e.left, 0);
-        const right = emitExpr(state, e.right, 0);
+        const left = wrapTextView(state, e.left.ty, emitExpr(state, e.left, 0));
+        const right = wrapTextView(
+          state,
+          e.right.ty,
+          emitExpr(state, e.right, 0)
+        );
         return `mtoc_string_concat(${left}, ${right})`;
       }
       // Comparison / logical ops with any complex operand take a

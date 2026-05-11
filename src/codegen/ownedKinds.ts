@@ -29,7 +29,13 @@ import {
  *  `runtime.ts`); call sites activate via `useRuntimeByName` and emit
  *  the call directly. The `copy` and `disp` slots accept the value's
  *  MType so the registry can pick a complex sibling when it exists
- *  (e.g. `mtoc_tensor_copy_complex`, `mtoc_disp_tensor_complex`). */
+ *  (e.g. `mtoc_tensor_copy_complex`, `mtoc_disp_tensor_complex`).
+ *
+ *  Text kinds (string / char array) leave `disp` undefined — `Disp`
+ *  codegen routes them through `mtoc_disp_text` via a text view, a
+ *  different argument shape from the by-struct disp helpers tensors
+ *  use. Callers must check `isText` first or accept that ownedOps
+ *  may surface `disp === undefined`. */
 export interface OwnedKindOps {
   /** C type used to declare and pass the value. */
   cType: string;
@@ -47,9 +53,9 @@ export interface OwnedKindOps {
   /** Helper name for a deep copy of a value of this kind. May depend
    *  on the value's MType (real vs complex tensor, etc.). */
   copy: (ty: MType) => string;
-  /** Helper name for `disp` of a value of this kind. May depend on
-   *  the value's MType (real vs complex tensor). */
-  disp: (ty: MType) => string;
+  /** Helper name for `disp` of a value of this kind. Absent for text
+   *  kinds — those route through `mtoc_disp_text` (see header). */
+  disp?: (ty: MType) => string;
 }
 
 const STRING_OPS: OwnedKindOps = {
@@ -59,7 +65,6 @@ const STRING_OPS: OwnedKindOps = {
   free: "mtoc_string_free",
   assign: "mtoc_string_assign",
   copy: () => "mtoc_string_copy",
-  disp: () => "mtoc_disp_string",
 };
 
 const CHAR_TENSOR_OPS: OwnedKindOps = {
@@ -69,7 +74,6 @@ const CHAR_TENSOR_OPS: OwnedKindOps = {
   free: "mtoc_char_tensor_free",
   assign: "mtoc_char_tensor_assign",
   copy: () => "mtoc_char_tensor_copy",
-  disp: () => "mtoc_disp_char_tensor",
 };
 
 const DOUBLE_TENSOR_OPS: OwnedKindOps = {

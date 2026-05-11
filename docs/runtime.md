@@ -301,18 +301,20 @@ through the same lifecycle pair as tensors:
 - `mtoc_string_copy(s)` — deep-copy into a fresh heap buffer (`owned=1`).
   Used at the `c = a;` assignment path so the source remains usable.
 - `mtoc_string_concat(a, b)` — concat into a fresh heap buffer
-  (`owned=1`). Reads both inputs as views; their owned flags are
-  irrelevant here. Backs the `+` operator on string operands.
+  (`owned=1`). Takes two `mtoc_text_view_t` arguments so it can
+  accept any combination of string / char-array operands; backs the
+  `+` operator whenever at least one side is a string.
 - `mtoc_string_free(&s)` — releases the backing buffer iff `owned`,
   then resets the struct to the empty shape. Idempotent on a zeroed
   struct, so the scope-exit safety net is sound across branch merges.
 - `mtoc_string_assign(&lhs, rhs)` — consume-and-replace. Frees `*lhs`
   (no-op if not owned), moves `rhs` into place. Codegen emits this on
   every string `Assign`.
-- `mtoc_disp_string(s)` — prints the bytes through `stdout` followed
-  by a newline. Empty handles print just the newline.
-- `mtoc_error_string(s)` — backs the statement-only `error("...")`
-  builtin. Writes the message to stderr, then `exit(1)`.
+
+`disp(s)`, `error(s)`, `strcmp(a, b)`, and `assert(cond, msg)` no
+longer call string-specific helpers — they route through the shared
+text-view helpers described in the "Text view" section below, which
+accept either source kind via a zero-copy adapter.
 
 Strings ride the same early-free liveness pass as tensors (see the
 "Cleanup" section): a string `v` whose last touch is statement `s`
@@ -369,8 +371,9 @@ The lifecycle helpers (`mtoc_char_tensor_empty` /
 `_from_literal` / `_alloc` / `_copy` / `_assign` / `_free`) mirror the
 tensor and string helpers exactly, and char arrays plug into the same
 `isOwned` / early-free / scope-exit infrastructure as strings and
-double tensors. `mtoc_disp_char_tensor` and `mtoc_disp_char` print the
-bytes as text (followed by a newline), not as numeric values.
+double tensors. Scalar chars use `mtoc_disp_char`; multi-element char
+arrays route through `mtoc_disp_text` (see the "Text view" section
+below) so they share one display helper with strings.
 
 Char-arithmetic (`'a' + 1`, `'abc' + 'def'`) reads each char as a
 double on-the-fly inside the elementwise loop (`(double)v.data[i]`)
@@ -378,6 +381,60 @@ and produces a fresh double tensor. The promotion is a single read-
 site cast — there's no separate "convert char tensor to double tensor"
 pass. The outcome matches numbl: any binary arithmetic with a char
 operand widens to double.
+
+## Text view
+
+numbl distinguishes `string` (scalar handle, byte length) from `char`
+arrays (1×N row vector of bytes), but the runtime helpers that
+consume text — `disp`, `error`, `assert(_, msg)`, `strcmp`,
+`string_concat` — only need to walk the bytes. mtoc exposes a single
+non-owning view struct so each helper has one signature regardless of
+the source kind:
+
+```
+typedef struct {
+  const char *data;
+  long len;
+} mtoc_text_view_t;
+```
+
+Two zero-copy adapters live alongside it in `runtime/text_view.h`:
+
+- `mtoc_text_from_string(s)` — wraps an `mtoc_string_t` (uses `s.len`
+  directly).
+- `mtoc_text_from_char_tensor(c)` — wraps an `mtoc_char_tensor_t`
+  (uses `c.rows * c.cols`).
+
+Codegen sites that take text wrap each operand in the appropriate
+adapter at the call boundary (via `wrapTextView` in
+`codegen/emitExpr.ts`). The view is non-owning — the underlying buffer
+stays with the caller (literal in `.rodata`, owned `mtoc_string_t`,
+or owned `mtoc_char_tensor_t`) and the helpers never free.
+
+The unified helpers are:
+
+- `mtoc_disp_text(v)` — prints `v.data[0..len]` to stdout + newline.
+  Backs `disp(s)` for both string and char-array args.
+- `mtoc_error_text(v)` — writes the message to stderr, then `exit(1)`.
+  Backs `error(s)` for both kinds.
+- `mtoc_assert_double_msg_text(cond, v)` — like `mtoc_assert_double`
+  but prints the user-supplied message on failure. Backs `assert(cond,
+msg)` for any text msg.
+- `mtoc_strcmp_text(a, b)` — byte-for-byte equality on two views,
+  returning 1.0 / 0.0. Backs `strcmp(a, b)` for any combination of
+  text args.
+- `mtoc_string_concat(a, b)` — takes two views and returns a fresh
+  owned `mtoc_string_t`. Backs the `+` operator whenever at least one
+  side is a string; mixed `string + char_array` and
+  `char_array + string` both produce a string result.
+
+Adding a new text-aware helper means writing one `.h` body that takes
+`mtoc_text_view_t` (and depending on `mtoc_text_view_t` in the
+registry); the call-site dispatch is uniform via `wrapTextView`.
+
+Scalar chars (1×1 bare C `char`) are intentionally outside the text
+view today — they retain the numeric-character role (`'A' + 1`) and
+`disp('a')` still routes through `mtoc_disp_char`.
 
 ## Adding a helper
 

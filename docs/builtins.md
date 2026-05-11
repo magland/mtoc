@@ -154,28 +154,38 @@ The lowerer and codegen consume it generically.
 These hooks are how non-uniform builtin behavior stays declarative
 in the registry instead of accumulating special cases in `lower.ts`.
 
-## String-aware builtins
+## Text-aware builtins (string ↔ char-array interchange)
 
-`disp(s)` accepts a string `Var` or `StringLit` directly and produces
-`IRStmt.Disp` via its `lowerStmt` hook; codegen picks
-`mtoc_disp_string` based on the arg's `MType`. `error("...")` is the
-parallel `IRStmt.Error`, also produced by a `lowerStmt` hook.
-`assert(cond)` and `assert(cond, msg)` produce `IRStmt.Assert` via
-their `lowerStmt` hook; codegen dispatches across three runtime
-helpers: `mtoc_assert_double` (no message), `mtoc_assert_double_msg`
-(string message), and `mtoc_assert_double_msg_char` (char-array
-message). All three fail on a zero or NaN cond and are no-ops
-otherwise. The msg arg must be a string `Var`/`StringLit` or a
-char-array `Var`/`CharLit`; nested string/char expressions must be
-assigned to a name first. The tensor-condition form (numbl fails if
-any element is zero/NaN) is deferred — raises `UnsupportedConstruct`.
+numbl treats `string` (double-quoted) and `char` arrays (single-quoted)
+as separate types, but most "text-accepting" builtins should work the
+same regardless of which form a user wrote. mtoc routes every such
+builtin through one C helper that consumes an `mtoc_text_view_t` (a
+non-owning `{data, len}` pair), with the caller wrapping either source
+struct via `mtoc_text_from_string` / `mtoc_text_from_char_tensor`.
 
-`strcmp(a, b)` accepts char arrays and strings in any combination.
-Both arms get normalized to a `(data, len)` view inside their helper:
-char-tensor × char-tensor uses `mtoc_strcmp_char_tensor`, anything
-involving a string uses `mtoc_strcmp_string` (the char-array side
-gets bridged through `mtoc_string_from_literal(.data, .cols)`).
-Returns a real scalar (1.0 / 0.0).
+The `isText(t)` predicate in `lowering/types.ts` is the seed —
+`isString(t) || isCharArray(t)`. Scalar chars are intentionally
+excluded (they're bare C `char` and keep their numeric character
+role; `disp('a')` still routes through `mtoc_disp_char`).
+
+The text-view-aware builtins:
+
+- **`disp(s)`** accepts a string / char-array `Var`, `StringLit`,
+  `CharLit`, or any ANF-hoistable owned producer. Codegen emits
+  `mtoc_disp_text(<view>);` for both source kinds.
+- **`error(msg)`** accepts the same shapes as `disp`'s text arg and
+  emits `mtoc_error_text(<view>);`. Both `error("boom")` and
+  `error('boom')` work.
+- **`assert(cond)`** uses `mtoc_assert_double` (no message).
+  **`assert(cond, msg)`** emits `mtoc_assert_double_msg_text(<cond>,
+<view>);` where `msg` is any text value (string or char array).
+  Both fail on a zero or NaN cond and are no-ops otherwise; the
+  tensor-condition form (numbl fails if any element is zero/NaN) is
+  deferred and raises `UnsupportedConstruct`.
+- **`strcmp(a, b)`** accepts any pair of strings / char arrays. The
+  builtin's `emit` closure wraps each arg via the appropriate
+  `mtoc_text_from_*` adapter and emits a single `mtoc_strcmp_text(va,
+vb)` call returning a real scalar (1.0 / 0.0).
 
 Numeric predicates `isnan(x)` / `isinf(x)` / `isfinite(x)` and the
 `logical(x)` coercion are inlined as expression-level emits — no
@@ -192,9 +202,14 @@ Call that reads `.cols` from the `mtoc_char_tensor_t` struct — no
 runtime helper needed. Tensor / numeric arguments fall through to
 the default `reduceTensor` validate / build path.
 
-String concat (`+` on two strings) is handled in the binary lowering
-path, not as a builtin; it produces a `Binary(Add, …)` IR node typed
-as `STRING` and codegen emits `mtoc_string_concat(...)`.
+String concat (`+`) is handled in the binary lowering path, not as a
+builtin. Whenever at least one operand is a string and the other is
+text (string or char array), the lowerer produces a `Binary(Add, …)`
+IR node typed as `STRING`; codegen emits
+`mtoc_string_concat(<view_left>, <view_right>)` which takes two
+`mtoc_text_view_t` arguments and returns a fresh owned `mtoc_string_t`.
+char-array + char-array is NOT concat — it falls through to the
+numeric path for element-wise addition.
 
 ## Caveats
 

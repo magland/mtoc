@@ -1,16 +1,18 @@
-/* mtoc runtime helper: concatenate two string handles into a fresh
+/* mtoc runtime helper: concatenate two text views into a fresh
  * heap-allocated owned string.
  *
- * Implements numbl's `"a" + "b" == "ab"` semantics. Both inputs are
- * read-only views (their `owned` flag is irrelevant here — they
- * remain the caller's responsibility). The returned handle owns its
- * buffer; the caller must pass it to `mtoc_string_assign` (which
- * takes ownership) or `mtoc_string_free`.
+ * Implements numbl's `"a" + "b" == "ab"` semantics, generalized to
+ * accept either strings or char arrays on each side (numbl coerces
+ * char into string at the `+` boundary; mtoc bridges via the text
+ * view at the call site). Both inputs are non-owning views; the
+ * returned handle owns its buffer and the caller must pass it to
+ * `mtoc_string_assign` (which takes ownership) or
+ * `mtoc_string_free`.
  */
 
 #include <string.h>
 
-static mtoc_string_t mtoc_string_concat(mtoc_string_t a, mtoc_string_t b) {
+static mtoc_string_t mtoc_string_concat(mtoc_text_view_t a, mtoc_text_view_t b) {
   long alen = a.len > 0 ? a.len : 0;
   long blen = b.len > 0 ? b.len : 0;
   long total = alen + blen;

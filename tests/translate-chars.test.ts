@@ -21,7 +21,7 @@ describe("chars", () => {
     expect(c).toContain("mtoc_char_tensor_t s = mtoc_char_tensor_empty();");
     expect(c).toContain('mtoc_char_tensor_from_literal("abc", 3)');
     expect(c).toContain("mtoc_char_tensor_assign(&s,");
-    expect(c).toContain("mtoc_disp_char_tensor(s);");
+    expect(c).toContain("mtoc_disp_text(mtoc_text_from_char_tensor(s));");
     expect(c).toContain("mtoc_char_tensor_free(&s);");
   });
 

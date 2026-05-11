@@ -64,7 +64,7 @@ describe("indexing — scalar reads", () => {
     const c = translate("s = 'abc';\ndisp(s(2));\n");
     expect(c).toMatch(/s\.data\[\(long\)\(2\.0\) - 1L\]/);
     // Result is a scalar char — disp goes through mtoc_disp_char (NOT
-    // mtoc_disp_char_tensor, which is for whole arrays).
+    // mtoc_disp_text, which is for whole text values).
     expect(c).toContain("mtoc_disp_char(s.data[");
   });
 

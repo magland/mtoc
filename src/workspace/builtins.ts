@@ -24,6 +24,7 @@ import {
   isScalar,
   isScalarReal,
   isString,
+  isText,
   numericTypeND,
   rowVecDouble,
   scalarComplex,
@@ -440,7 +441,7 @@ const BUILTINS: BuiltinSig[] = [
   // hook before the default expression-call path; it produces a
   // dedicated IR node (`IRStmt.Disp` / `IRStmt.Error`) that codegen
   // recognizes for kind-specific output (e.g. `mtoc_disp_double`,
-  // `mtoc_disp_tensor`, `mtoc_error_string`). The expression-position
+  // `mtoc_disp_tensor`, `mtoc_error_text`). The expression-position
   // emit closures throw — `category === "stmt"` ensures the lowerer
   // never reaches them.
   {
@@ -542,23 +543,23 @@ const BUILTINS: BuiltinSig[] = [
       let msg: IRExpr | null = null;
       if (args.length === 2) {
         msg = ctx.lowerExpr(args[1]);
-        const isText = isString(msg.ty) || isCharArray(msg.ty);
-        if (!isText) {
+        if (!isText(msg.ty)) {
           throw new UnsupportedConstruct(
             `'assert' message must be a string or char array ` +
               `(got ${typeToString(msg.ty)})`,
             args[1].span
           );
         }
-        const isStr = isString(msg.ty);
-        const allowedKinds = isStr
-          ? new Set(["Var", "StringLit"])
-          : new Set(["Var", "CharLit"]);
-        // Owned-producing msg expressions (e.g. string concat,
-        // user-func string return) are admitted here because the
-        // post-lowering ANF pass hoists them into their own
-        // `_mtoc_anf_<N>` Assigns, leaving a `Var` for codegen.
-        if (!allowedKinds.has(msg.kind) && !isOwnedProducer(msg)) {
+        // Codegen wraps `msg` in a text view (`mtoc_text_from_string`
+        // / `mtoc_text_from_char_tensor`), so a single helper accepts
+        // either source kind. The msg expression itself needs to be a
+        // named handle: a literal (`StringLit` / `CharLit`), a `Var`,
+        // or an owned-producing expression that ANF hoists into a
+        // `_mtoc_anf_<N>` Assign before codegen sees it.
+        const isLiteralKind =
+          (isString(msg.ty) && msg.kind === "StringLit") ||
+          (isCharArray(msg.ty) && msg.kind === "CharLit");
+        if (msg.kind !== "Var" && !isLiteralKind && !isOwnedProducer(msg)) {
           throw new UnsupportedConstruct(
             `'assert' message must be a literal or variable; ` +
               `assign the value to a name first`,
@@ -570,9 +571,10 @@ const BUILTINS: BuiltinSig[] = [
     },
   },
 
-  // `error(s)` raises a numbl RuntimeError; codegen emits
-  // `mtoc_error_string(arg);`. Today only the single-string-argument
-  // form is accepted; `error(id, fmt, …)` shapes are deferred.
+  // `error(msg)` raises a numbl RuntimeError; codegen emits
+  // `mtoc_error_text(view);`. Accepts either a string or a char-array
+  // message (numbl treats them interchangeably here); the codegen
+  // bridges via the text view. `error(id, fmt, …)` shapes are deferred.
   {
     name: "error",
     category: "stmt",
@@ -593,24 +595,23 @@ const BUILTINS: BuiltinSig[] = [
     lowerStmt: (ctx, args, span) => {
       if (args.length !== 1) return null;
       const arg = ctx.lowerExpr(args[0]);
-      if (!isString(arg.ty)) {
+      if (!isText(arg.ty)) {
         throw new UnsupportedConstruct(
-          `'error' currently requires a single string argument ` +
+          `'error' currently requires a single string or char-array argument ` +
             `(got ${typeToString(arg.ty)})`,
           args[0].span
         );
       }
-      // Owned-producing string args (concat / user-func string return)
-      // are admitted here because the post-lowering ANF pass hoists
-      // them into their own `_mtoc_anf_<N>` Assigns, so codegen sees a
-      // `Var`.
-      if (
-        arg.kind !== "Var" &&
-        arg.kind !== "StringLit" &&
-        !isOwnedProducer(arg)
-      ) {
+      // Codegen needs a named addressable handle (`Var`), a non-owning
+      // literal (`StringLit` / `CharLit`), or an owned-producing
+      // expression that ANF hoists into a `_mtoc_anf_<N>` Assign
+      // before codegen sees it.
+      const isLiteralKind =
+        (isString(arg.ty) && arg.kind === "StringLit") ||
+        (isCharArray(arg.ty) && arg.kind === "CharLit");
+      if (arg.kind !== "Var" && !isLiteralKind && !isOwnedProducer(arg)) {
         throw new UnsupportedConstruct(
-          `'error' of a string expression is only supported for string ` +
+          `'error' of a text expression is only supported for ` +
             `literals or variables; assign the value to a name first`,
           args[0].span
         );
@@ -632,13 +633,13 @@ const BUILTINS: BuiltinSig[] = [
 
   // ── String / char comparison ─────────────────────────────────────────
   // `strcmp(a, b)` returns 1.0 if the two text values match
-  // byte-for-byte, 0.0 otherwise. Accepts (char-array, char-array),
-  // (string, string), or any mix of the two — both arms get
-  // normalized to a (data*, len) view inside their helper. Scalar
-  // chars (bare `char`) are still rejected today since the test
-  // corpus doesn't need them; numbl returns 0 for type-mismatched
-  // inputs (e.g. number vs string), but we'd rather raise a span at
-  // lowering than silently always-return-0.
+  // byte-for-byte, 0.0 otherwise. Accepts strings and char arrays in
+  // any combination — both arms get wrapped in a text view at the
+  // call site and dispatched through a single `mtoc_strcmp_text`
+  // helper. Scalar chars (bare `char`) are still rejected today
+  // since the test corpus doesn't need them; numbl returns 0 for
+  // type-mismatched inputs (e.g. number vs string), but we'd rather
+  // raise a span at lowering than silently always-return-0.
   {
     name: "strcmp",
     category: "expr",
@@ -658,38 +659,19 @@ const BUILTINS: BuiltinSig[] = [
     ],
     result: () => scalarDouble("nonnegative"),
     emit: (args, argTys, state) => {
-      const aS = isString(argTys[0]);
-      const bS = isString(argTys[1]);
-      const aC = isCharArray(argTys[0]);
-      const bC = isCharArray(argTys[1]);
-      if (aS && bS) {
-        state.useRuntime("mtoc_strcmp_string");
-        return `mtoc_strcmp_string(${args[0]}, ${args[1]})`;
-      }
-      if (aC && bC) {
-        state.useRuntime("mtoc_strcmp_char_tensor");
-        return `mtoc_strcmp_char_tensor(${args[0]}, ${args[1]})`;
-      }
-      // Mixed char-array × string — promote the char-array view into
-      // the string helper's (data, len, owned=0) shape inline.
-      state.useRuntime("mtoc_strcmp_string");
-      const aExpr = aS
-        ? args[0]
-        : `mtoc_string_from_literal(${args[0]}.data, ${args[0]}.cols)`;
-      const bExpr = bS
-        ? args[1]
-        : `mtoc_string_from_literal(${args[1]}.data, ${args[1]}.cols)`;
-      if (!aS) state.useRuntime("mtoc_string_from_literal");
-      if (!bS) state.useRuntime("mtoc_string_from_literal");
-      return `mtoc_strcmp_string(${aExpr}, ${bExpr})`;
+      state.useRuntime("mtoc_strcmp_text");
+      state.useRuntime("mtoc_text_view_t");
+      const view = (i: number): string => {
+        if (isString(argTys[i])) return `mtoc_text_from_string(${args[i]})`;
+        return `mtoc_text_from_char_tensor(${args[i]})`;
+      };
+      return `mtoc_strcmp_text(${view(0)}, ${view(1)})`;
     },
     lowerExpr: (_ctx, args, span) => {
       if (args.length !== 2) return null;
       const a = args[0].ty;
       const b = args[1].ty;
-      const okA = isString(a) || isCharArray(a);
-      const okB = isString(b) || isCharArray(b);
-      if (!okA || !okB) {
+      if (!isText(a) || !isText(b)) {
         throw new UnsupportedConstruct(
           `'strcmp' currently requires both arguments to be ` +
             `char arrays or strings (got ${typeToString(a)} ` +

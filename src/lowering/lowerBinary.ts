@@ -24,6 +24,7 @@ import {
   isScalarReal,
   isNumeric,
   isString,
+  isText,
   numericTypeND,
   rowVecDouble,
   scalarComplex,
@@ -116,27 +117,16 @@ export function lowerBinary(
       span: e.span,
     };
   }
-  // String concatenation: `+` on two strings is the only string-typed
-  // binary op mtoc supports today. numbl also coerces string + number
-  // / string + bool / etc., but mtoc requires both operands to be
-  // strings to keep the codegen path concretely typed; mismatches
-  // surface as a `TypeError` so the user can wrap the other side
-  // explicitly (today: just use a string variable). Any non-Add op on
-  // a string operand is rejected.
-  //
-  // Mixed char + string is out of scope: numbl bridges at runtime but
-  // the codegen path is non-trivial. Reject with a clear message.
-  const leftIsChar = isNumeric(left.ty) && left.ty.elem === "char";
-  const rightIsChar = isNumeric(right.ty) && right.ty.elem === "char";
+  // String concatenation: `+` lowers to a string-typed Binary whenever
+  // at least one operand is a string. The other operand may be a
+  // string or a char-array (numbl coerces char into string at the `+`
+  // boundary); mtoc bridges via the text view at codegen. A scalar
+  // char or any non-text operand still rejects with a `TypeError` so
+  // the user can wrap the other side explicitly. Any non-Add op on a
+  // string operand is rejected. char-array + char-array is NOT
+  // concat — it's element-wise numeric addition, handled by the
+  // numeric path below.
   if (isString(left.ty) || isString(right.ty)) {
-    if (leftIsChar || rightIsChar) {
-      throw new UnsupportedConstruct(
-        `binary ${e.op} on char and string operands is not yet supported ` +
-          `(mtoc does not bridge char and string types; ` +
-          `use double-quoted strings for concatenation)`,
-        e.span
-      );
-    }
     if (e.op !== "Add") {
       throw new UnsupportedConstruct(
         `binary ${e.op} on string operands is not supported ` +
@@ -144,9 +134,10 @@ export function lowerBinary(
         e.span
       );
     }
-    if (!isString(left.ty) || !isString(right.ty)) {
+    if (!isText(left.ty) || !isText(right.ty)) {
       throw new TypeError(
-        `binary + requires both operands to be strings ` +
+        `binary + with a string operand requires the other operand to ` +
+          `be a string or char array ` +
           `(got ${typeToString(left.ty)} and ${typeToString(right.ty)})`,
         e.span
       );

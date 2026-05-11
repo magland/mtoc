@@ -170,19 +170,31 @@ The subset is growing iteratively. Roughly:
   `floor`/`ceil`/`round`/`fix`, `mod`/`rem`, and `^` stay real-only
   for now (numbl-semantics or pending implementation work).
 - Strings (numbl `string`, scalar only): double-quoted literals
-  (`"hello"`), concatenation via `+` (`"a" + "b" == "ab"`), `disp`,
-  `error("msg")`, and the introspection builtins `length(s)` and
-  `numel(s)` (both folded to `1` per numbl semantics). Stored as a
-  small `mtoc_string_t` struct (data pointer + byte length + owned
-  flag); literals point at `.rodata` while concat results allocate
-  a fresh buffer. String arrays, string indexing, `sprintf`/`strcat`/
-  `num2str`, and string + numeric coercion are deferred.
+  (`"hello"`), concatenation via `+` with another string or char
+  array (`"a" + "b" == "ab"`, `"hi " + 'there' == "hi there"`),
+  `disp`, `error("msg")`, `assert(_, "msg")`, `strcmp`, and the
+  introspection builtins `length(s)` / `numel(s)` (both folded to `1`
+  per numbl semantics). Stored as a small `mtoc_string_t` struct
+  (data pointer + byte length + owned flag); literals point at
+  `.rodata` while concat results allocate a fresh buffer. String
+  arrays, string indexing, `sprintf`/`strcat`/`num2str`, and string +
+  numeric coercion are deferred.
 - Char (numbl `char`, single-quoted `'...'`): scalar chars (`'a'`),
   char arrays (`'hello'`), `disp`, `length`/`numel`, horzcat
-  (`['ab' 'cd']`), arithmetic (`'a' + 1 == 98`, `'abc' + 1`), and
-  comparisons (`'a' == 'a'`, `'abc' == 'abd'`). Scalar chars are bare
-  C `char`; char arrays use `mtoc_char_tensor_t`. Char + string binary
-  ops, 2D char matrices, and char indexing are deferred.
+  (`['ab' 'cd']`), arithmetic (`'a' + 1 == 98`, `'abc' + 1`),
+  comparisons (`'a' == 'a'`, `'abc' == 'abd'`), `error('msg')`,
+  `assert(_, 'msg')`, `strcmp` with any combination of char-array /
+  string, and mixed `+` concat with a string. Scalar chars are bare
+  C `char`; char arrays use `mtoc_char_tensor_t`. 2D char matrices
+  and char indexing are deferred.
+- Text view (`mtoc_text_view_t`): a non-owning `{data, len}` adapter
+  every "accepts text" runtime helper consumes. `disp`, `error`,
+  `assert(_, msg)`, `strcmp`, and `string_concat` each route through
+  a single helper that takes a view, with the call site wrapping
+  either source struct via `mtoc_text_from_string` /
+  `mtoc_text_from_char_tensor`. The TS-side predicate is
+  [`isText`](src/lowering/types.ts) — see
+  [docs/runtime.md](docs/runtime.md#text-view) for details.
 
 Anything outside the supported subset raises `UnsupportedConstruct` with a
 source span pointing to the offending line.
