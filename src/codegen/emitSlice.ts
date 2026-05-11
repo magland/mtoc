@@ -111,6 +111,7 @@ function emitSingleSlotSliceRead(
           "should have been caught at lowering"
       );
     }
+    useRuntimeByName(state, "mtoc_loop_count");
     const startStr = emitExpr(state, slot.start, 0);
     const endStr = emitExpr(state, slot.end, 0);
     const stepStr = formatNumLit(slot.step.value);
@@ -119,9 +120,8 @@ function emitSingleSlotSliceRead(
     pushStmt(
       state,
       level + 1,
-      `long _mtoc_n = (long)floor((_mtoc_end - _mtoc_start) / ${stepStr}) + 1;`
+      `long _mtoc_n = mtoc_loop_count(_mtoc_start, _mtoc_end, ${stepStr});`
     );
-    pushStmt(state, level + 1, `if (_mtoc_n < 0) _mtoc_n = 0;`);
     count = "_mtoc_n";
     srcIndexFor = k => `(long)(_mtoc_start + ${stepStr} * (double)${k}) - 1L`;
     if (isRowVec(baseTy)) {
@@ -317,6 +317,7 @@ function emitSliceSlotSetup(
             "should have been caught at lowering"
         );
       }
+      useRuntimeByName(state, "mtoc_loop_count");
       const startStr = emitExpr(state, slot.start, 0);
       const endStr = emitExpr(state, slot.end, 0);
       const stepStr = formatNumLit(slot.step.value);
@@ -325,13 +326,11 @@ function emitSliceSlotSetup(
       pushStmt(
         state,
         level,
-        `long _mtoc_n_${i} = (long)floor((_mtoc_end_${i} - _mtoc_start_${i}) / ${stepStr}) + 1;`
+        `long _mtoc_n_${i} = mtoc_loop_count(_mtoc_start_${i}, _mtoc_end_${i}, ${stepStr});`
       );
-      pushStmt(state, level, `if (_mtoc_n_${i} < 0) _mtoc_n_${i} = 0;`);
       slotSrc.push(
         `((long)(_mtoc_start_${i} + ${stepStr} * (double)${kVar}) - 1L)`
       );
-      state.needMath.value = true;
     }
   }
   return slotSrc;
@@ -397,6 +396,7 @@ export function emitIndexSliceStore(
           "should have been caught at lowering"
       );
     }
+    useRuntimeByName(state, "mtoc_loop_count");
     const startStr = emitExpr(state, slot.start, 0);
     const endStr = emitExpr(state, slot.end, 0);
     const stepStr = formatNumLit(slot.step.value);
@@ -405,11 +405,9 @@ export function emitIndexSliceStore(
     pushStmt(
       state,
       level + 1,
-      `long _mtoc_n = (long)floor((_mtoc_end - _mtoc_start) / ${stepStr}) + 1;`
+      `long _mtoc_n = mtoc_loop_count(_mtoc_start, _mtoc_end, ${stepStr});`
     );
-    pushStmt(state, level + 1, `if (_mtoc_n < 0) _mtoc_n = 0;`);
     dstOffsetFor = k => `(long)(_mtoc_start + ${stepStr} * (double)${k}) - 1L`;
-    state.needMath.value = true;
   } else {
     // Single-slot Scalar should have routed through IndexStore.
     throw new Error(

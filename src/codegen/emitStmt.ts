@@ -646,6 +646,7 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // Linear-path freedOwned: snapshot/restore around the body
       // for the same reason as `While` — body may iterate zero
       // times, so frees inside don't graduate to the post-loop set.
+      useRuntimeByName(state, "mtoc_loop_count");
       const preFreed = new Set(state.freedOwned);
       pushStmt(state, level, `{`);
       pushStmt(state, level + 1, `double _mtoc_start = ${startStr};`);
@@ -653,9 +654,8 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       pushStmt(
         state,
         level + 1,
-        `long _mtoc_n = (long)floor((_mtoc_end - _mtoc_start) / ${stepStr}) + 1;`
+        `long _mtoc_n = mtoc_loop_count(_mtoc_start, _mtoc_end, ${stepStr});`
       );
-      pushStmt(state, level + 1, `if (_mtoc_n < 0) _mtoc_n = 0;`);
       pushStmt(
         state,
         level + 1,

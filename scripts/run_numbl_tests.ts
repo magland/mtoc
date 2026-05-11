@@ -141,11 +141,12 @@ async function runOne(rel: string): Promise<Result> {
     };
   }
   // The convention is that a passing numbl test prints SUCCESS as
-  // the final line; intermediate disp output is fine. Ignore a
-  // trailing newline from the CLI.
-  const lines = stdout.split("\n");
+  // the final line; intermediate disp output is fine. Split on
+  // either line ending and trim any trailing CR / blank lines so a
+  // CRLF-emitting environment doesn't mask a passing test.
+  const lines = stdout.split(/\r?\n/);
   while (lines.length && lines[lines.length - 1] === "") lines.pop();
-  const last = lines[lines.length - 1] ?? "";
+  const last = (lines[lines.length - 1] ?? "").replace(/\r$/, "");
   if (last === "SUCCESS") {
     return { rel, category: "PASS", detail: null };
   }

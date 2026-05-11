@@ -302,7 +302,7 @@ describe("indexing — range and colon reads", () => {
     expect(c).toContain("double _mtoc_start_0 = 1.0;");
     expect(c).toContain("double _mtoc_end_0 = 2.0;");
     expect(c).toContain(
-      "long _mtoc_n_0 = (long)floor((_mtoc_end_0 - _mtoc_start_0) / 1.0) + 1;"
+      "long _mtoc_n_0 = mtoc_loop_count(_mtoc_start_0, _mtoc_end_0, 1.0);"
     );
     expect(c).toContain("long _mtoc_n_1 = M.dims[1];");
     // The range slot's source uses _mtoc_k_0 inside the loop body.
@@ -476,7 +476,7 @@ describe("indexing — range and colon writes", () => {
     );
     // The codegen emits the count formula + a runtime check before
     // the loop.
-    expect(c).toMatch(/long _mtoc_n = \(long\)floor\(/);
+    expect(c).toMatch(/long _mtoc_n = mtoc_loop_count\(/);
     expect(c).toContain("long _mtoc_rhs_n = w.dims[0] * w.dims[1];");
     expect(c).toContain("if (_mtoc_n != _mtoc_rhs_n)");
     expect(c).toContain("range-write count mismatch");

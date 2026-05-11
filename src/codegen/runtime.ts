@@ -132,6 +132,7 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_disp_complex", MTOC_DISP_COMPLEX],
   ["mtoc_tensor_t", MTOC_TENSOR_STRUCT],
   ["mtoc_alloc", MTOC_ALLOC],
+  ["mtoc_loop_count", loadSnippet("loop_count.h")],
   // Tensor lifecycle helpers. Every multi-element Assign + scope-exit
   // path goes through these, so generated C reads close to the numbl
   // source — `mtoc_tensor_assign(&x, mtoc_tensor_from_row(..., 3));`

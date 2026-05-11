@@ -11,7 +11,13 @@
 #include <stdlib.h>
 
 static double *mtoc_alloc(size_t n_bytes) {
-  double *p = (double *)malloc(n_bytes);
+  /* `malloc(0)` is implementation-defined: glibc returns a non-NULL
+   * sentinel, but some C libraries return NULL — which would trip
+   * the OOM abort below on a perfectly valid empty-tensor request.
+   * Clamp to a 1-byte allocation so the contract "return non-NULL or
+   * abort on OOM" holds uniformly. The caller never reads from a
+   * zero-element buffer, so the wasted byte is irrelevant. */
+  double *p = (double *)malloc(n_bytes == 0 ? 1 : n_bytes);
   if (!p) {
     fprintf(stderr, "mtoc: out of memory (mtoc_alloc requested %zu bytes)\n",
             n_bytes);
