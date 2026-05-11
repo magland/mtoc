@@ -36,6 +36,7 @@ import {
   isCharArray,
   isCharScalar,
   isMultiElement,
+  isOwned,
   isScalar,
   isScalarReal,
   isString,
@@ -69,6 +70,7 @@ import {
   forEachSubExpr,
   forEachTopLevelExpr,
 } from "./walk.js";
+import { anfNormalize } from "./anf.js";
 
 // Reserved C identifiers that need mangling. Mirrors numbl's
 // cJit/codegen.ts list. Centralized here so emit.ts never has to
@@ -822,28 +824,43 @@ export class Lowerer {
 }
 
 /**
- * Owned-allocating expression kinds: expressions that produce a fresh
- * heap-owned value at runtime and therefore can only appear at the
- * top of `Assign.rhs`, where the surrounding `mtoc_*_assign` takes
- * ownership. Anywhere nested would leak the temporary buffer.
+ * Owned-allocating expression kinds: expressions whose evaluation
+ * returns a fresh heap-owned value at runtime (tensor / char tensor /
+ * string). The post-lowering ANF pass (`src/lowering/anf.ts`) hoists
+ * every such expression that isn't already at the top of an owned-LHS
+ * `Assign.rhs` into a synthetic `Assign` to a `_mtoc_anf_<N>` temp,
+ * so after ANF an owned producer appears at exactly one position: the
+ * full RHS of an owned-LHS `Assign`. This validator verifies that
+ * invariant.
  *
  * - `tensor-lit`: every TensorLit allocates a fresh tensor.
  * - `string-concat`: a string-typed `Binary` (`+`) calls
  *   `mtoc_string_concat`, which returns an owned handle.
  * - `index-slice`: an `IndexSlice` (range/colon read) allocates a
  *   fresh tensor sized by the index range.
+ * - `user-call`: a `Call` to a user-defined function whose result is
+ *   owned (`isOwned`), returned by struct value from the callee.
  *
  * `Var` is never an owned-allocating expression — it just reads an
  * already-owned heap value; the read doesn't transfer ownership.
- * Similarly `StringLit` points at `.rodata` (zero allocation) and
- * is fine anywhere.
+ * `StringLit` points at `.rodata` (zero allocation) and is fine
+ * anywhere. Elementwise scalar builtin Calls and Binary/Unary nodes
+ * also don't allocate at the call site — they fold into iter-loop
+ * staging buffers managed by `emitTensorAssignFromExpr`.
  */
-type OwnedExprKind = "tensor-lit" | "string-concat" | "index-slice";
+type OwnedExprKind =
+  | "tensor-lit"
+  | "string-concat"
+  | "index-slice"
+  | "user-call";
 
 function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
   if (e.kind === "TensorLit") return "tensor-lit";
   if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
   if (e.kind === "IndexSlice") return "index-slice";
+  if (e.kind === "Call" && e.callee.kind === "userFunc" && isOwned(e.ty)) {
+    return "user-call";
+  }
   return null;
 }
 
@@ -851,32 +868,34 @@ function ownedExprMessage(kind: OwnedExprKind): string {
   switch (kind) {
     case "tensor-lit":
       return (
-        "tensor literals are only supported as the right-hand side of an " +
-        "assignment (not inside a larger expression)"
+        "internal: tensor literal still nested inside another expression " +
+        "after ANF; ANF pass should have hoisted it"
       );
     case "string-concat":
       return (
-        "string concatenation (`+`) is only supported as the top-level " +
-        "right-hand side of an assignment; assign intermediate " +
-        "concatenations to a variable first"
+        "internal: string concatenation still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
       );
     case "index-slice":
       return (
-        "range/colon indexing is only supported as the top-level " +
-        "right-hand side of an assignment; assign the slice to a " +
-        "variable first"
+        "internal: range/colon index slice still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
+      );
+    case "user-call":
+      return (
+        "internal: owned-returning user-function call still nested " +
+        "inside another expression after ANF; ANF pass should have " +
+        "hoisted it"
       );
   }
 }
 
 /**
- * Reject any owned-allocating sub-expression — a TensorLit anywhere,
- * or a string-typed `Binary` (concat) anywhere. The expression
- * passed in is itself checked, so call sites that *do* permit a
- * top-level owned producer (the supported `Assign.rhs` shapes)
- * recurse into the operands directly instead of calling this helper
- * on the whole RHS. CharLit produces a non-owning handle (or a bare
- * char literal) and is safe anywhere.
+ * Reject any owned-allocating sub-expression that ANF didn't hoist.
+ * After ANF the IR satisfies "owned producers only appear as the
+ * full RHS of an owned-LHS Assign"; this walker enforces that on
+ * every expression position EXCEPT the cases the caller has already
+ * exempted (the direct-consume Assign.rhs).
  */
 function rejectNestedOwnedExpr(e: IRExpr): void {
   forEachSubExpr(e, sub => {
@@ -888,16 +907,13 @@ function rejectNestedOwnedExpr(e: IRExpr): void {
 }
 
 /**
- * Reject `Call` nodes inside a multi-element tensor expression EXCEPT
- * element-wise builtin calls — those render naturally inside the
- * iter-loop because each arg's per-slot rendering produces a scalar C
- * expression that the builtin's `emit` closure consumes unchanged
- * (e.g. `sqrt(x.real[_mtoc_i])`).
- *
- * Reductions (`sum`, `length`, `numel`), user-function calls, and any
- * builtin with a non-scalar param shape still reject — they need a
- * full-tensor view of their argument, which can't be rendered inside
- * the iter loop where multi-element `Var`s collapse to `.real[<iter>]`.
+ * Reject non-elementwise `Call` nodes inside a multi-element tensor
+ * expression. After ANF every owned-producing user-func Call has
+ * been hoisted into its own Assign, so what remains under a multi-
+ * element expression is either an elementwise builtin Call (which
+ * lifts slot-by-slot in the iter loop) or a reduction-style Call
+ * whose tensor arg has been collapsed to a per-slot scalar — the
+ * latter is wrong, so reject it with a span.
  */
 function rejectCallInTensorContext(e: IRExpr): void {
   forEachSubExpr(e, sub => {
@@ -908,8 +924,8 @@ function rejectCallInTensorContext(e: IRExpr): void {
     throw new UnsupportedConstruct(
       `function calls inside a multi-element tensor expression are not ` +
         `yet supported here (only element-wise scalar builtins like ` +
-        `sqrt/sin/abs lift over tensors automatically; assign other ` +
-        `call results to a name first)`,
+        `sqrt/sin/abs lift slot-by-slot; assign other call results to ` +
+        `a name first)`,
       sub.span
     );
   });
@@ -917,14 +933,14 @@ function rejectCallInTensorContext(e: IRExpr): void {
 
 function validateStmt(s: IRStmt): void {
   if (s.kind === "Assign") {
-    // `Assign.rhs` is the one position that *permits* a top-level
-    // owned producer (TensorLit / string concat). Recurse into the
-    // operands of that producer; everything else gets the whole
-    // expression checked.
+    // The only position that permits a top-level owned producer is
+    // the RHS of an owned-LHS Assign whose RHS kind matches the
+    // producer's classification — the ANF pass leaves that direct
+    // consume site intact and lifts everything else. Recurse into
+    // the producer's operands (those positions are nested), and run
+    // the standard rejection on any other RHS shape.
     const top = classifyOwnedExpr(s.rhs);
     if (top === "tensor-lit") {
-      // TensorLit cells were required to be scalar-real at lowering;
-      // still check none of them is itself an owned producer.
       const tl = s.rhs as Extract<IRExpr, { kind: "TensorLit" }>;
       for (const row of tl.elements) {
         for (const cell of row) rejectNestedOwnedExpr(cell);
@@ -934,15 +950,15 @@ function validateStmt(s: IRStmt): void {
       rejectNestedOwnedExpr(b.left);
       rejectNestedOwnedExpr(b.right);
     } else if (top === "index-slice") {
-      // Recurse into the slice's index components — a nested
-      // owned producer in `start` / `step` / `end` would leak. The
-      // base is a Var read (never an owned producer) so it's safe.
       const slice = s.rhs as Extract<IRExpr, { kind: "IndexSlice" }>;
       if (slice.index.kind === "Range") {
         rejectNestedOwnedExpr(slice.index.start);
         rejectNestedOwnedExpr(slice.index.step);
         rejectNestedOwnedExpr(slice.index.end);
       }
+    } else if (top === "user-call") {
+      const call = s.rhs as Extract<IRExpr, { kind: "Call" }>;
+      for (const a of call.args) rejectNestedOwnedExpr(a);
     } else {
       rejectNestedOwnedExpr(s.rhs);
       if (isMultiElement(s.rhs.ty)) {
@@ -951,20 +967,16 @@ function validateStmt(s: IRStmt): void {
     }
     return;
   }
-  // Every other stmt accepts the same rule for each top-level
-  // expression it directly holds: no owned producers anywhere in the
-  // tree. Body recursion is handled by `forEachStmtInTree` at the
-  // `validateIR` driver — each body stmt becomes its own visit, so
-  // we don't need to descend manually here.
+  // Every other stmt holds expressions in non-consume positions.
+  // After ANF none of them should contain an owned producer.
   forEachTopLevelExpr(s, rejectNestedOwnedExpr);
 }
 
 /**
- * Walk the lowered program rejecting constructs that would have made
- * codegen throw a stack trace — TensorLit nested inside expressions,
- * Call nodes inside multi-element tensor RHSs. Errors thrown here carry
- * a span, so users see a line number instead of a codegen-internal
- * trace.
+ * Walk the post-ANF program and assert the "owned producers only at
+ * Assign-RHS top" invariant. Anything that slipped through is
+ * an internal bug — ANF should have hoisted it — but we still throw
+ * with a span so the user sees a line number.
  */
 function validateIR(prog: IRProgram): void {
   for (const fn of prog.functions) forEachStmtInTree(fn.body, validateStmt);
@@ -1000,6 +1012,11 @@ export function lower(
     functions: shared.order,
     stmts,
   };
+  // A-normalize: hoist every owned-producing sub-expression that
+  // isn't already at a direct consume site into a synthetic
+  // `_mtoc_anf_<N> = <producer>;` Assign. After this pass the IR
+  // satisfies the invariant `validateIR` enforces.
+  anfNormalize(prog);
   validateIR(prog);
   return prog;
 }

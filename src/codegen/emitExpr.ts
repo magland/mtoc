@@ -71,11 +71,18 @@ export function emitExpr(
   // the check at the top level.
   // `CharLit` is excluded: a non-owning literal handle (char scalar or
   // char array) is safe in any expression position — no allocation.
+  // User-function `Call`s that return a multi-element tensor are also
+  // excluded: they return a fully-formed `mtoc_tensor_t` struct by
+  // value, which the surrounding owned-LHS assign path consumes via
+  // `mtoc_<kind>_assign(&lhs, foo(args))` without going through the
+  // iter-loop materialization machinery.
+  const isUserFuncCall = e.kind === "Call" && e.callee.kind === "userFunc";
   if (
     state.iterStack.length === 0 &&
     e.kind !== "Var" &&
     e.kind !== "TensorLit" &&
     e.kind !== "CharLit" &&
+    !isUserFuncCall &&
     isMultiElement(e.ty)
   ) {
     throw new Error(

@@ -23,18 +23,22 @@ describe("strings", () => {
     expect(c).toMatch(/mtoc_string_assign\(&c, mtoc_string_concat\(a, b\)\);/);
   });
 
-  it("rejects nested string concat (would leak the inner buffer)", () => {
-    let err: unknown;
-    try {
-      translate('a = "x";\nb = "y";\nc = "z";\nd = a + b + c;\n');
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/string concatenation/i);
+  it("hoists nested string concat via ANF", () => {
+    // The post-lowering ANF pass lifts the inner concat into its
+    // own `_mtoc_anf_<N>` Assign so each concat happens at a clean
+    // consume site — no buffer leaks.
+    const c = translate('a = "x";\nb = "y";\nc = "z";\nd = a + b + c;\n');
+    expect(c).toMatch(/_mtoc_anf_/);
+    // The inner (a + b) concat lands in the ANF temp; the outer
+    // concat lands in `d`. Both shapes appear verbatim in main().
+    expect(c).toMatch(
+      /mtoc_string_assign\(&_mtoc_anf_\d+, mtoc_string_concat\(a, b\)\);/
+    );
+    expect(c).toMatch(
+      /mtoc_string_assign\(&d, mtoc_string_concat\(_mtoc_anf_\d+, c\)\);/
+    );
+    // The lifted temp gets freed (either early-free or scope-exit).
+    expect(c).toMatch(/mtoc_string_free\(&_mtoc_anf_/);
   });
 
   it("rejects non-Add binary ops on strings", () => {
@@ -122,21 +126,13 @@ describe("strings", () => {
     expect(e.message).toMatch(/char arrays or strings/);
   });
 
-  it("disp of a string concat expression is rejected with a clear message", () => {
-    let err: unknown;
-    try {
-      translate('a = "x";\nb = "y";\ndisp(a + b);\n');
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
-    // The nested-binary rule fires first, since the disp arg is the
-    // outer Binary and its left/right are scanned for nested string
-    // Binary nodes.
-    expect(e.message).toMatch(/string/i);
+  it("hoists a string concat expression as a disp arg via ANF", () => {
+    // ANF lifts the string-concat to a `_mtoc_anf_<N>` Assign and
+    // disp consumes the resulting `Var` via `mtoc_disp_string`.
+    const c = translate('a = "x";\nb = "y";\ndisp(a + b);\n');
+    expect(c).toMatch(/_mtoc_anf_/);
+    expect(c).toMatch(/mtoc_string_concat/);
+    expect(c).toMatch(/mtoc_disp_string/);
   });
 
   it("splits a string -> numeric top-level reassignment via a fresh binding", () => {

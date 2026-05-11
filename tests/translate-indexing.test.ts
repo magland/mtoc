@@ -115,22 +115,13 @@ describe("indexing — scalar reads", () => {
     expect(e.message).toMatch(/real scalar/i);
   });
 
-  it("rejects a range index with an UnsupportedConstruct (range support deferred)", () => {
-    // Range-indexed reads (`v(2:5)`) are a known gap; the parser
-    // emits a `Range` Expr at the slot, and lowerExpr's default arm
-    // surfaces a span-attributed UnsupportedConstruct. This test
-    // pins that error path so it stays predictable until the range
-    // support commit lands.
-    let err: unknown;
-    try {
-      translate("v = [1 2 3];\ndisp(v(1:2));\n");
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
+  it("accepts a range index as a disp arg via ANF", () => {
+    // Range-indexed reads (`v(2:5)`) produce an `IndexSlice` IRExpr
+    // which is owned-producing; the post-lowering ANF pass hoists it
+    // into a `_mtoc_anf_<N>` Assign so disp sees a `Var`.
+    const c = translate("v = [1 2 3];\ndisp(v(1:2));\n");
+    expect(c).toMatch(/_mtoc_anf_/);
+    expect(c).toMatch(/mtoc_disp_tensor/);
   });
 
   it("rejects `end` outside an index expression", () => {
@@ -224,33 +215,21 @@ describe("indexing — range and colon reads", () => {
     expect(c).toMatch(/_mtoc_t\.imag\[_mtoc_k\] = z\.imag\[/);
   });
 
-  it("rejects a range slice nested inside a larger expression", () => {
-    // Indexing produces a fresh tensor — only legal at the top of
-    // Assign.rhs. The lowering-pass validator catches a nested use.
-    let err: unknown;
-    try {
-      translate("v = [1 2 3];\nw = v(1:2) + v(2:3);\n");
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/range\/colon/i);
+  it("hoists range slices nested in arithmetic via ANF", () => {
+    // Indexing produces a fresh tensor. The post-lowering ANF pass
+    // hoists each `IndexSlice` operand of a Binary into its own
+    // `_mtoc_anf_<N>` Assign so the surrounding iter loop reads them
+    // as Vars.
+    const c = translate("v = [1 2 3];\nw = v(1:2) + v(2:3);\n");
+    expect(c).toMatch(/_mtoc_anf_/);
+    // Two lifts — one per slice.
+    expect((c.match(/_mtoc_anf_/g) ?? []).length).toBeGreaterThanOrEqual(2);
   });
 
-  it("rejects a range slice as a disp arg with a clear message", () => {
-    let err: unknown;
-    try {
-      translate("v = [1 2 3];\ndisp(v(1:2));\n");
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
+  it("hoists a range slice as a disp arg via ANF", () => {
+    const c = translate("v = [1 2 3];\ndisp(v(1:2));\n");
+    expect(c).toMatch(/_mtoc_anf_/);
+    expect(c).toMatch(/mtoc_disp_tensor/);
   });
 
   it("rejects a non-literal step", () => {

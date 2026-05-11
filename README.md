@@ -88,15 +88,19 @@ The subset is growing iteratively. Roughly:
 - Statement-only builtins: `disp`, `error("msg")`, `assert(cond)`,
   `assert(cond, msg)` (msg may be a string or char-array literal /
   variable; tensor-condition form is deferred)
-- User-defined functions with 0, 1, or N≥2 scalar outputs (input may
-  be scalar or tensor; outputs must be scalars today). One
-  specialization per unique call-site argument-type tuple. The C ABI
-  is picked per output count: 0 → `void`, 1 → return-by-value, N≥2 →
-  `void` with one `T *_mtoc_o<i>` out-pointer per output. Multi-
-  output calls use the `[a, b] = foo(x);` syntax (with `~` to drop a
-  slot); 0-output and N-output functions can also be invoked as bare
-  statements `foo(x);`. Tensor params are owned by the callee under
-  copy-on-arg-pass — the body can reassign them freely
+- User-defined functions with 0, 1, or N≥2 outputs. Each output can
+  be a scalar (real / complex) or an owned kind (real / complex
+  double tensor, char tensor, scalar string). One specialization per
+  unique call-site argument-type tuple. The C ABI is picked per
+  output count: 0 → `void`, 1 → return-by-value (struct return for
+  owned kinds), N≥2 → `void` with one `T *_mtoc_o<i>` out-pointer
+  per output (owned slots use `mtoc_<kind>_assign` so the caller's
+  prior buffer is consumed cleanly). Multi-output calls use the
+  `[a, b] = foo(x);` syntax (with `~` to drop a slot — owned discard
+  slots are freed right after the call so they don't leak); 0-output
+  and N-output functions can also be invoked as bare statements
+  `foo(x);`. Tensor / char / string params are owned by the callee
+  under copy-on-arg-pass — the body can reassign them freely
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum`, `length`, `numel`
 - Index reads:

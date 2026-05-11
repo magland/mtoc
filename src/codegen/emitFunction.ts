@@ -14,8 +14,8 @@
 import type { IRFunction, IRStmt } from "../lowering/ir.js";
 import {
   cTypeFor,
-  isMultiElement,
   isNumeric,
+  isOwned,
   typeToString,
 } from "../lowering/types.js";
 import { computeFutureTouches } from "./liveness.js";
@@ -27,12 +27,55 @@ import {
   functionFreeOnExitSet,
 } from "./emitOwned.js";
 
+/** Per-function scope-exit free set with output cNames removed. Owned
+ *  return values transfer to the caller — for a 1-output function the
+ *  struct is returned by value; for an N-output function the callee
+ *  hands the buffer off via `mtoc_<kind>_assign(_mtoc_o<i>, <local>)`.
+ *  Either way the callee must NOT free the output's heap buffer, so we
+ *  strip those cNames from the otherwise-routine `functionFreeOnExitSet`
+ *  (which still releases owned tensor params and other locals). */
+export function scopeExitFreeSet(
+  fn: IRFunction
+): ReadonlyMap<string, import("../lowering/ir.js").VarBinding> {
+  const base = functionFreeOnExitSet(fn);
+  // Strip every output cName that holds an owned value.
+  const out = new Map(base);
+  for (const o of fn.outputs) {
+    if (isOwned(o.ty)) out.delete(o.cName);
+  }
+  return out;
+}
+
+/** Write each multi-output sret slot from the corresponding output's
+ *  post-body live cName. Owned slots route through the kind's
+ *  consume-replace `assign` helper so the caller's prior buffer at the
+ *  lvalue is freed before the new handle lands; scalar slots use a
+ *  plain pointer store. Activates the helpers it depends on. */
+export function emitOwnedAwareSretWrites(
+  state: EmitState,
+  level: number,
+  outputs: ReadonlyArray<IRFunction["outputs"][number]>
+): void {
+  for (let i = 0; i < outputs.length; i++) {
+    const o = outputs[i];
+    const owned = ownedOps(o.ty);
+    if (owned !== null) {
+      useRuntimeByName(state, owned.structSnippet);
+      useRuntimeByName(state, owned.assign);
+      pushStmt(state, level, `${owned.assign}(_mtoc_o${i}, ${o.cName});`);
+    } else {
+      pushStmt(state, level, `*_mtoc_o${i} = ${o.cName};`);
+    }
+  }
+}
+
 /** Emit the body of a user-defined function (predeclarations + body
  *  stmts + scope-exit frees + final return) into a fresh local-line
  *  buffer. The frees pair with `emitDeclarations`'s heap allocations
  *  AND with the caller-side `mtoc_tensor_copy` for every tensor
  *  parameter: every tensor local AND every owned tensor param is
- *  freed before the implicit fall-through return, and every
+ *  freed before the implicit fall-through return — except cNames that
+ *  hold a return value (those transfer to the caller). Every
  *  `IRStmt.ReturnFromFunction` early exit picks up the same free
  *  preamble (driven by `state.currentScopeVars`). */
 export function emitFunctionBody(
@@ -50,20 +93,32 @@ export function emitFunctionBody(
   state.lines = [];
   // Predecls cover assignedVars only — params are declared by the C
   // signature. Scope-exit frees cover both: locals from the body and
-  // owned tensor params from the call site.
-  const freeOnExit = functionFreeOnExitSet(fn);
+  // owned tensor params from the call site — EXCEPT for cNames that
+  // hold a return value, since those buffers transfer to the caller
+  // (either by return-by-value on the 1-output path, or by an
+  // `mtoc_<kind>_assign` sret write on the multi-output path).
+  const freeOnExit = scopeExitFreeSet(fn);
   state.currentScopeVars = freeOnExit;
-  state.futureTouches = computeFutureTouches(fn.body);
+  state.futureTouches = computeFutureTouches(fn.body, fn.outputs);
   state.freedOwned = new Set();
   state.currentFunctionOutputs = fn.outputs;
 
   emitDeclarations(state, 1, fn.assignedVars);
   for (const s of fn.body) emitStmt(state, 1, s);
-  // Implicit fall-through return at the end of the function: free every
-  // tensor backing not already released earlier on the linear path,
-  // then carry the output(s) back. Early-exit `return` paths emitted
-  // by `IRStmt.ReturnFromFunction` carry their own copy of the free
-  // preamble + output write (see `emitStmt`).
+  // Implicit fall-through return at the end of the function. Order:
+  //   - Multi-output: write each output's sret slot FIRST (using the
+  //     consume-replace `mtoc_<kind>_assign` for owned outputs so the
+  //     caller's prior buffer is freed before the handoff). Then free
+  //     non-output locals. Then `return;`.
+  //   - Single-output owned: free non-output locals first, then
+  //     `return <cName>;` returns the struct by value. The output's
+  //     cName is excluded from `freeOnExit`, so its buffers survive.
+  //   - Single-output scalar / 0-output: just free + return.
+  // Early-exit `return` paths emitted by `IRStmt.ReturnFromFunction`
+  // carry their own copy of the same free + write preamble.
+  if (fn.outputs.length >= 2) {
+    emitOwnedAwareSretWrites(state, 1, fn.outputs);
+  }
   emitScopeExitFrees(state, 1, freeOnExit, state.freedOwned);
   if (fn.outputs.length === 0) {
     // 0-output: C `void` function; no fall-through write or return
@@ -71,15 +126,12 @@ export function emitFunctionBody(
     // end of a `void` function is well-defined.
   } else if (fn.outputs.length === 1) {
     // Classic single-output convention: return-by-value of the
-    // post-body live binding's C name.
+    // post-body live binding's C name. For owned types the struct
+    // copy hands the heap buffers to the caller; the callee skipped
+    // freeing this cName above.
     pushStmt(state, 1, `return ${fn.outputs[0].cName};`);
   } else {
-    // Multi-output convention: write each output's local through the
-    // matching `_mtoc_o<i>` out-pointer, then `return;`. Out-pointers
-    // are declared as C parameters by `emitFunction`.
-    for (let i = 0; i < fn.outputs.length; i++) {
-      pushStmt(state, 1, `*_mtoc_o${i} = ${fn.outputs[i].cName};`);
-    }
+    // Multi-output sret writes already emitted above; just return.
     pushStmt(state, 1, `return;`);
   }
 
@@ -140,19 +192,15 @@ export function emitFunction(
   // C return-type and outputs:
   //   - 0 outputs   : `void` return type, no out-pointer params.
   //   - 1 output    : classic return-by-value (scalar real → `double`,
-  //                   scalar complex → `double _Complex`).
+  //                   scalar complex → `double _Complex`, owned kinds →
+  //                   their struct type; ownership transfers via the
+  //                   struct copy and the callee skips freeing the
+  //                   output's cName).
   //   - N outputs   : `void` return type plus one trailing
-  //                   `T_i *_mtoc_o<i>` parameter per output.
-  // Lowering rejects tensor outputs per-output (sret is a future
-  // stage); any tensor shape reaching here is a lowerer escape.
-  for (const o of fn.outputs) {
-    if (isMultiElement(o.ty)) {
-      throw new Error(
-        `codegen: function '${fn.matlabName}' output '${o.name}' has ` +
-          `unsupported type ${typeToString(o.ty)}`
-      );
-    }
-  }
+  //                   `T_i *_mtoc_o<i>` parameter per output. Owned
+  //                   outputs write through `mtoc_<kind>_assign` so
+  //                   the caller's prior buffer at the lvalue is
+  //                   released before the new handle lands.
   let returnCTy: string;
   if (fn.outputs.length === 1) {
     const cTy = cTypeFor(fn.outputs[0].ty);
@@ -163,6 +211,10 @@ export function emitFunction(
       );
     }
     returnCTy = cTy;
+    // Activate the owned-kind typedef when the return type needs it so
+    // the function's signature is valid C wherever it appears.
+    const owned = ownedOps(fn.outputs[0].ty);
+    if (owned !== null) useRuntimeByName(state, owned.structSnippet);
     if (isNumeric(fn.outputs[0].ty) && fn.outputs[0].ty.isComplex) {
       state.needComplex.value = true;
     }
@@ -207,6 +259,9 @@ export function emitFunction(
             `unsupported type ${typeToString(o.ty)}`
         );
       }
+      // Owned outputs need their typedef visible in the signature.
+      const owned = ownedOps(o.ty);
+      if (owned !== null) useRuntimeByName(state, owned.structSnippet);
       if (isNumeric(o.ty) && o.ty.isComplex) state.needComplex.value = true;
       paramParts.push(`${cTy} *_mtoc_o${i}`);
     }

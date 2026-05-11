@@ -36,18 +36,23 @@ workaround or a roadmap note.
   `zeros(N, M)`, `ones(N, M)`, etc. with a runtime size still raise
   `UnsupportedConstruct`. The codegen path for dynamic-shape allocation
   is in place — only the builtin signatures and runtime helpers remain.
-- **Tensor sub-expressions only at `Assign` RHS.** `disp(a + b)` and
-  `sum(a .* a)` fail with a clear "assign to a temp first" message —
-  the call result still has nowhere to land. Element-wise scalar
-  builtins (`sqrt`, `sin`, `cos`, `abs`, `atan2`, `hypot`, `power`, `min`,
-  `max`, `mod`, `rem`, `floor`, `ceil`, `round`, `fix`, `isnan`, `isinf`,
-  `isfinite`, `logical`, `real`, `imag`, `conj`, `angle`, `sign`) DO lift
-  over tensor arguments automatically at the top level of an `Assign` —
-  `y = sqrt(x)` materializes the same per-slot loop as `y = x .* x`.
-  Reductions (`sum`, `length`, `numel`) and user-function calls still
-  require their tensor argument materialized to a named variable.
-  Auto-materialization of tensor temporaries during lowering is a known
-  TODO.
+- **Tensor sub-expressions only at `Assign` RHS — for _non_-owned
+  expressions.** `disp(a + b)` and `sum(a .* a)` still fail with a
+  "assign to a temp first" message: a Binary on two tensors produces a
+  multi-element value with no surrounding consume site. Element-wise
+  scalar builtins (`sqrt`, `sin`, `cos`, `abs`, `atan2`, `hypot`,
+  `power`, `min`, `max`, `mod`, `rem`, `floor`, `ceil`, `round`, `fix`,
+  `isnan`, `isinf`, `isfinite`, `logical`, `real`, `imag`, `conj`,
+  `angle`, `sign`) DO lift over tensor arguments automatically at the
+  top level of an `Assign` — `y = sqrt(x)` materializes the same
+  per-slot loop as `y = x .* x`. Owned-producing sub-expressions
+  (TensorLit, IndexSlice, string concat, tensor-returning user-function
+  calls) are automatically hoisted by the ANF pass, so
+  `disp(helper(x))`, `sum(helper(x))`, `y = [1 2] + 1`,
+  `y = v(1:3) + 1`, `s = (a + b) + c`, `y = helper(helper(x))`, and
+  `y = bump(helper(x), 7)` all compile cleanly. Auto-materialization of
+  _non_-owned intermediate tensors (e.g. Binary on two tensors as a
+  disp arg) is still a known TODO.
 - **No matrix multiply / divide / power yet.** `*`/`/`/`^` between two
   tensors is explicitly rejected at lowering with a message pointing the user
   at `.* ./ .^` for elementwise. Matrix ops will need a separate codegen path
@@ -78,13 +83,28 @@ workaround or a roadmap note.
   `M(a:b, c:d)`), TensorLit / Binary / IndexSlice on the RHS of a
   range write (assign to a name first), and indexing into a scalar
   variable (`x(1)` returning `x`).
-- **Tensor-valued function returns aren't supported yet.** Functions accept
-  tensor arguments (real or complex), but the return type must be a scalar
-  (real or complex). Returning a tensor needs an sret-style codegen path
-  that's still pending. Tensor params are owned by the callee (caller-side
-  copy-on-arg-pass), so reassigning a param inside the body is fine —
-  `mtoc_tensor_assign` frees the previous buffer and installs the new one,
-  and the scope-exit free reclaims the final value.
+- **User functions can return owned values.** 1-output functions return
+  the owned struct (`mtoc_tensor_t`, `mtoc_char_tensor_t`, `mtoc_string_t`)
+  by value; the callee skips freeing the output's local at scope exit so
+  the heap buffers transfer to the caller, who consumes them via
+  `mtoc_<kind>_assign(&lhs, foo(args))` at the assignment site. N-output
+  functions write owned outputs through their sret out-pointer using the
+  same `mtoc_<kind>_assign` helper so the caller's prior buffer at the
+  lvalue is released before the new handle lands. Tensor params remain
+  callee-owned via the existing copy-on-arg-pass machinery.
+
+  Tensor-returning calls compose into any expression position the ANF
+  pass can hoist them out of — `y = foo(x) + 1`, `y = sqrt(foo(x))`,
+  `y = foo(x) .* bar(z)`, `y = foo(foo(x))`, `y = bump(foo(x), 7)`,
+  `s = sum(foo(x))`, `disp(foo(x))` all decompose to a sequence of
+  synthetic `_mtoc_anf_<N> = <producer>;` Assigns whose temps are
+  predeclared and freed by the standard liveness machinery. What's
+  still deferred:
+  - **Bare statement form for owned-returning 1-output functions.**
+    `foo(x);` (where `foo` returns a tensor) still rejects with
+    "tensor-valued expression at statement scope"; capture into a name
+    if you want the buffer freed automatically at scope exit.
+
 - **`sum` on a matrix isn't supported.** Vector sum returns scalar; matrix sum
   in numbl returns a row vector of column sums, which needs a tensor-returning
   builtin path.
@@ -93,10 +113,13 @@ workaround or a roadmap note.
 
 - **Recursion is rejected** with an explicit error. Lifting requires forward
   declarations + fixpoint return-type inference.
-- **Multi-output is supported, but each output must be a scalar.**
+- **Multi-output supports mixed scalar + owned outputs.**
   `function [a, b] = f(x)` lowers to a `void`-returning C function with
-  one out-pointer per output; tensor-valued outputs are still rejected
-  at lowering. Zero-output functions (`function foo(x)`) and the
+  one out-pointer per output. Owned slots (tensors, char tensors,
+  strings) are written via the kind's `mtoc_<kind>_assign` helper so
+  the caller's prior buffer at the lvalue is consumed cleanly; ignored
+  outputs (`~`) declare an empty discard temp that's freed immediately
+  after the call. Zero-output functions (`function foo(x)`) and the
   bare-statement call form `foo(x);` also work. See `docs/specialization.md`
   for the full ABI.
 - **No anonymous functions / function handles** (`@(x) x*x`, `@sin`).

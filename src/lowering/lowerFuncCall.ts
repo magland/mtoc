@@ -19,6 +19,7 @@ import {
   arithResult,
   canonicalizeType,
   isMultiElement,
+  isOwned,
   isScalar,
   isScalarReal,
   isNumeric,
@@ -682,10 +683,16 @@ function specialize(
           fnAst.span
         );
       }
-      if (!isScalar(ty)) {
+      // Accept scalars (real / complex / char) and owned kinds (real or
+      // complex double tensors, char tensors, scalar strings). The
+      // owned path carries the return through `mtoc_<kind>_assign` at
+      // the caller, and the callee excludes its output from the
+      // scope-exit free walk so ownership transfers cleanly.
+      const okReturn = isScalar(ty) || isOwned(ty);
+      if (!okReturn) {
         throw new UnsupportedConstruct(
-          `function '${matlabName}' must return a scalar — ` +
-            `tensor returns are not yet supported (got ${typeToString(ty)})`,
+          `function '${matlabName}' return type ${typeToString(ty)} is ` +
+            `not yet supported`,
           fnAst.span
         );
       }

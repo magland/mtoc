@@ -166,20 +166,16 @@ describe("translate scalar example", () => {
     expect(c).not.toMatch(/_mtoc_x__v/);
   });
 
-  it("rejects a tensor literal embedded inside a binary expression", () => {
-    let err: unknown;
-    try {
-      translate("a = [1 2 3];\nb = a + [4 5 6];\n");
-    } catch (e) {
-      err = e;
-    }
-    // We reject TensorLit nested inside Binary at lowering. Confirm
-    // the error has a span and the right name.
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/tensor literal/i);
+  it("hoists a tensor literal embedded inside a binary expression via ANF", () => {
+    // The post-lowering ANF pass lifts TensorLit operands of Binary
+    // into their own `_mtoc_anf_<N>` synthetic Assigns, so the
+    // subsequent iter-loop Assign reads them as Vars. Confirms ANF
+    // ran and the program compiles.
+    const c = translate("a = [1 2 3];\nb = a + [4 5 6];\ndisp(b);\n");
+    expect(c).toMatch(/_mtoc_anf_/);
+    expect(c).toMatch(
+      /mtoc_tensor_from_row\(\(double\[\]\)\{4\.0, 5\.0, 6\.0\}/
+    );
   });
 
   it("emits mtoc_tensor_free(&v) before the implicit return of a function with a tensor local", () => {
@@ -342,17 +338,14 @@ describe("translate scalar example", () => {
     expect(e.message).toMatch(/message must be a string/);
   });
 
-  it("assert rejects a nested-string msg expression", () => {
-    let err: unknown;
-    try {
-      translate('a = "x";\nb = "y";\nassert(0, a + b);\n');
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.message).toMatch(/literal or variable/);
+  it("assert accepts a nested-string msg expression via ANF", () => {
+    // ANF lifts the string concat into its own `_mtoc_anf_<N>` Assign,
+    // so the assert's msg arg ends up as a `Var` that codegen routes
+    // through `mtoc_assert_double_msg`.
+    const c = translate('a = "x";\nb = "y";\nassert(0, a + b);\n');
+    expect(c).toMatch(/_mtoc_anf_/);
+    expect(c).toMatch(/mtoc_string_concat/);
+    expect(c).toMatch(/mtoc_assert_double_msg/);
   });
 
   it("assert rejects a non-scalar-real argument with a clear message", () => {

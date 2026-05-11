@@ -190,16 +190,22 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // handle) and installs the new value in one step.
         //
         // The tensor case (multi-element double) splits on RHS kind:
-        // a non-Var, non-TensorLit RHS materializes elementwise via a
-        // per-slot loop. Strings and char arrays accept a Var
-        // (deep-copy) or any owned-producing expression directly
-        // (`StringLit`, `mtoc_string_concat(...)`,
-        // `mtoc_char_tensor_from_literal(...)`).
+        // a non-Var, non-TensorLit, non-user-Call RHS materializes
+        // elementwise via a per-slot loop. A user-function call
+        // RHS returns a fully-formed owned tensor by value — the
+        // direct `mtoc_tensor_assign(&lhs, foo(args))` path consumes
+        // that handle without re-allocating. Strings and char arrays
+        // accept a Var (deep-copy) or any owned-producing expression
+        // directly (`StringLit`, `mtoc_string_concat(...)`,
+        // `mtoc_char_tensor_from_literal(...)`, user-function call).
+        const isUserFuncCall =
+          s.rhs.kind === "Call" && s.rhs.callee.kind === "userFunc";
         if (
           isNumeric(s.ty) &&
           isMultiElement(s.ty) &&
           s.ty.elem === "double" &&
-          s.rhs.kind !== "Var"
+          s.rhs.kind !== "Var" &&
+          !isUserFuncCall
         ) {
           emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
@@ -494,10 +500,11 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // Free every tensor backing in the enclosing function's scope
       // before we return — but skip ones already freed earlier on
       // this linear path so the same var doesn't get a redundant
-      // free emit. `currentScopeVars` is set to `fn.assignedVars` (+
-      // tensor params) by `emitFunctionBody`. Lowering only emits
-      // this kind inside a function body, so the field is always
-      // non-null here.
+      // free emit. `currentScopeVars` is set to the function's
+      // owned-locals + tensor-params set (with output cNames already
+      // excluded for the body-end binding) by `emitFunctionBody`.
+      // Lowering only emits this kind inside a function body, so
+      // the field is always non-null here.
       if (
         state.currentScopeVars === null ||
         state.currentFunctionOutputs === null
@@ -507,13 +514,47 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
             "function scope; should have been rejected at lowering"
         );
       }
+      const outputs = state.currentFunctionOutputs;
+      // Mark each owned output's per-return cName as "already freed"
+      // so the scope-exit walk leaves it alone — the buffer transfers
+      // to the caller (return-by-value for the 1-output path,
+      // `mtoc_<kind>_assign` sret write for the N-output path). The
+      // post-body cName captured in `currentScopeVars`'s exclude list
+      // may differ from `s.outputCNames[i]` after a top-level
+      // variable split inside the function body, so we mark both
+      // here via the per-return list.
+      for (let i = 0; i < outputs.length; i++) {
+        if (isOwned(outputs[i].ty)) {
+          state.freedOwned.add(s.outputCNames[i]);
+        }
+      }
+      // Multi-output: write sret slots BEFORE the free walk. Owned
+      // slots route through `mtoc_<kind>_assign` so the caller's
+      // prior buffer at the lvalue is consumed; scalar slots use a
+      // plain pointer store.
+      if (outputs.length >= 2) {
+        for (let i = 0; i < outputs.length; i++) {
+          const o = outputs[i];
+          const owned = ownedOps(o.ty);
+          if (owned !== null) {
+            useRuntimeByName(state, owned.structSnippet);
+            useRuntimeByName(state, owned.assign);
+            pushStmt(
+              state,
+              level,
+              `${owned.assign}(_mtoc_o${i}, ${s.outputCNames[i]});`
+            );
+          } else {
+            pushStmt(state, level, `*_mtoc_o${i} = ${s.outputCNames[i]};`);
+          }
+        }
+      }
       emitScopeExitFrees(
         state,
         level,
         state.currentScopeVars,
         state.freedOwned
       );
-      const outputs = state.currentFunctionOutputs;
       if (outputs.length === 0) {
         // Zero-output function: no value to carry back, no out-pointer
         // writes. Emit a bare `return;` so the C control-flow path is
@@ -527,12 +568,7 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // the IR node.
         pushStmt(state, level, `return ${s.outputCNames[0]};`);
       } else {
-        // Multi-output convention: write each output's local into
-        // the corresponding `_mtoc_o<i>` out-pointer (declared as a
-        // C parameter by `emitFunction`), then `return;`.
-        for (let i = 0; i < outputs.length; i++) {
-          pushStmt(state, level, `*_mtoc_o${i} = ${s.outputCNames[i]};`);
-        }
+        // Multi-output sret writes already emitted above; just return.
         pushStmt(state, level, `return;`);
       }
       break;
@@ -571,9 +607,19 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // EmitState gives each call a unique suffix for its temps,
       // even though they're structurally scoped — handy when reading
       // the emitted C diff for unrelated calls.
+      //
+      // Owned discard slots (tensors / char tensors / strings) need
+      // (1) initialization to an empty handle before the call so the
+      // callee's `mtoc_<kind>_assign` sees a freeable starting value,
+      // and (2) a `mtoc_<kind>_free` after the call so the freshly
+      // installed buffer doesn't leak.
       const callIdx = state.multiAssignCallCounter++;
       pushStmt(state, level, `{`);
       const outArgs: string[] = [];
+      const ownedDiscards: {
+        cName: string;
+        owned: ReturnType<typeof ownedOps>;
+      }[] = [];
       for (let i = 0; i < s.outputs.length; i++) {
         const slot = s.outputs[i];
         const cTy = cTypeFor(slot.ty);
@@ -585,7 +631,15 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         }
         if (slot.binding === null) {
           const tmp = `_mtoc_discard_${callIdx}_${i}`;
-          pushStmt(state, level + 1, `${cTy} ${tmp};`);
+          const owned = ownedOps(slot.ty);
+          if (owned !== null) {
+            useRuntimeByName(state, owned.structSnippet);
+            useRuntimeByName(state, owned.empty);
+            pushStmt(state, level + 1, `${cTy} ${tmp} = ${owned.empty}();`);
+            ownedDiscards.push({ cName: tmp, owned });
+          } else {
+            pushStmt(state, level + 1, `${cTy} ${tmp};`);
+          }
           outArgs.push(`&${tmp}`);
         } else {
           outArgs.push(`&${slot.binding.cName}`);
@@ -596,6 +650,13 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         level + 1,
         `${s.mangled}(${[...argStrs, ...outArgs].join(", ")});`
       );
+      // Release owned discard temps before closing the block. The
+      // callee's `mtoc_<kind>_assign` consumed the empty handle and
+      // installed a fresh buffer; we free it here so it doesn't leak.
+      for (const d of ownedDiscards) {
+        useRuntimeByName(state, d.owned!.free);
+        pushStmt(state, level + 1, `${d.owned!.free}(&${d.cName});`);
+      }
       pushStmt(state, level, `}`);
       // Reassigning to an owned LHS via the call clears its freed
       // marker on the current linear path, mirroring `Assign` to an
@@ -720,7 +781,15 @@ function collectMultiElementVarsByCName(
  *  evaluate the body into the staging tensor's slots, then
  *  `mtoc_tensor_assign(&target, _mtoc_t)` to consume-replace the
  *  target. Wrapped in `{}` so the staging local is scoped per
- *  Assign. */
+ *  Assign.
+ *
+ *  Owned-producing sub-expressions (user-func tensor calls,
+ *  TensorLit, IndexSlice, string concat) are already hoisted to
+ *  their own `_mtoc_anf_<N>` synthetic Assigns by the lowering-pass
+ *  ANF normalizer, so by the time we get here the RHS contains only
+ *  `Var`, scalar literals, elementwise builtin Calls, Binary, Unary,
+ *  IndexLoad, etc. — everything that renders correctly slot-by-slot
+ *  inside the iter loop. */
 function emitTensorAssignFromExpr(
   state: EmitState,
   level: number,
@@ -756,14 +825,12 @@ function emitTensorAssignFromExpr(
   // never appears in this function's emission.
   const stagingName = "_mtoc_t";
 
-  // Collect every distinct multi-element Var in the RHS (keyed by
-  // cName so duplicates like `v .* v` collapse). The shape source
+  // Collect every distinct multi-element Var in the RHS, keyed by
+  // cName so duplicates like `v .* v` collapse. The shape source
   // already picked by `findShapeSourceVar` is the first entry; for
   // every other Var we emit one `mtoc_check_shape(<source>, <other>)`
   // before the staging-buffer alloc. Same-Var and scalar-broadcast
-  // cases produce zero checks. The check is once-per-assign — once
-  // the source is shape-compatible with every other operand, every
-  // per-element read inside the loop is in bounds.
+  // cases produce zero checks.
   // When the shape source is a CharLit, no runtime shape checks are
   // emitted for other CharLit operands (their lengths are statically
   // known; the dim lattice already admitted them as compatible).

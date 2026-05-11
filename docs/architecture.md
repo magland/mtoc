@@ -99,6 +99,21 @@ Lowering does several jobs in one walk:
   renders the call once per element with each tensor arg collapsed to
   `<v>.real[<iter>]`. See `docs/builtins.md` for details. `.^` and
   comparison operators (`==`, `<`, etc.) ride the same path.
+- **ANF normalization (`src/lowering/anf.ts`)**: a post-lowering pass that
+  hoists every owned-producing sub-expression (TensorLit, IndexSlice,
+  string concat, user-function call returning an owned kind) out of
+  larger expressions into its own synthetic
+  `_mtoc_anf_<N> = <producer>;` Assign, registered in the enclosing
+  scope's `assignedVars`. After ANF, owned producers appear at exactly
+  one position: the full RHS of an owned-LHS Assign. That tight
+  invariant collapses what used to be a patchwork of context-sensitive
+  consume-site rules into a single `mtoc_<kind>_assign(&lhs, producer)`
+  path, with the existing liveness / scope-exit free walks managing
+  every temp's lifetime uniformly. Arbitrary nesting like
+  `helper(helper(x))`, `bump(helper(x), 7)`, `sum(helper(x))`,
+  `disp(helper(x))`, `[1 2] + 1`, `v(1:3) + 1`, `(a + b) + c`
+  (strings), etc. all decompose into a sequence of well-formed
+  Assigns automatically.
 
 ### IR walkers (`src/lowering/walk.ts`)
 

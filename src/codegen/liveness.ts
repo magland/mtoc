@@ -42,7 +42,7 @@
  */
 
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
-import { isOwned } from "../lowering/types.js";
+import { isOwned, type MType } from "../lowering/types.js";
 import { forEachSubExpr, forEachTopLevelExpr } from "../lowering/walk.js";
 
 /** Per-statement future-touch sets, keyed by the IRStmt object
@@ -58,10 +58,15 @@ interface TouchCtx {
    *  header — drives one more iteration plus the exit path). */
   readonly continueOut: ReadonlySet<string>;
   /** Future touches reachable from a `ReturnFromFunction`. Always
-   *  empty for owned-value liveness today — function returns are
-   *  scalars. Kept as a field so the recursion threads through it
-   *  cleanly in case we ever support owned-value returns. */
+   *  empty — the early-return path has no successors. The owned
+   *  output cNames captured in `ReturnFromFunction.outputCNames` are
+   *  added separately as "touched-at-this-return" via `functionOutputTypes`. */
   readonly returnOut: ReadonlySet<string>;
+  /** Output-slot types of the enclosing function, in declaration order.
+   *  Used to identify which `ReturnFromFunction.outputCNames` entries
+   *  correspond to owned outputs (those need to stay live through the
+   *  return). Null when analyzing main / a non-function body. */
+  readonly functionOutputTypes: ReadonlyArray<MType> | null;
   /** Mutated map of per-statement future-touch sets (the analysis
    *  output). */
   readonly futureTouchOut: Map<IRStmt, ReadonlySet<string>>;
@@ -215,25 +220,60 @@ function touchStmt(
       return new Set(ctx.breakOut);
     case "Continue":
       return new Set(ctx.continueOut);
-    case "ReturnFromFunction":
-      return new Set(ctx.returnOut);
+    case "ReturnFromFunction": {
+      // The early-return path itself has no successors, but each owned
+      // output cName captured in `s.outputCNames` is "used" at this
+      // return — the codegen emits a return-by-value of it (1-output)
+      // or an sret write of it (N-output). Mark them as touched so the
+      // backward dataflow doesn't decide they're dead one stmt earlier
+      // and emit a stray early-free.
+      const out = new Set(ctx.returnOut);
+      if (ctx.functionOutputTypes !== null) {
+        for (let i = 0; i < ctx.functionOutputTypes.length; i++) {
+          if (isOwned(ctx.functionOutputTypes[i])) {
+            out.add(s.outputCNames[i]);
+          }
+        }
+      }
+      return out;
+    }
   }
 }
 
 /** Compute per-statement future-touch sets for a body of statements.
- *  The body's fall-through future-touch is `EMPTY` for owned-value
- *  liveness — no owned value outlives `main` or a function body. */
+ *  The body's fall-through future-touch is normally `EMPTY` (no owned
+ *  value outlives `main` or a stmt body) — but when the body belongs
+ *  to a function with owned outputs, the post-body cNames of those
+ *  outputs are alive at the fall-through return, so we seed the set
+ *  with them. Without this, an `Assign` to an owned output whose only
+ *  consumer is the implicit return would be classified as a "last
+ *  touch" and emit a stray early-free.
+ *
+ *  `functionOutputs` carries one `{cName, ty}` per output slot in
+ *  declaration order — same shape as `IRStmt.ReturnFromFunction.outputCNames`
+ *  so the per-return marking also lines up. Pass `null` for main /
+ *  any non-function body. */
 export function computeFutureTouches(
-  stmts: ReadonlyArray<IRStmt>
+  stmts: ReadonlyArray<IRStmt>,
+  functionOutputs: ReadonlyArray<{ cName: string; ty: MType }> | null = null
 ): FutureTouchMap {
   const futureTouchOut = new Map<IRStmt, ReadonlySet<string>>();
   const empty: ReadonlySet<string> = new Set();
+  const functionOutputTypes =
+    functionOutputs === null ? null : functionOutputs.map(o => o.ty);
+  const bodyEnd = new Set<string>();
+  if (functionOutputs !== null) {
+    for (const o of functionOutputs) {
+      if (isOwned(o.ty)) bodyEnd.add(o.cName);
+    }
+  }
   const ctx: TouchCtx = {
     breakOut: empty,
     continueOut: empty,
     returnOut: empty,
+    functionOutputTypes,
     futureTouchOut,
   };
-  touchSeq(stmts, empty, ctx);
+  touchSeq(stmts, bodyEnd, ctx);
   return futureTouchOut;
 }

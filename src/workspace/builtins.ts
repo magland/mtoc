@@ -29,6 +29,7 @@ import {
   type MType,
   type Sign,
 } from "../lowering/types.js";
+import { isOwnedProducer } from "../lowering/anf.js";
 
 /** Sign-domain constraint on an argument. `null` means no constraint. */
 export type Domain = "nonnegative" | "positive" | null;
@@ -441,14 +442,20 @@ const BUILTINS: BuiltinSig[] = [
     lowerStmt: (ctx, args, span) => {
       if (args.length !== 1) return null;
       const arg = ctx.lowerExpr(args[0]);
-      // Codegen can only print scalars or named tensor variables; a
-      // tensor expression has no addressable storage to hand to the
-      // runtime helper, so reject it with a span before codegen.
-      // Exception: CharLit (non-owning literal handle) is always OK.
+      // Codegen needs a named addressable handle (`Var`) or a non-owning
+      // literal (`CharLit` / `StringLit`) to pass to the runtime disp
+      // helper. Owned-producing expressions (TensorLit / IndexSlice /
+      // user-func owned Call / string concat) are accepted here because
+      // the post-lowering ANF pass hoists each one into its own
+      // `_mtoc_anf_<N>` Assign, so codegen ultimately sees a `Var`.
+      // Other multi-element expressions (Binary / Unary / elementwise
+      // builtin Call on tensors) still reject — auto-materializing
+      // those would need a separate pass.
       if (
         isMultiElement(arg.ty) &&
         arg.kind !== "Var" &&
-        arg.kind !== "CharLit"
+        arg.kind !== "CharLit" &&
+        !isOwnedProducer(arg)
       ) {
         throw new UnsupportedConstruct(
           `'disp' of a tensor expression is only supported for ` +
@@ -456,11 +463,12 @@ const BUILTINS: BuiltinSig[] = [
           args[0].span
         );
       }
-      // Same restriction for strings: a bare concat expression has no
-      // named buffer to hand to the runtime helper, and the owned
-      // result would leak. Allow `StringLit` (cheap, points at .rodata)
-      // and `Var`; reject otherwise.
-      if (isString(arg.ty) && arg.kind !== "Var" && arg.kind !== "StringLit") {
+      if (
+        isString(arg.ty) &&
+        arg.kind !== "Var" &&
+        arg.kind !== "StringLit" &&
+        !isOwnedProducer(arg)
+      ) {
         throw new UnsupportedConstruct(
           `'disp' of a string expression is only supported for string ` +
             `literals or variables; assign the value to a name first`,
@@ -525,7 +533,11 @@ const BUILTINS: BuiltinSig[] = [
         const allowedKinds = isStr
           ? new Set(["Var", "StringLit"])
           : new Set(["Var", "CharLit"]);
-        if (!allowedKinds.has(msg.kind)) {
+        // Owned-producing msg expressions (e.g. string concat,
+        // user-func string return) are admitted here because the
+        // post-lowering ANF pass hoists them into their own
+        // `_mtoc_anf_<N>` Assigns, leaving a `Var` for codegen.
+        if (!allowedKinds.has(msg.kind) && !isOwnedProducer(msg)) {
           throw new UnsupportedConstruct(
             `'assert' message must be a literal or variable; ` +
               `assign the value to a name first`,
@@ -567,7 +579,15 @@ const BUILTINS: BuiltinSig[] = [
           args[0].span
         );
       }
-      if (arg.kind !== "Var" && arg.kind !== "StringLit") {
+      // Owned-producing string args (concat / user-func string return)
+      // are admitted here because the post-lowering ANF pass hoists
+      // them into their own `_mtoc_anf_<N>` Assigns, so codegen sees a
+      // `Var`.
+      if (
+        arg.kind !== "Var" &&
+        arg.kind !== "StringLit" &&
+        !isOwnedProducer(arg)
+      ) {
         throw new UnsupportedConstruct(
           `'error' of a string expression is only supported for string ` +
             `literals or variables; assign the value to a name first`,
