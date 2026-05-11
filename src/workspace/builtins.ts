@@ -10,14 +10,19 @@
  * shape-polymorphic builtin or stmt-only builtin (`error`, `assert`)
  * means appending one entry and writing two short closures.
  *
- * The factories below (`libm`, `runtime`, `reduceVector`,
- * `reduceTensor`) keep the registry terse for the common cases.
+ * The factories below (`libm`, `runtime`, `reduceTensor`) keep the
+ * registry terse for the common cases. Shape-dispatched reductions
+ * (`sum` / `min` / `max` over a tensor argument) drive their lowering
+ * through the per-builtin `lowerExpr` hook + `oneArgReductionLowerExpr`
+ * factory, since the result kind (scalar vs tensor) depends on the
+ * argument's static shape.
  */
 
 import type { Expr, Span } from "../parser/index.js";
 import { UnsupportedConstruct } from "../lowering/errors.js";
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
+  dimIsOne,
   isCharArray,
   isMultiElement,
   isNumeric,
@@ -32,6 +37,7 @@ import {
   typeToString,
   type DimInfo,
   type MType,
+  type NumericType,
   type Sign,
 } from "../lowering/types.js";
 import { isOwnedProducer } from "../lowering/anf.js";
@@ -355,55 +361,6 @@ function runtime(
   };
 }
 
-interface ReduceVectorComplexOpts {
-  /** When set, complex-vector inputs are admitted and dispatched to
-   *  this runtime helper, which returns `double _Complex`. The result
-   *  type tracks the input — real → real, complex → complex. */
-  complexHelperName?: string;
-}
-
-/** 1-arg vector reduction (e.g. `sum(v)`). The result sign is derived
- *  from the argument's sign — summing nonneg elements is nonneg, etc.
- *  Optionally accepts a complex sibling helper for complex-vector
- *  inputs (`sum` over a complex vector returns a complex scalar). */
-function reduceVector(
-  name: string,
-  helperName: string,
-  signFromArg: (s: Sign) => Sign,
-  complexOpts: ReduceVectorComplexOpts = {}
-): BuiltinSig {
-  const { complexHelperName } = complexOpts;
-  const complexDomain: ComplexDomain = complexHelperName
-    ? "real-or-complex"
-    : "real-only";
-  return {
-    name,
-    category: "expr",
-    params: [
-      {
-        shape: "vector",
-        domain: null,
-        elem: "double",
-        complexDomain,
-      },
-    ],
-    result: argTys => {
-      const argTy = argTys[0];
-      if (complexHelperName && isNumeric(argTy) && argTy.isComplex) {
-        return scalarComplex();
-      }
-      const argSign: Sign = isNumeric(argTy) ? argTy.sign : "unknown";
-      return scalarDouble(signFromArg(argSign));
-    },
-    emit: (args, argTys, state) => {
-      const useComplex = complexHelperName !== undefined && anyComplex(argTys);
-      const target = useComplex ? complexHelperName! : helperName;
-      state.useRuntime(target);
-      return `${target}(${args.join(", ")})`;
-    },
-  };
-}
-
 /** 1-arg multi-element tensor reduction returning a scalar of fixed
  *  sign (e.g. `length`, `numel`). These are pure introspection — the
  *  result is rows/cols-derived and doesn't touch element values — so
@@ -431,6 +388,63 @@ function reduceTensor(
     },
   };
 }
+
+/** Helper-name table for the four shape × element-kind reduction
+ *  variants. `runtimeKey` is the name the codegen activates via
+ *  `state.useRuntime(...)`; `cName` is the function the emit closure
+ *  renders. The two differ for `min`/`max` (one umbrella .h file
+ *  defines both the min and max C functions) but are identical for
+ *  `sum` (one .h per C function). Used by `oneArgReductionLowerExpr`
+ *  to pick the right helper based on the input's static shape and
+ *  element kind. */
+interface ReductionHelpers {
+  realAll: { runtimeKey: string; cName: string };
+  complexAll: { runtimeKey: string; cName: string };
+  realDefault: { runtimeKey: string; cName: string };
+  complexDefault: { runtimeKey: string; cName: string };
+}
+
+const SUM_REDUCTION: ReductionHelpers = {
+  realAll: { runtimeKey: "mtoc_sum", cName: "mtoc_sum" },
+  complexAll: { runtimeKey: "mtoc_sum_complex", cName: "mtoc_sum_complex" },
+  realDefault: { runtimeKey: "mtoc_sum_default", cName: "mtoc_sum_default" },
+  complexDefault: {
+    runtimeKey: "mtoc_sum_complex_default",
+    cName: "mtoc_sum_complex_default",
+  },
+};
+
+const MIN_REDUCTION: ReductionHelpers = {
+  realAll: { runtimeKey: "mtoc_minmax_real_all", cName: "mtoc_min_real_all" },
+  complexAll: {
+    runtimeKey: "mtoc_minmax_complex_all",
+    cName: "mtoc_min_complex_all",
+  },
+  realDefault: {
+    runtimeKey: "mtoc_minmax_real_default",
+    cName: "mtoc_min_real_default",
+  },
+  complexDefault: {
+    runtimeKey: "mtoc_minmax_complex_default",
+    cName: "mtoc_min_complex_default",
+  },
+};
+
+const MAX_REDUCTION: ReductionHelpers = {
+  realAll: { runtimeKey: "mtoc_minmax_real_all", cName: "mtoc_max_real_all" },
+  complexAll: {
+    runtimeKey: "mtoc_minmax_complex_all",
+    cName: "mtoc_max_complex_all",
+  },
+  realDefault: {
+    runtimeKey: "mtoc_minmax_real_default",
+    cName: "mtoc_max_real_default",
+  },
+  complexDefault: {
+    runtimeKey: "mtoc_minmax_complex_default",
+    cName: "mtoc_max_complex_default",
+  },
+};
 
 // ── Registry ────────────────────────────────────────────────────────────
 
@@ -840,18 +854,29 @@ const BUILTINS: BuiltinSig[] = [
   libm("hypot", 2, "hypot", "nonnegative"),
   libm("power", 2, "pow", "unknown"),
 
-  // ── 2-arg runtime — `min`/`max` accept complex ───────────────────────
-  // For real, libm `fmin`/`fmax` are correct. For complex, numbl orders
-  // by magnitude with ties broken by angle — we wrap that in a runtime
-  // helper. Mixing real and complex promotes the real to complex.
-  runtime("min", 2, "fmin", "unknown", [], {
-    complexHelperName: "mtoc_min_complex",
-    realIsLibm: true,
-  }),
-  runtime("max", 2, "fmax", "unknown", [], {
-    complexHelperName: "mtoc_max_complex",
-    realIsLibm: true,
-  }),
+  // ── `min`/`max` — overloaded across arity ───────────────────────────
+  // The default 2-arg sigs handle elementwise `min(a, b)` / `max(a, b)`
+  // (real → libm `fmin`/`fmax`; complex → `mtoc_min_complex` /
+  // `mtoc_max_complex`; mixed real-complex promotes to complex). The
+  // `lowerExpr` hook intercepts the 1-arg form and synthesizes a
+  // reduction sig (vector-like input → scalar result via `_all` helper;
+  // matrix input → tensor result via `_default` helper). 2-arg calls
+  // fall through to the elementwise path; 3-arg `(v, [], dim)` is
+  // deferred (requires empty-tensor-literal support — see Phase B).
+  {
+    ...runtime("min", 2, "fmin", "unknown", [], {
+      complexHelperName: "mtoc_min_complex",
+      realIsLibm: true,
+    }),
+    lowerExpr: oneArgReductionLowerExpr("min", MIN_REDUCTION, s => s),
+  },
+  {
+    ...runtime("max", 2, "fmax", "unknown", [], {
+      complexHelperName: "mtoc_max_complex",
+      realIsLibm: true,
+    }),
+    lowerExpr: oneArgReductionLowerExpr("max", MAX_REDUCTION, s => s),
+  },
 
   // ── 2-arg runtime ────────────────────────────────────────────────────
   // `mod(a,b)` follows MATLAB convention (sign of result follows divisor).
@@ -859,13 +884,38 @@ const BUILTINS: BuiltinSig[] = [
   runtime("mod", 2, "mtoc_mod", "unknown"),
 
   // ── Tensor reductions / introspection ────────────────────────────────
-  // `sum` is restricted to vectors for now; matrix sums (which return a
-  // row vector of column sums) need a tensor-returning builtin path
-  // we'll add later. The result sign tracks the input's sign — sum of
-  // nonneg elements is nonneg, sum of positive is positive, etc.
-  reduceVector("sum", "mtoc_sum", s => s, {
-    complexHelperName: "mtoc_sum_complex",
-  }),
+  // `sum` accepts any numeric value:
+  //   - scalar           → identity (the value, unchanged).
+  //   - vector-like      → scalar result via `mtoc_sum` (real) or
+  //                        `mtoc_sum_complex` (complex). "Vector-like"
+  //                        means at most one non-singleton axis.
+  //   - statically a matrix (≥2 axes are `notOne`) → tensor result via
+  //                        `mtoc_sum_default` (real) or `_complex_default`.
+  //   - statically ambiguous shape → rejected at lowering with a clear
+  //                        diagnostic (deferred until explicit-dim or
+  //                        runtime-shape dispatch lands).
+  // The result sign tracks the input's sign — summing nonneg elements
+  // stays nonneg, etc. The default-path entries below are unreachable;
+  // every call routes through `lowerExpr`.
+  {
+    name: "sum",
+    category: "expr",
+    params: [
+      {
+        shape: "any",
+        domain: null,
+        elem: "double",
+        complexDomain: "real-or-complex",
+      },
+    ],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "codegen internal: sum must be lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: oneArgReductionLowerExpr("sum", SUM_REDUCTION, s => s),
+  },
 
   // `length` and `numel` accept any non-scalar tensor and return a
   // nonneg scalar (the count includes 0 for an empty tensor). They
@@ -1245,6 +1295,159 @@ function tocLowerStmt(
       span,
     },
     span,
+  };
+}
+
+/** Build a `lowerExpr` hook for a 1-arg tensor reduction that dispatches
+ *  on the static shape of its argument:
+ *
+ *  - **Scalar input**     → return the arg unchanged (identity fold,
+ *                           matching numbl's `min(x) === x` /
+ *                           `sum(x) === x` for runtime numbers).
+ *  - **Vector-like input** (≤1 axis is not statically `one`) → emit a
+ *                           call to the `_all` helper; result type is
+ *                           `scalarDouble` / `scalarComplex`.
+ *  - **Matrix input** (≥2 axes are `notOne`, with no `unknown` mixed in)
+ *                         → emit a call to the `_default` helper; result
+ *                           type is computed by collapsing the first
+ *                           `notOne` axis to `one` and trailing-stripping.
+ *  - **Statically ambiguous** (≥2 non-`one` axes with at least one
+ *                              `unknown`) → reject at lowering. The user
+ *                              can `reshape` to a known shape or wait
+ *                              for the explicit-dim form.
+ *
+ *  When the call's arity isn't 1, returns `null` to defer to the default
+ *  sig — for `min`/`max` that means falling through to the 2-arg
+ *  elementwise path; for `sum` the default sig is throw-only, so a
+ *  non-1 arity will raise the registry's standard "expects 1 argument(s),
+ *  got N" message via the default validation. */
+function oneArgReductionLowerExpr(
+  name: string,
+  helpers: ReductionHelpers,
+  signFromArg: (s: Sign) => Sign
+): BuiltinLowerExpr {
+  return (_ctx, args, span) => {
+    if (args.length !== 1) return null;
+    const arg = args[0];
+    if (!isNumeric(arg.ty)) {
+      throw new UnsupportedConstruct(
+        `${name}: argument must be numeric (got ${typeToString(arg.ty)})`,
+        span
+      );
+    }
+    if (arg.ty.elem !== "double") {
+      throw new UnsupportedConstruct(
+        `${name}: char-array argument is not yet supported`,
+        span
+      );
+    }
+    if (isScalar(arg.ty)) {
+      // numbl's `sum(x) === x`, `min(x) === x`, `max(x) === x` for a
+      // scalar `x`. Skip the call entirely — the arg's value flows up.
+      return arg;
+    }
+    const isComplex = arg.ty.isComplex;
+    const argSign: Sign = arg.ty.sign;
+    const resultSign: Sign = signFromArg(argSign);
+    const nonOneAxes = arg.ty.dims.filter(d => !dimIsOne(d));
+    if (nonOneAxes.length <= 1) {
+      // Result is a scalar regardless of the runtime sizes of the
+      // unknown / notOne axis (sum of N elements → scalar; min/max of
+      // N elements → scalar). Use the `_all` helper.
+      const variant = isComplex ? helpers.complexAll : helpers.realAll;
+      const resultTy = isComplex ? scalarComplex() : scalarDouble(resultSign);
+      const sig: BuiltinSig = {
+        name,
+        category: "expr",
+        params: [
+          {
+            shape: "tensor",
+            domain: null,
+            elem: "double",
+            complexDomain: "real-or-complex",
+          },
+        ],
+        result: () => resultTy,
+        emit: (argStrs, _argTys, state) => {
+          state.useRuntime(variant.runtimeKey);
+          return `${variant.cName}(${argStrs[0]})`;
+        },
+      };
+      return {
+        kind: "Call",
+        name,
+        callee: { kind: "builtin", sig },
+        args,
+        ty: resultTy,
+        span,
+      };
+    }
+    // ≥2 non-`one` axes. We need every non-`one` axis to be definitely
+    // `notOne` (not `unknown`) to pick the result kind statically. With
+    // an `unknown` mixed in, the input could be a vector (collapsing
+    // to a scalar) or a matrix (giving a tensor) at runtime — the
+    // static return type can't unify those two shapes.
+    const hasUnknown = arg.ty.dims.some(d => d.kind === "unknown");
+    if (hasUnknown) {
+      throw new UnsupportedConstruct(
+        `${name}: input shape ${typeToString(arg.ty)} is statically ` +
+          `ambiguous (it might be a vector or a matrix at runtime, which ` +
+          `produce a scalar vs tensor result respectively); reshape to ` +
+          `a known shape first, or pass an explicit dim argument once ` +
+          `that form is supported`,
+        span
+      );
+    }
+    // Statically a matrix (every non-`one` axis is `notOne`). Compute
+    // the result shape: collapse the first `notOne` axis to `one`,
+    // leave the rest. `numericTypeND` does the trailing-singleton strip.
+    const resultDims: DimInfo[] = arg.ty.dims.slice();
+    let firstNotOne = -1;
+    for (let i = 0; i < resultDims.length; i++) {
+      if (resultDims[i].kind === "notOne") {
+        firstNotOne = i;
+        break;
+      }
+    }
+    if (firstNotOne === -1) {
+      throw new Error(
+        `internal: ${name}: expected ≥1 notOne axis after passing the ` +
+          `nonOneAxes.length >= 2 + no-unknown checks`
+      );
+    }
+    resultDims[firstNotOne] = { kind: "one" };
+    const resultTy: NumericType = numericTypeND(
+      resultDims,
+      isComplex,
+      resultSign
+    );
+    const variant = isComplex ? helpers.complexDefault : helpers.realDefault;
+    const sig: BuiltinSig = {
+      name,
+      category: "expr",
+      params: [
+        {
+          shape: "tensor",
+          domain: null,
+          elem: "double",
+          complexDomain: "real-or-complex",
+        },
+      ],
+      result: () => resultTy,
+      emit: (argStrs, _argTys, state) => {
+        state.useRuntime(variant.runtimeKey);
+        return `${variant.cName}(${argStrs[0]})`;
+      },
+      producesOwnedDirectly: true,
+    };
+    return {
+      kind: "Call",
+      name,
+      callee: { kind: "builtin", sig },
+      args,
+      ty: resultTy,
+      span,
+    };
   };
 }
 

@@ -246,6 +246,50 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
   ["mtoc_sign", loadSnippet("sign.h")],
   ["mtoc_sum", loadSnippet("sum.h", ["mtoc_tensor_t"])],
   ["mtoc_sum_complex", loadSnippet("sum_complex.h", ["mtoc_tensor_t"])],
+  [
+    "mtoc_sum_default",
+    loadSnippet("sum_default.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc",
+      "mtoc_tensor_alloc_nd",
+    ]),
+  ],
+  [
+    "mtoc_sum_complex_default",
+    loadSnippet("sum_complex_default.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_nd_complex",
+    ]),
+  ],
+  // Tensor `min` / `max` — 1-arg reduction siblings of the 2-arg
+  // elementwise `min` / `max` registered above. Each `.h` defines BOTH
+  // the min and max variants together; we register one umbrella key per
+  // .h file and the lowerer activates that umbrella regardless of which
+  // symbol it emits in the C source (same idiom as `mtoc_rng` / `mtoc_tic`):
+  //   - mtoc_minmax_real_all      → mtoc_min_real_all / mtoc_max_real_all
+  //   - mtoc_minmax_complex_all   → mtoc_min_complex_all / mtoc_max_complex_all
+  //   - mtoc_minmax_real_default  → mtoc_min_real_default / mtoc_max_real_default
+  //   - mtoc_minmax_complex_default → mtoc_min_complex_default / mtoc_max_complex_default
+  ["mtoc_minmax_real_all", loadSnippet("minmax_all.h", ["mtoc_tensor_t"])],
+  [
+    "mtoc_minmax_complex_all",
+    loadSnippet("minmax_complex_all.h", ["mtoc_tensor_t"]),
+  ],
+  [
+    "mtoc_minmax_real_default",
+    loadSnippet("minmax_default.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc",
+      "mtoc_tensor_alloc_nd",
+    ]),
+  ],
+  [
+    "mtoc_minmax_complex_default",
+    loadSnippet("minmax_complex_default.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_nd_complex",
+    ]),
+  ],
   ["mtoc_length", loadSnippet("length.h", ["mtoc_tensor_t"])],
   ["mtoc_numel", loadSnippet("numel.h", ["mtoc_tensor_t"])],
   // Complex-scalar runtime helpers — siblings of libm-real / mtoc-real

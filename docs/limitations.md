@@ -128,9 +128,20 @@ workaround or a roadmap note.
     "tensor-valued expression at statement scope"; capture into a name
     if you want the buffer freed automatically at scope exit.
 
-- **`sum` on a matrix isn't supported.** Vector sum returns scalar; matrix sum
-  in numbl returns a row vector of column sums, which needs a tensor-returning
-  builtin path.
+- **Reductions (`sum` / `min` / `max`) require a statically-known
+  scalar-or-vector vs matrix shape.** mtoc dispatches on the argument's
+  static type: a scalar is the identity, an input with ≤1 non-singleton
+  axis reduces to a scalar (real → `double`, complex → `double _Complex`),
+  and an input with ≥2 axes that are statically `notOne` reduces along
+  the first non-singleton axis to a fresh tensor (numbl's default-dim
+  rule). NaN-skip and complex magnitude-then-angle ordering match numbl
+  byte-for-byte. What's deferred: the explicit `(v, [], dim)` form
+  (blocked on empty-tensor-literal `[]` support), the multi-output
+  `[m, i] = min(v)` index form, statically-ambiguous shapes (e.g. the
+  `[unknown, unknown]` output of `reshape` / `zeros(n, m)` — mtoc raises
+  a clear "input shape is statically ambiguous" diagnostic; reshape to
+  a known shape first), and reductions for other names (`prod`, `mean`,
+  `any`, `all`, `norm` along a dim).
 
 ## Functions
 
@@ -171,11 +182,10 @@ workaround or a roadmap note.
   `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`,
   `cosh`, `tanh`, `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`,
   `angle`), complex tensor literals, complex tensor element-wise
-  arithmetic with broadcast, and complex vector `sum` are byte-for-byte
-  against numbl. `^` (complex pow), the rounding family
-  (`floor`/`ceil`/`round`/`fix`) on complex, `mod`/`rem` on complex, and
-  complex `min`/`max` over tensors (only scalars today) are not yet
-  supported. `floor`/`ceil`/`round`/`fix` would need a componentwise
+  arithmetic with broadcast, complex tensor reductions (`sum`, `min`,
+  `max` over vectors and matrices), are byte-for-byte against numbl.
+  `^` (complex pow), the rounding family (`floor`/`ceil`/`round`/`fix`)
+  on complex, and `mod`/`rem` on complex are not yet supported. `floor`/`ceil`/`round`/`fix` would need a componentwise
   runtime helper; `mod`/`rem` are real-only by numbl semantics.
 - **Strings are partial.** Double-quoted scalar strings (`"hello"`)
   work for `disp`, `error`, `assert(_, msg)`, `strcmp`, `+`

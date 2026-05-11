@@ -11,6 +11,7 @@ disp(numel(c));
 m = [1 2 3; 4 5 6];
 disp(length(m));
 disp(numel(m));
+disp(sum(m));
 
 % sum over a vector built from arithmetic
 a = [1 2 3];

@@ -83,8 +83,15 @@ The subset is growing iteratively. Roughly:
   `atan2`, `hypot`, `power`
 - Numeric predicates: `isnan`, `isinf`, `isfinite`, `logical` (all
   scalar; return 0.0/1.0 to match numbl's logical-as-double convention)
-- Runtime helpers: `sign`, `mod`, `sum` (vector), `length`, `numel`,
-  `strcmp` (char-array, string, or any mix; scalar 0/1 result)
+- Runtime helpers: `sign`, `mod`, `length`, `numel`, `strcmp`
+  (char-array, string, or any mix; scalar 0/1 result)
+- Reductions: `sum(t)`, `min(t)`, `max(t)` — single-arg, over any
+  statically-shape-known tensor (real or complex). Vectors and any
+  shape with ≤1 non-singleton axis collapse to a scalar; statically-
+  known matrices collapse along the first non-singleton axis to a
+  fresh tensor. Complex ordering is by magnitude with ties broken by
+  angle; NaNs are skipped, matching numbl. The 2-arg `min(a, b)` /
+  `max(a, b)` is still elementwise.
   (full registry: [`src/workspace/builtins.ts`](src/workspace/builtins.ts))
 - Shape builtins: `size(t)` (row vector of dim sizes),
   `size(t, dim)`, `ndims(t)` (min-2 padded like numbl),
@@ -143,7 +150,7 @@ The subset is growing iteratively. Roughly:
   `UnsupportedConstruct` at the call site in v1 — see
   [docs/limitations.md](docs/limitations.md)
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
-  arithmetic on them, `sum`, `length`, `numel`
+  arithmetic on them, `sum` / `min` / `max` reductions, `length`, `numel`
 - Non-conjugate transpose `.'` on 2-D real / complex tensors. The imag
   lane is reordered but not negated (that's `'` — conjugate transpose,
   not yet wired). Char arrays and `ndim > 2` are rejected at lowering
@@ -185,8 +192,10 @@ The subset is growing iteratively. Roughly:
   byte-for-byte (scalar + tensor), and complex-aware builtins —
   `sqrt`, `exp`, `log`, `log2`, `log10`, `expm1`, `log1p`, `sin`,
   `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`,
-  `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`, `angle`,
-  `sum` (vector reduction). `length`/`numel` accept any tensor.
+  `abs`, `sign`, `real`, `imag`, `conj`, `angle`, and the
+  tensor-aware reductions `sum`, `min`, `max` (single-arg form over
+  vectors and matrices, including complex). `length`/`numel` accept
+  any tensor.
   `floor`/`ceil`/`round`/`fix`, `mod`/`rem`, and `^` stay real-only
   for now (numbl-semantics or pending implementation work).
 - Strings (numbl `string`, scalar only): double-quoted literals

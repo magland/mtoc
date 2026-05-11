@@ -54,10 +54,12 @@ patterns:
   `complexOpts.realIsLibm: true` when the real-side `helperName` is
   actually a libm function (e.g. `log10`, `fmin`) so the factory skips
   `useRuntime` on the real branch.
-- **`reduceVector(name, helperName, signFromArg)`** — vector → scalar reduction
-  (`sum`). Sign computed from the arg.
 - **`reduceTensor(name, helperName, resultSign, domains)`** — tensor → scalar
   introspection (`length`, `numel`).
+- **`oneArgReductionLowerExpr(name, helpers, signFromArg)`** — `lowerExpr`
+  hook for value-reducing builtins (`sum` / `min` / `max`) that need to
+  return a scalar OR a tensor depending on the argument's static shape.
+  See "Shape-dispatched tensor reductions" below.
 
 Most new builtins fit one of these. Adding a new factory is appropriate when
 several entries share a non-trivial closure shape.
@@ -111,9 +113,46 @@ real-or-complex sibling (`cabs`, `csqrt`, …) keeps working because the
 dispatch in the closure reads `argTys` directly off the (unscalarified)
 call IR.
 
-Reductions like `sum` / `length` / `numel` are NOT element-wise (their
-param shape is `vector` / `tensor`), so they consume the full tensor
-struct as before.
+Reductions like `sum` / `min(t)` / `max(t)` / `length` / `numel` are
+NOT element-wise — they consume the full tensor struct as a single
+value. See "Shape-dispatched tensor reductions" below for how the
+value-reducing flavors pick a scalar- vs tensor-returning helper.
+
+## Shape-dispatched tensor reductions
+
+`sum`, `min`, and `max` each have to choose between a scalar-returning
+runtime helper (`mtoc_sum(t) → double`) and a tensor-returning one
+(`mtoc_sum_default(t) → mtoc_tensor_t`) depending on the argument's
+static shape. `oneArgReductionLowerExpr` is the `lowerExpr` factory
+that drives this dispatch — caller provides a `ReductionHelpers` table
+(real-all / complex-all / real-default / complex-default helper
+identifiers) plus a sign-propagation rule.
+
+The dispatch rule mirrors numbl's `firstReduceDim`:
+
+| Static shape of `arg.ty`                                             | Result                                                  |
+| -------------------------------------------------------------------- | ------------------------------------------------------- |
+| Scalar (all axes `one`)                                              | Identity — the call lowers to `arg` itself              |
+| ≤1 axis is not `one` (rest `one`)                                    | Scalar via `_all` helper                                |
+| ≥2 axes are `notOne`, no `unknown` mixed in                          | Tensor via `_default`; first `notOne` axis → `one`      |
+| ≥2 non-`one` axes with at least one `unknown` (statically ambiguous) | `UnsupportedConstruct` at lowering with a clear message |
+
+The statically-ambiguous case is what `reshape(t, ...)` / `zeros(n, m)`
+produce — the result could be a vector (collapsing to a scalar) or a
+matrix (giving a tensor) at runtime, and the static return type can't
+unify those two shapes. Users hit this by `reshape`-ing to a known
+shape first, or by waiting on the explicit-`dim` form.
+
+`min` and `max` keep their 2-arg elementwise sigs alongside this hook
+— the `lowerExpr` factory returns `null` for arity-2 calls, letting
+the existing scalar-scalar lift handle `min(a, b)`. For `sum`, the
+default-path entry is throw-only and every arity is routed through
+the hook (arity ≠ 1 hits the standard "expects 1 argument" error).
+
+`min`/`max` over a complex tensor order by magnitude with ties broken
+by angle (`atan2(im, re)`), and skip NaN per `minMaxScan` in numbl —
+the runtime helpers (`minmax_complex_all.h` / `minmax_complex_default.h`)
+encode that ordering directly.
 
 ## Adding one
 
@@ -234,9 +273,11 @@ numeric path for element-wise addition.
 - **Tensor-returning builtins** plug in via `lowerExpr` synthesizing a
   one-shot `BuiltinSig` whose `result` is multi-element and `emit`
   renders a runtime helper that allocates the result. Today `size(t)`
-  (→ `mtoc_size_vec`) and `reshape(t, …)` (→ `mtoc_tensor_reshape` /
-  `_complex`) follow this pattern; future ones (e.g. `zeros(N, M)`) plug
-  in the same way. The ANF pass and IR validator recognize non-
-  elementwise builtin Calls with `isOwned` result as owned producers,
+  (→ `mtoc_size_vec`), `reshape(t, …)` (→ `mtoc_tensor_reshape` /
+  `_complex`), `zeros(N, M)` / `ones(...)` / `nan(...)` / `inf(...)` /
+  `eye(...)`, and the matrix-shaped `sum(t)` / `min(t)` / `max(t)` (→
+  `mtoc_sum_default` / `mtoc_minmax_*_default`) follow this pattern.
+  The ANF pass and IR validator recognize non-elementwise builtin
+  Calls with `isOwned` result as owned producers,
   so a tensor-returning builtin can appear at an Assign RHS or be
   auto-hoisted out of nested positions.
