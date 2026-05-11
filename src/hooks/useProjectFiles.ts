@@ -17,6 +17,7 @@ import {
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder("utf-8");
+const SAVE_DEBOUNCE_MS = 500;
 
 /** Metadata-only file reference (no content loaded). */
 export interface WorkspaceFile {
@@ -67,16 +68,9 @@ export interface UseProjectFilesResult {
   contentCache: React.RefObject<Map<string, Uint8Array>>;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function debounce<T extends (...args: any[]) => any>(
-  fn: T,
-  delay: number
-): (...args: Parameters<T>) => void {
-  let timeoutId: ReturnType<typeof setTimeout>;
-  return (...args: Parameters<T>) => {
-    clearTimeout(timeoutId);
-    timeoutId = setTimeout(() => fn(...args), delay);
-  };
+interface PendingSave {
+  data: Uint8Array;
+  timeoutId: ReturnType<typeof setTimeout>;
 }
 
 function generateUniqueName(files: WorkspaceFile[]): string {
@@ -108,6 +102,7 @@ export function useProjectFiles(projectName: string): UseProjectFilesResult {
   const [activeFileId, setActiveFileIdRaw] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const contentCacheRef = useRef(new Map<string, Uint8Array>());
+  const pendingSavesRef = useRef(new Map<string, PendingSave>());
 
   const setActiveFileId = useCallback(
     (id: string) => {
@@ -116,6 +111,53 @@ export function useProjectFiles(projectName: string): UseProjectFilesResult {
     },
     [projectName]
   );
+
+  // Fire one file's pending save synchronously (still async at the IDB layer,
+  // but no longer waiting on the debounce timer).
+  const flushSave = useCallback((fileId: string) => {
+    const pending = pendingSavesRef.current.get(fileId);
+    if (!pending) return;
+    clearTimeout(pending.timeoutId);
+    pendingSavesRef.current.delete(fileId);
+    saveFileData(fileId, pending.data).catch(e =>
+      console.error("Failed to save file:", e)
+    );
+  }, []);
+
+  const flushAllSaves = useCallback(() => {
+    for (const fileId of Array.from(pendingSavesRef.current.keys())) {
+      flushSave(fileId);
+    }
+  }, [flushSave]);
+
+  // Flush pending writes when the page is hidden/unloaded so a reload within
+  // the debounce window doesn't see empty files.
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") flushAllSaves();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", flushAllSaves);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", flushAllSaves);
+      flushAllSaves();
+    };
+  }, [flushAllSaves]);
+
+  // Per-file debounced save — a write to file B never clobbers file A's
+  // pending write, and switching active file is safe.
+  const scheduleSave = useCallback((fileId: string, data: Uint8Array) => {
+    const existing = pendingSavesRef.current.get(fileId);
+    if (existing) clearTimeout(existing.timeoutId);
+    const timeoutId = setTimeout(() => {
+      pendingSavesRef.current.delete(fileId);
+      saveFileData(fileId, data).catch(e =>
+        console.error("Failed to save file:", e)
+      );
+    }, SAVE_DEBOUNCE_MS);
+    pendingSavesRef.current.set(fileId, { data, timeoutId });
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -160,25 +202,13 @@ export function useProjectFiles(projectName: string): UseProjectFilesResult {
     []
   );
 
-  const debouncedSave = useMemo(
-    () =>
-      debounce(async (fileId: string, data: Uint8Array) => {
-        try {
-          await saveFileData(fileId, data);
-        } catch (e) {
-          console.error("Failed to save file:", e);
-        }
-      }, 500),
-    []
-  );
-
   const updateFileContent = useCallback(
     (content: string) => {
       const data = textEncoder.encode(content);
       contentCacheRef.current.set(activeFileId, data);
-      debouncedSave(activeFileId, data);
+      scheduleSave(activeFileId, data);
     },
-    [activeFileId, debouncedSave]
+    [activeFileId, scheduleSave]
   );
 
   const emptyData = useMemo(() => new Uint8Array(0), []);
@@ -200,6 +230,11 @@ export function useProjectFiles(projectName: string): UseProjectFilesResult {
   const handleDeleteFile = useCallback(
     async (fileId: string) => {
       try {
+        const pending = pendingSavesRef.current.get(fileId);
+        if (pending) {
+          clearTimeout(pending.timeoutId);
+          pendingSavesRef.current.delete(fileId);
+        }
         await deleteFile(fileId);
         contentCacheRef.current.delete(fileId);
         if (activeFileId === fileId) {
