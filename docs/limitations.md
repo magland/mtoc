@@ -37,14 +37,27 @@ workaround or a roadmap note.
   `UnsupportedConstruct`. The codegen path for dynamic-shape allocation
   is in place — only the builtin signatures and runtime helpers remain.
 - **Tensor sub-expressions only at `Assign` RHS.** `disp(a + b)` and
-  `sum(a .* a)` fail with a clear "assign to a temp first" message.
-  Auto-materialization of tensor temporaries during lowering is a known TODO.
+  `sum(a .* a)` fail with a clear "assign to a temp first" message —
+  the call result still has nowhere to land. Element-wise scalar
+  builtins (`sqrt`, `sin`, `cos`, `abs`, `atan2`, `hypot`, `power`, `min`,
+  `max`, `mod`, `rem`, `floor`, `ceil`, `round`, `fix`, `isnan`, `isinf`,
+  `isfinite`, `logical`, `real`, `imag`, `conj`, `angle`, `sign`) DO lift
+  over tensor arguments automatically at the top level of an `Assign` —
+  `y = sqrt(x)` materializes the same per-slot loop as `y = x .* x`.
+  Reductions (`sum`, `length`, `numel`) and user-function calls still
+  require their tensor argument materialized to a named variable.
+  Auto-materialization of tensor temporaries during lowering is a known
+  TODO.
 - **No matrix multiply / divide / power yet.** `*`/`/`/`^` between two
   tensors is explicitly rejected at lowering with a message pointing the user
   at `.* ./ .^` for elementwise. Matrix ops will need a separate codegen path
-  (likely calling into a BLAS-shaped helper).
-- **No tensor comparisons.** `a == b` requires both to be scalars. Elementwise
-  comparison on tensors will land alongside auto-materialization.
+  (likely calling into a BLAS-shaped helper). `.^` itself works on tensors
+  (real-elem, scalar↔tensor broadcast or same-shape tensor↔tensor); complex
+  `.^` is deferred.
+- **Tensor comparisons lift.** `a == b`, `a < b`, `a > 0`, `a ~= b`, etc.
+  produce 0.0/1.0 tensors at the element-wise broadcast shape. `&&` /
+  `||` stay scalar-only — there is no `&` / `|` parser shape yet for the
+  element-wise logical conjunction / disjunction.
 - **Indexing covers scalar reads, range/colon reads, scalar writes,
   and range/colon writes** — all on real-or-complex double tensors.
   Scalar reads also work on char tensors; scalar reads / writes

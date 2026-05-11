@@ -87,6 +87,34 @@ that wraps a libm name flips `needMath = true` and emits
 `` `${cName}(${args.join(", ")})` ``; a runtime-helper factory additionally
 calls `useRuntime("mtoc_mod")` (or whichever helper).
 
+## Element-wise lift over tensors
+
+Any builtin whose `params` are all `shape: "scalar"` is automatically
+**element-wise-liftable**: passing one or more multi-element tensor
+arguments materializes a per-slot result tensor at the assignment site
+(via the same iter-loop codegen path that drives tensor `+ - .* ./`).
+The lowerer (`lowerBuiltinCallWithArgs` in `lowering/lowerFuncCall.ts`):
+
+1. Detects the lift by inspecting `params` + arg types.
+2. Computes the broadcast shape across all args (scalar ↔ tensor or
+   same-shape tensor ↔ tensor; via `arithResult` on the type lattice).
+3. Asks the builtin's `result` for the scalar-equivalent result type
+   (by scalarifying the arg types — preserving `elem`/`isComplex`/`sign`,
+   collapsing `rows`/`cols` to 1×1) and widens the result back to the
+   broadcast shape.
+
+The `emit` closure does NOT change — codegen renders each arg in iter
+context (a multi-element `Var` becomes `<v>.real[<iter>]`, complex
+`(<v>.real[<iter>] + <v>.imag[<iter>] * I)`), so the closure sees scalar
+per-slot strings and produces the right C expression unchanged. A
+real-or-complex sibling (`cabs`, `csqrt`, …) keeps working because the
+dispatch in the closure reads `argTys` directly off the (unscalarified)
+call IR.
+
+Reductions like `sum` / `length` / `numel` are NOT element-wise (their
+param shape is `vector` / `tensor`), so they consume the full tensor
+struct as before.
+
 ## Adding one
 
 The common path:

@@ -16,15 +16,19 @@ import type { FunctionStmt } from "../workspace/workspace.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr, IRFunction } from "./ir.js";
 import {
+  arithResult,
   canonicalizeType,
   isMultiElement,
   isScalar,
   isScalarReal,
   isNumeric,
   isVector,
+  scalarDouble,
   signIsNonneg,
   signIsPositive,
+  type DimInfo,
   type MType,
+  type NumericType,
   typeToString,
 } from "./types.js";
 import { Lowerer, assertNotMtocReserved, cNameFor } from "./lower.js";
@@ -126,12 +130,68 @@ export function lowerBuiltinCallWithArgs(
     const overridden = builtin.lowerExpr(this, args, span);
     if (overridden !== null) return overridden;
   }
+  const argLabel = (i: number): string =>
+    builtin.params.length === 1 ? "x" : `arg ${i + 1}`;
+
+  // Elementwise lift: when every param is shape: "scalar" but at least
+  // one arg is a multi-element numeric (double-elem) tensor, the call
+  // becomes elementwise. Per-slot rendering is handled by the existing
+  // iter-loop codegen (`emitTensorAssignFromExpr`); here we only need
+  // to validate the args against their scalar-equivalent constraints
+  // and widen the builtin's scalar result type to the broadcast shape.
+  if (isElementwiseEligible(builtin, args)) {
+    const shape = broadcastNumericShape(args.map(a => a.ty));
+    if (shape === null) {
+      throw new TypeError(
+        `${name}: cannot broadcast arguments with incompatible shapes ` +
+          `(${args.map(a => typeToString(a.ty)).join(", ")})`,
+        span
+      );
+    }
+    for (let i = 0; i < args.length; i++) {
+      const constraint = builtin.params[i];
+      // Shape check: scalar-real-only params still reject complex args
+      // (matches the scalar path); the actual shape mismatch isn't an
+      // error here — it's the whole point of the lift.
+      validateComplexDomain(name, constraint, args[i], argLabel(i), span);
+      validateDomain(name, constraint, args[i], argLabel(i), span);
+    }
+    const scalarArgTys = args.map(a => scalarifyType(a.ty));
+    let scalarResult: MType;
+    try {
+      scalarResult = builtin.result(scalarArgTys);
+    } catch (err) {
+      if (err instanceof TypeError && err.span === null) {
+        throw new TypeError(err.message, span);
+      }
+      throw err;
+    }
+    if (!isNumeric(scalarResult)) {
+      throw new TypeError(
+        `internal: builtin '${name}' produced non-numeric result type ` +
+          `${typeToString(scalarResult)} for elementwise-lifted call`,
+        span
+      );
+    }
+    const resultTy: NumericType = {
+      ...scalarResult,
+      rows: shape.rows,
+      cols: shape.cols,
+    };
+    return {
+      kind: "Call",
+      name,
+      callee: { kind: "builtin", sig: builtin },
+      args,
+      ty: resultTy,
+      span,
+    };
+  }
+
   // Per-arg shape + complex-domain + sign-domain validation, all driven
   // by ParamConstraint. Order matters: the complex-domain check runs
   // before the sign-domain check so a complex arg fails with "cannot
   // accept a complex argument" rather than a confusing sign error.
-  const argLabel = (i: number): string =>
-    builtin.params.length === 1 ? "x" : `arg ${i + 1}`;
   for (let i = 0; i < args.length; i++) {
     const constraint = builtin.params[i];
     validateShape(name, builtin, constraint, args[i], argLabel(i));
@@ -160,6 +220,63 @@ export function lowerBuiltinCallWithArgs(
     ty: resultTy,
     span,
   };
+}
+
+/** True when the builtin's params are all `shape: "scalar"`. Such a
+ *  builtin is element-wise by construction — it operates on one slot
+ *  at a time, so passing a tensor argument means "apply once per
+ *  element". `isElementwiseBuiltin` is the per-sig predicate used by
+ *  both lowering (this file) and the IR validator (`validateIR`). */
+export function isElementwiseBuiltin(sig: BuiltinSig): boolean {
+  return sig.params.every(p => p.shape === "scalar");
+}
+
+/** Whether `args` constitute an elementwise lift of a `builtin` call:
+ *  the builtin is elementwise-shaped, at least one arg is a
+ *  multi-element double-elem numeric, and every arg is a double-elem
+ *  numeric (char tensors fall through to the original validation,
+ *  which rejects them). */
+function isElementwiseEligible(
+  builtin: BuiltinSig,
+  args: ReadonlyArray<IRExpr>
+): boolean {
+  if (!isElementwiseBuiltin(builtin)) return false;
+  let anyMultiElement = false;
+  for (const a of args) {
+    if (!isNumeric(a.ty)) return false;
+    if (a.ty.elem !== "double") return false;
+    if (isMultiElement(a.ty)) anyMultiElement = true;
+  }
+  return anyMultiElement;
+}
+
+/** Drop the row/col dims of a numeric type down to 1×1 while preserving
+ *  `elem`, `isComplex`, and `sign`. Used to "scalarify" an
+ *  element-wise-lifted call's arg types before asking the builtin for
+ *  its scalar-equivalent result type; the call site then widens that
+ *  result back up to the broadcast shape. */
+function scalarifyType(t: MType): MType {
+  if (!isNumeric(t)) return t;
+  const one: DimInfo = { kind: "one" };
+  return { ...t, rows: one, cols: one };
+}
+
+/** Broadcast shape across a list of numeric arg types — the dim of the
+ *  largest-shaped operand per axis (`scalar ⊙ tensor → tensor`,
+ *  `tensor ⊙ same-shape tensor → same`, rowVec ⊙ colVec → null).
+ *  Returns just the rows/cols pair (sign/complex/elem are recomputed
+ *  by the builtin's `result` closure). Returns null if any pair is
+ *  shape-incompatible (mirrors `arithResult`'s Unknown). */
+function broadcastNumericShape(
+  tys: ReadonlyArray<MType>
+): { rows: DimInfo; cols: DimInfo } | null {
+  let acc: MType = scalarDouble("unknown");
+  for (const t of tys) {
+    if (!isNumeric(t)) return null;
+    acc = arithResult("Add", acc, t);
+    if (!isNumeric(acc)) return null;
+  }
+  return { rows: acc.rows, cols: acc.cols };
 }
 
 function validateShape(
