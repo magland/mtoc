@@ -27,6 +27,44 @@ export interface RuntimeSnippet {
   deps: ReadonlyArray<string>;
 }
 
+/**
+ * Parse a raw snippet source string into its `headers` and `code` parts.
+ *
+ * The strict `#include` pattern accepted is:
+ *   optional-whitespace `#` optional-whitespace `include`
+ *   whitespace `<header>` or `"header"` optional-trailing-whitespace
+ *
+ * Any line whose trimmed form starts with `#include` but does NOT match
+ * that pattern (e.g. a trailing `// comment`, a `#include<nospace>`) is
+ * rejected with a clear error rather than silently dropped into the body.
+ *
+ * Exported for use in tests.
+ */
+export function parseSnippetSource(raw: string): {
+  headers: string[];
+  code: string;
+} {
+  const headers: string[] = [];
+  const bodyLines: string[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    const m = line.match(/^\s*#\s*include\s+(<[^>]+>|"[^"]+")\s*$/);
+    if (m) {
+      headers.push(m[1]);
+    } else if (/^\s*#\s*include\b/.test(line)) {
+      throw new Error(
+        `runtime snippet: unexpected #include form: ${JSON.stringify(line)}; ` +
+          `expected '#include <header>' or '#include "header"' with no trailing content`
+      );
+    } else {
+      bodyLines.push(line);
+    }
+  }
+  while (bodyLines.length && bodyLines[0].trim() === "") bodyLines.shift();
+  while (bodyLines.length && bodyLines[bodyLines.length - 1].trim() === "")
+    bodyLines.pop();
+  return { headers, code: bodyLines.join("\n") + "\n" };
+}
+
 function loadSnippet(
   filename: string,
   deps: ReadonlyArray<string> = []
@@ -38,20 +76,8 @@ function loadSnippet(
         `re-run 'npm run build:snippets' after adding the .h file`
     );
   }
-  const headers: string[] = [];
-  const bodyLines: string[] = [];
-  for (const line of raw.split(/\r?\n/)) {
-    const m = line.match(/^\s*#\s*include\s+(<[^>]+>|"[^"]+")\s*$/);
-    if (m) {
-      headers.push(m[1]);
-    } else {
-      bodyLines.push(line);
-    }
-  }
-  while (bodyLines.length && bodyLines[0].trim() === "") bodyLines.shift();
-  while (bodyLines.length && bodyLines[bodyLines.length - 1].trim() === "")
-    bodyLines.pop();
-  return { headers, code: bodyLines.join("\n") + "\n", deps };
+  const { headers, code } = parseSnippetSource(raw);
+  return { headers, code, deps };
 }
 
 // Each `loadSnippet(name, deps)` parses the inlined `.h` file's

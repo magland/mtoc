@@ -190,6 +190,10 @@ export function formatArgInit(state: EmitState, e: IRExpr): string {
 }
 
 export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
+  // Track the current statement level so that expression-level helpers
+  // (emitComplexCmpOrLogical, complex Unary Not) can push hoisted temp
+  // declarations at the right indentation without needing a `level` param.
+  state.currentLevel = level;
   // Drop a numbl-style comment above each emitted statement so a
   // reader of the generated C can follow the original program shape
   // without bouncing back to the `.m` source. `renderStmt` returns
@@ -451,6 +455,9 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       armFreedSets.push(state.freedOwned);
 
       for (const eif of s.elseifs) {
+        // Reset currentLevel so any complex temp hoisted by the condition
+        // expression is pushed at the outer scope level, not the thenBody level.
+        state.currentLevel = level;
         pushStmt(state, level, `} else if (${emitExpr(state, eif.cond, 0)}) {`);
         state.freedOwned = new Set(preFreed);
         for (const t of eif.body) emitStmt(state, level + 1, t);
@@ -1597,6 +1604,10 @@ function emitIndexSliceStore(
     `fprintf(stderr, "mtoc: range-write count mismatch: lhs slice has %ld elements, rhs has %ld\\n", _mtoc_n, _mtoc_rhs_n);`
   );
   pushStmt(state, level + 2, `abort();`);
+  // abort() requires <stdlib.h>. With includeRuntime:true the header is
+  // pulled in transitively by the alloc helper; with includeRuntime:false
+  // snippets are stripped so we must mark it explicitly.
+  state.needStdlib.value = true;
   pushStmt(state, level + 1, `}`);
   pushStmt(
     state,
@@ -1632,10 +1643,6 @@ function emitIndexSliceStore(
   }
   pushStmt(state, level + 1, `}`);
   pushStmt(state, level, `}`);
-  // The fprintf + abort path uses <stdio.h> (always pulled in) and
-  // <stdlib.h> (transitively pulled in by every tensor-bearing
-  // program through the alloc helper, which any IndexSliceStore
-  // base must have triggered). No extra header activation needed.
 }
 
 /** Multi-slot `<base>(slice) = rhs;` write. One nested loop per slot
@@ -1708,6 +1715,8 @@ function emitMultiSlotSliceStore(
       `fprintf(stderr, "mtoc: range-write count mismatch: lhs slice has %ld elements, rhs has %ld\\n", _mtoc_n, _mtoc_rhs_n);`
     );
     pushStmt(state, level + 2, `abort();`);
+    // abort() requires <stdlib.h> — mark explicitly for the no-runtime path.
+    state.needStdlib.value = true;
     pushStmt(state, level + 1, `}`);
   }
 

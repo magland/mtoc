@@ -52,11 +52,14 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   const state: EmitState = {
     needMath: { value: false },
     needComplex: { value: false },
+    needStdlib: { value: false },
     runtime: [],
     runtimeNames: new Set(),
     lines: [],
     iterStack: [],
     elemwiseLoopCounter: 0,
+    currentLevel: 1,
+    complexTmpCounter: 0,
     currentScopeVars: null,
     futureTouches: null,
     freedOwned: new Set(),
@@ -101,6 +104,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   const headerSet = new Set<string>(["<stdio.h>"]);
   if (state.needMath.value) headerSet.add("<math.h>");
   if (state.needComplex.value) headerSet.add("<complex.h>");
+  if (state.needStdlib.value) headerSet.add("<stdlib.h>");
   if (includeRuntime) {
     for (const snippet of state.runtime) {
       for (const h of snippet.headers) headerSet.add(h);

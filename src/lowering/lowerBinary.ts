@@ -358,6 +358,8 @@ function inferPowSign(baseSign: Sign, expVal: number | null): Sign {
         if (isEven) {
           if (baseSign === "negative" || baseSign === "nonzero")
             return "positive";
+          // nonpositive maps to nonnegative: (x≤0)^(positive even) ≥ 0.
+          // This also covers nonneg, zero, and unknown — any real^even ≥ 0.
           return "nonnegative";
         }
         // positive odd integer: sign matches base
@@ -409,8 +411,10 @@ function lowerPow(
   // since most callers feed integer exponents and a blanket lift
   // would force `(-2)^2 → 4 + ε*i`, breaking `== 4` assertions.
   const leftSign = isNumeric(left.ty) ? left.ty.sign : "unknown";
-  const baseDefinitelyNegative =
-    leftSign === "negative" || leftSign === "nonpositive";
+  // Only treat the base as definitely negative when the sign is strictly
+  // "negative" — a "nonpositive" base can be zero, and 0^(non-integer) is
+  // real (not complex), so lifting to cpow would be wrong there.
+  const baseDefinitelyNegative = leftSign === "negative";
   if (baseDefinitelyNegative) {
     const expVal = tryConstExprValue(right);
     if (

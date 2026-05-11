@@ -34,12 +34,16 @@ static double _Complex mtoc_cdiv(double _Complex a, double _Complex b) {
     double ri = ai > 0.0 ? INFINITY : (ai < 0.0 ? -INFINITY : 0.0);
     /* `rr + ri * I` would corrupt the parts: `INFINITY * I` evaluates
      * via `Inf*(0 + 1i)` and the 0*Inf term yields NaN in the real
-     * lane. C99 §6.2.5/13 guarantees `double _Complex` has the same
-     * layout as `double[2]` with real at index 0, so writing the
-     * parts directly bypasses that arithmetic. */
+     * lane. Use CMPLX() (C11) to assemble the two parts directly
+     * without arithmetic; fall back to the GCC/Clang __real__/__imag__
+     * builtins (well-defined, no aliasing) on older toolchains. */
+#if defined(CMPLX)
+    double _Complex result = CMPLX(rr, ri);
+#else
     double _Complex result;
-    ((double *)&result)[0] = rr;
-    ((double *)&result)[1] = ri;
+    __real__ result = rr;
+    __imag__ result = ri;
+#endif
     return result;
   }
   if (fabs(br) >= fabs(bi)) {

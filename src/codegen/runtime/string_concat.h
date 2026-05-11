@@ -10,14 +10,31 @@
  * `mtoc_string_free`.
  */
 
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static mtoc_string_t mtoc_string_concat(mtoc_text_view_t a, mtoc_text_view_t b) {
   long alen = a.len > 0 ? a.len : 0;
   long blen = b.len > 0 ? b.len : 0;
-  long total = alen + blen;
+  size_t total;
+#if defined(__has_builtin) && __has_builtin(__builtin_add_overflow)
+  if (__builtin_add_overflow((size_t)alen, (size_t)blen, &total)) {
+    fprintf(stderr,
+      "mtoc: string concat allocation overflow (%ld + %ld bytes)\n", alen, blen);
+    abort();
+  }
+#else
+  if ((size_t)alen > SIZE_MAX - (size_t)blen) {
+    fprintf(stderr,
+      "mtoc: string concat allocation overflow (%ld + %ld bytes)\n", alen, blen);
+    abort();
+  }
+  total = (size_t)alen + (size_t)blen;
+#endif
   mtoc_string_t out;
-  if (total <= 0) {
+  if (total == 0) {
     out.data = (const char *)0;
     out.len = 0;
     out.owned = 1;
@@ -27,7 +44,7 @@ static mtoc_string_t mtoc_string_concat(mtoc_text_view_t a, mtoc_text_view_t b) 
   if (alen > 0) memcpy(buf, a.data, (size_t)alen);
   if (blen > 0) memcpy(buf + alen, b.data, (size_t)blen);
   out.data = buf;
-  out.len = total;
+  out.len = (long)total;
   out.owned = 1;
   return out;
 }

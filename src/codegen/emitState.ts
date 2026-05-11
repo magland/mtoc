@@ -27,6 +27,23 @@ export interface EmitState {
    *  has been emitted — drives `<complex.h>` inclusion. Boxed for the
    *  same reason as `needMath`. */
   needComplex: { value: boolean };
+  /** True when the emitted code calls `abort()` directly (e.g. the
+   *  range-write count-mismatch path), requiring `<stdlib.h>`. With
+   *  `includeRuntime: true` this header is already pulled in
+   *  transitively by the alloc helper; with `includeRuntime: false`
+   *  snippets are stripped so we must emit it explicitly. */
+  needStdlib: { value: boolean };
+  /** The indentation level of the statement currently being emitted.
+   *  Set at the top of each `emitStmt` call and restored before any
+   *  condition expression that follows body processing (e.g. `else if`).
+   *  Used by `emitComplexCmpOrLogical` and the `Unary Not` complex path
+   *  to push hoisted temp declarations at the right scope level. */
+  currentLevel: number;
+  /** Counter for synthetic complex-temp names emitted by
+   *  `emitComplexCmpOrLogical` and the complex `Unary Not` path to
+   *  avoid double-evaluating a Call-bearing complex operand. Each use
+   *  takes the next available index and increments. */
+  complexTmpCounter: number;
   /** Runtime helpers used by the program, in stable order. */
   runtime: RuntimeSnippet[];
   /** Names of helpers already added to `runtime` (dedup). */

@@ -44,4 +44,18 @@ describe("emitC includeRuntime option", () => {
     expect(c).not.toContain("#include <stdlib.h>");
     expect(c).not.toContain("#include <string.h>");
   });
+
+  it("includeRuntime: false emits <stdlib.h> when abort() is needed for range-write count check", () => {
+    // A range write with a tensor RHS always emits a runtime count-mismatch
+    // check that calls abort().  With includeRuntime:true the header is
+    // pulled in transitively by the alloc helper; with includeRuntime:false
+    // snippet headers are suppressed, so the codegen must emit <stdlib.h>
+    // explicitly whenever abort() appears in the output.
+    const c = translate(
+      "v = [1.0 2.0 3.0]; w = [4.0 5.0 6.0]; v(1:3) = w; disp(v(2));",
+      { includeRuntime: false }
+    );
+    expect(c).toContain("#include <stdlib.h>");
+    expect(c).toContain("abort()");
+  });
 });

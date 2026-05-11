@@ -220,7 +220,7 @@ static int mtoc__parse_spec(const char *spec, long spec_len,
       double v = (slot.kind == MTOC_FA_DOUBLE) ? slot.d
                : (slot.kind == MTOC_FA_COMPLEX) ? creal(slot.z) : 0.0;
       long n = (long)floor(v + 0.5);
-      width = width * 1 + (n > 0 ? n : 0);  /* numbl appends digits */
+      width = n > 0 ? n : 0;  /* * resolves to the arg value; negative collapses to 0 */
       continue;
     }
     /* Anything else is unexpected — numbl carries it through
@@ -359,8 +359,8 @@ static void mtoc__emit_float(mtoc__writer_fn writer, void *ctx,
   if (!isfinite(x)) {
     const char *s = isnan(x) ? "NaN" : (x > 0 ? "Infinity" : "-Infinity");
     long slen = (long)strlen(s);
-    mtoc__emit_padded(writer, ctx, s, slen, width,
-                      zero_pad ? ' ' : ' ', left_align);
+    /* zero-padding is meaningless for NaN/Inf — always use spaces */
+    mtoc__emit_padded(writer, ctx, s, slen, width, ' ', left_align);
     return;
   }
   int default_prec = 6;

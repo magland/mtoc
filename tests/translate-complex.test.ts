@@ -89,3 +89,48 @@ describe("complex scalar codegen", () => {
     expect(c).toContain("pow(4.0, 0.5)");
   });
 });
+
+describe("complex codegen — no double-evaluation of Call operands", () => {
+  // A complex Call operand that appears in Equal / NotEqual / AndAnd /
+  // OrOr expands into two C sub-expressions (creal + cimag, or two
+  // truthy checks), so without a fix the Call would be evaluated twice.
+  // The fix hoists any non-Var complex operand to a temp before the
+  // comparison.
+
+  it("does not double-evaluate a complex Call in == comparison", () => {
+    // sqrt(-4+0i) = csqrt(z) in C; appears as lhs of ==.
+    // Before the fix: creal(csqrt(z)) == ... && cimag(csqrt(z)) == ...
+    // After the fix: a temp holds csqrt(z) and is referenced once each.
+    const c = translate("z = -4 + 0i; w = 0 + 2i; disp(sqrt(z) == w);");
+    expect(c).not.toContain("creal(csqrt(z))");
+    expect(c).not.toContain("cimag(csqrt(z))");
+    // The temp declaration itself must be present.
+    expect(c).toContain("csqrt(z)");
+  });
+
+  it("does not double-evaluate a complex Binary operand in == comparison", () => {
+    // z + z2 is a non-Var complex expression; it should be hoisted.
+    const c = translate(
+      "z = 1 + 2i; z2 = 3 + 4i; w = 4 + 6i; disp((z + z2) == w);"
+    );
+    // The expanded comparison must NOT inline z + z2 twice.
+    expect(c).not.toContain("creal(z + z2)");
+    expect(c).not.toContain("cimag(z + z2)");
+  });
+
+  it("does not double-evaluate complex Call operand in unary ~", () => {
+    // ~sqrt(z) negates the toBool of csqrt(z); same double-eval risk.
+    const c = translate("z = -4 + 0i; disp(~sqrt(z));");
+    expect(c).not.toContain("creal(csqrt(z)) != 0.0 || cimag(csqrt(z))");
+    expect(c).toContain("csqrt(z)");
+  });
+
+  it("still inlines Var operands directly (no unnecessary temps)", () => {
+    // Var operands are pure reads; they should not be hoisted.
+    const c = translate("a = 1 + 2i; w = 3 + 4i; disp(a == w);");
+    // creal(a) and cimag(a) are fine — no temp needed for a plain var.
+    expect(c).toMatch(/creal\(a\) == creal\(w\)/);
+    expect(c).toMatch(/cimag\(a\) == cimag\(w\)/);
+    expect(c).not.toContain("_mtoc_cx_tmp");
+  });
+});

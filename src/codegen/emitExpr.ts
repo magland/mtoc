@@ -37,6 +37,7 @@ import {
 import { ownedOps } from "./ownedKinds.js";
 import {
   builtinEmitFacade,
+  pushStmt,
   useRuntimeByName,
   type EmitState,
 } from "./emitState.js";
@@ -397,7 +398,14 @@ export function emitExpr(
     case "Unary": {
       // Complex `~z` (Not) is the toBool negation: 1 iff re==0 && im==0.
       if (e.op === "Not" && isNumeric(e.operand.ty) && e.operand.ty.isComplex) {
-        const s = emitExpr(state, e.operand, 0);
+        let s = emitExpr(state, e.operand, 0);
+        // The operand is used twice (creal + cimag). Hoist non-Var complex
+        // expressions to a temp to avoid double-evaluating Call nodes.
+        if (e.operand.kind !== "Var") {
+          const tmp = `_mtoc_cx_tmp_${state.complexTmpCounter++}`;
+          pushStmt(state, state.currentLevel, `double _Complex ${tmp} = ${s};`);
+          s = tmp;
+        }
         return `(!(creal(${s}) != 0.0 || cimag(${s}) != 0.0))`;
       }
       const cOp = UN_OP_C[e.op];
@@ -435,8 +443,32 @@ function emitComplexCmpOrLogical(
 ): string {
   const lc = isNumeric(e.left.ty) && e.left.ty.isComplex;
   const rc = isNumeric(e.right.ty) && e.right.ty.isComplex;
-  const left = emitExpr(state, e.left, 0);
-  const right = emitExpr(state, e.right, 0);
+  let left = emitExpr(state, e.left, 0);
+  let right = emitExpr(state, e.right, 0);
+
+  // For ops that use each complex operand twice (Equal / NotEqual expand
+  // into re+im comparisons; AndAnd / OrOr expand truthy into re+im checks),
+  // hoist any non-Var complex operand to a temp so a Call-bearing expression
+  // (e.g. csqrt(z)) is not evaluated twice in the generated C.
+  // Var operands are pure reads — double-use is harmless.
+  const doubledOp =
+    e.op === "Equal" ||
+    e.op === "NotEqual" ||
+    e.op === "AndAnd" ||
+    e.op === "OrOr";
+  if (doubledOp) {
+    if (lc && e.left.kind !== "Var") {
+      const tmp = `_mtoc_cx_tmp_${state.complexTmpCounter++}`;
+      pushStmt(state, state.currentLevel, `double _Complex ${tmp} = ${left};`);
+      left = tmp;
+    }
+    if (rc && e.right.kind !== "Var") {
+      const tmp = `_mtoc_cx_tmp_${state.complexTmpCounter++}`;
+      pushStmt(state, state.currentLevel, `double _Complex ${tmp} = ${right};`);
+      right = tmp;
+    }
+  }
+
   const reOf = (s: string, isComplex: boolean): string =>
     isComplex ? `creal(${s})` : s;
   const imOf = (s: string, isComplex: boolean): string =>

@@ -13,6 +13,7 @@
  * on `ndim` exceeding the inline `MTOC_MAX_NDIM` cap.
  */
 
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -23,13 +24,28 @@ static mtoc_tensor_t mtoc_tensor_alloc_nd(int ndim, const long *dims) {
     abort();
   }
   mtoc_tensor_t out;
-  long n = 1;
+  size_t n = 1;
   for (int i = 0; i < ndim; i++) {
     out.dims[i] = dims[i];
-    n *= dims[i];
+    size_t new_n;
+#if defined(__has_builtin) && __has_builtin(__builtin_mul_overflow)
+    if (__builtin_mul_overflow(n, (size_t)dims[i], &new_n)) {
+      fprintf(stderr,
+        "mtoc: tensor allocation overflow at dim %d (size %ld)\n", i, dims[i]);
+      abort();
+    }
+#else
+    if ((size_t)dims[i] != 0 && n > (SIZE_MAX / sizeof(double)) / (size_t)dims[i]) {
+      fprintf(stderr,
+        "mtoc: tensor allocation overflow at dim %d (size %ld)\n", i, dims[i]);
+      abort();
+    }
+    new_n = n * (size_t)dims[i];
+#endif
+    n = new_n;
   }
   out.ndim = ndim;
-  out.real = mtoc_alloc((size_t)n * sizeof(double));
+  out.real = mtoc_alloc(n * sizeof(double));
   out.imag = NULL;
   return out;
 }
