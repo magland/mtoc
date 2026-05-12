@@ -185,6 +185,13 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     ]),
   ],
   [
+    "mtoc_tensor_ctranspose_complex",
+    loadSnippet("tensor_ctranspose_complex.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc_nd_complex",
+    ]),
+  ],
+  [
     "mtoc_zeros_nd",
     loadSnippet("tensor_zeros.h", ["mtoc_tensor_t", "mtoc_tensor_alloc_nd"]),
   ],

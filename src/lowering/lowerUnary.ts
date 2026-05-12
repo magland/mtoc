@@ -3,11 +3,13 @@
  * time (so `-3` lowers as `NumLit(-3)`, not `Unary(Minus, NumLit(3))`)
  * and propagates the sign lattice on tensor operands.
  *
- * `NonConjugateTranspose` (`.'`) takes a separate path: scalar inputs
- * fold to the operand (transpose is identity on scalars); 2-D tensor
- * inputs lower to a synthetic `Call` IR node carrying a one-shot
- * `BuiltinSig` that emits `mtoc_tensor_transpose(...)` (or its complex
- * sibling). The `producesOwnedDirectly` flag routes the Call through
+ * Both transposes — `NonConjugateTranspose` (`.'`) and `Transpose`
+ * (`'`, the conjugate transpose) — take a separate path: scalar real
+ * inputs fold to the operand unchanged (identity); scalar complex
+ * inputs under `'` fold to `conj(z)`; 2-D tensor inputs lower to a
+ * synthetic `Call` IR node carrying a one-shot `BuiltinSig` that
+ * emits the appropriate `mtoc_tensor_(c)transpose[_complex](...)`
+ * helper. The `producesOwnedDirectly` flag routes the Call through
  * the same ANF / owned-LHS Assign pipeline as `reshape`.
  */
 
@@ -33,6 +35,7 @@ const SUPPORTED_UN_OPS: ReadonlySet<UnOp> = new Set([
   "Minus",
   "Not",
   "NonConjugateTranspose",
+  "Transpose",
 ] as UnOp[]);
 
 export function lowerUnary(
@@ -52,8 +55,8 @@ export function lowerUnary(
       e.span
     );
   }
-  if (e.op === "NonConjugateTranspose") {
-    return lowerNonConjugateTranspose(operand, e.span);
+  if (e.op === "NonConjugateTranspose" || e.op === "Transpose") {
+    return lowerTransposeOp(operand, e.op, e.span);
   }
   // Complex `Plus`/`Minus` are valid scalar arithmetic (`+z` identity,
   // `-z` flips both parts). Complex `Not` is the toBool path: `~z` is
@@ -110,17 +113,62 @@ export function lowerUnary(
   return { kind: "Unary", op: e.op, operand, ty, span: e.span };
 }
 
-/** Lower `<operand>.'` for a numeric operand. Scalar inputs (including
- *  complex and char scalars) fold to the operand unchanged — transpose
- *  is the identity on a 1×1 value. Multi-element 2-D tensor inputs
- *  lower to a `Call` to `mtoc_tensor_transpose` / its complex sibling.
- *  N-D (ndim > 2) and char arrays are rejected — those numbl runtime
- *  branches have unstable / underspecified behavior (char arrays are
- *  returned unchanged in numbl today; cross-runner parity isn't
- *  reachable until that's resolved upstream). */
-function lowerNonConjugateTranspose(operand: IRExpr, span: Span): IRExpr {
-  // Scalar (real, complex, or char): identity.
+/** Lower `<operand>.'` or `<operand>'` for a numeric operand. The two
+ *  ops differ only on complex inputs:
+ *    - `.'` (NonConjugateTranspose): reorder both real and imag lanes.
+ *    - `'`  (Transpose / conjugate-transpose): reorder both lanes,
+ *           additionally negate the imag lane (`conj`).
+ *  On real-valued inputs both forms are byte-identical.
+ *
+ *  Scalar real / char inputs are identity for both ops; a scalar
+ *  complex input under `'` folds to `conj(z)` (real lane preserved,
+ *  imag lane negated). Multi-element 2-D tensor inputs lower to a
+ *  `Call` to `mtoc_tensor_transpose`, `mtoc_tensor_transpose_complex`,
+ *  or `mtoc_tensor_ctranspose_complex` as appropriate. N-D (ndim > 2)
+ *  and char arrays are rejected — those numbl runtime branches have
+ *  unstable / underspecified behavior (char arrays are returned
+ *  unchanged in numbl today; cross-runner parity isn't reachable
+ *  until that's resolved upstream). */
+function lowerTransposeOp(
+  operand: IRExpr,
+  op: "NonConjugateTranspose" | "Transpose",
+  span: Span
+): IRExpr {
+  const isConjugate = op === "Transpose";
+  const opSym = isConjugate ? "'" : ".'";
+  // Scalar (real, complex, or char): identity for `.'`; `'` conjugates
+  // a complex scalar but is identity on real / char scalars.
   if (isScalar(operand.ty)) {
+    if (
+      isConjugate &&
+      isNumeric(operand.ty) &&
+      operand.ty.isComplex &&
+      operand.ty.elem === "double"
+    ) {
+      const resultTy = operand.ty;
+      const sig: BuiltinSig = {
+        name: "conj",
+        category: "expr",
+        params: [
+          {
+            shape: "scalar",
+            domain: null,
+            elem: "double",
+            complexDomain: "real-or-complex",
+          },
+        ],
+        result: () => resultTy,
+        emit: argStrs => `conj(${argStrs[0]})`,
+      };
+      return {
+        kind: "Call",
+        name: "conj",
+        callee: { kind: "builtin", sig },
+        args: [operand],
+        ty: resultTy,
+        span,
+      };
+    }
     return { ...operand, span };
   }
   // Caller (lowerUnary) gated on isNumeric before dispatching here; the
@@ -128,30 +176,36 @@ function lowerNonConjugateTranspose(operand: IRExpr, span: Span): IRExpr {
   // field accesses below type-check without a cast.
   if (!isNumeric(operand.ty)) {
     throw new UnsupportedConstruct(
-      `.' on a ${operand.ty.kind} value is not supported`,
+      `${opSym} on a ${operand.ty.kind} value is not supported`,
       span
     );
   }
   if (operand.ty.elem === "char") {
     throw new UnsupportedConstruct(
-      `.' on a char array is not yet supported`,
+      `${opSym} on a char array is not yet supported`,
       span
     );
   }
   if (isHigherDim(operand.ty)) {
     throw new UnsupportedConstruct(
-      `.' on a tensor with ndim > 2 is not yet supported`,
+      `${opSym} on a tensor with ndim > 2 is not yet supported`,
       span
     );
   }
   const [d0, d1] = operand.ty.dims;
   const isComplex = operand.ty.isComplex;
   const resultTy = numericTypeND([d1, d0], isComplex, operand.ty.sign);
-  const helper = isComplex
-    ? "mtoc_tensor_transpose_complex"
-    : "mtoc_tensor_transpose";
+  // Real-input `'` collapses to `.'` since negating a zero imag is a
+  // no-op; only the complex `'` branch needs the ctranspose helper.
+  const helper =
+    isComplex && isConjugate
+      ? "mtoc_tensor_ctranspose_complex"
+      : isComplex
+        ? "mtoc_tensor_transpose_complex"
+        : "mtoc_tensor_transpose";
+  const callName = isConjugate ? "ctranspose" : "transpose";
   const sig: BuiltinSig = {
-    name: "transpose",
+    name: callName,
     category: "expr",
     params: [
       {
@@ -170,7 +224,7 @@ function lowerNonConjugateTranspose(operand: IRExpr, span: Span): IRExpr {
   };
   return {
     kind: "Call",
-    name: "transpose",
+    name: callName,
     callee: { kind: "builtin", sig },
     args: [operand],
     ty: resultTy,

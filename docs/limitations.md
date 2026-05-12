@@ -84,11 +84,13 @@ workaround or a roadmap note.
   (likely calling into a BLAS-shaped helper). `.^` itself works on tensors
   (real-elem, scalar↔tensor broadcast or same-shape tensor↔tensor); complex
   `.^` is deferred.
-- **Non-conjugate transpose `.'` only.** `.'` works on 2-D real and
-  complex tensors (and is the identity on scalars). The conjugate
-  transpose `'` and the `transpose` / `ctranspose` builtin spellings
-  are not yet wired; transpose of a char array or an `ndim > 2` tensor
-  is rejected at lowering.
+- **Both transposes are wired.** `.'` (non-conjugate) and `'`
+  (conjugate) work on 2-D real and complex tensors and on scalars
+  — real / char scalars are identity for both; a scalar complex
+  `z'` folds to `conj(z)`. The `transpose` / `ctranspose` builtin
+  spellings aren't wired yet (only the operator forms); transpose
+  of a char array or an `ndim > 2` tensor is still rejected at
+  lowering.
 - **Tensor comparisons and elementwise logicals lift.** `a == b`,
   `a < b`, `a > 0`, `a ~= b`, `a & b`, `a | b`, etc. produce 0.0/1.0
   tensors at the element-wise broadcast shape. `&&` / `||` stay

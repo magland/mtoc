@@ -315,3 +315,40 @@ describe("elementwise logical `&` / `|`", () => {
     expect(err?.message).toMatch(/use the elementwise '&'/);
   });
 });
+
+describe("conjugate transpose `'`", () => {
+  // `'` is identity on real scalars, `conj` on complex scalars,
+  // and reorder-with-imag-negate on complex 2-D tensors. Real
+  // tensors collapse to the same helper as `.'` since negating
+  // a zero imag lane is a no-op.
+
+  it("folds `'` on a real scalar to the operand", () => {
+    const c = translate("x = 5;\ndisp(x');\n");
+    // No transpose helper is activated.
+    expect(c).not.toContain("mtoc_tensor_transpose");
+    expect(c).not.toContain("mtoc_tensor_ctranspose");
+    expect(c).toMatch(/mtoc_disp_double\(x\)/);
+  });
+
+  it("folds `'` on a complex scalar to `conj(z)`", () => {
+    const c = translate("z = 3 + 4i;\ndisp(z');\n");
+    expect(c).toContain("conj(z)");
+  });
+
+  it("uses the non-conjugate helper for real-tensor `'`", () => {
+    const c = translate("M = [1 2; 3 4];\ndisp(M');\n");
+    expect(c).toContain("mtoc_tensor_transpose(");
+    expect(c).not.toContain("mtoc_tensor_ctranspose_complex");
+  });
+
+  it("uses the conjugate helper for complex-tensor `'`", () => {
+    const c = translate("M = [1+2i 3; 4 5-6i];\ndisp(M');\n");
+    expect(c).toContain("mtoc_tensor_ctranspose_complex(");
+  });
+
+  it("uses the non-conjugate complex helper for `.'` on complex tensors", () => {
+    const c = translate("M = [1+2i 3; 4 5-6i];\ndisp(M.');\n");
+    expect(c).toContain("mtoc_tensor_transpose_complex(");
+    expect(c).not.toContain("mtoc_tensor_ctranspose_complex");
+  });
+});

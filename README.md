@@ -199,9 +199,13 @@ The subset is growing iteratively. Roughly:
   cases stay on the legacy flat-iter path; differing-shape cases route
   through a runtime broadcast-dim check + per-operand stride table.
   CharLit broadcasting is not yet wired.
-- Non-conjugate transpose `.'` on 2-D real / complex tensors. The imag
-  lane is reordered but not negated (that's `'` — conjugate transpose,
-  not yet wired). Char arrays and `ndim > 2` are rejected at lowering
+- Transpose: both `.'` (non-conjugate) and `'` (conjugate) on 2-D
+  real / complex tensors. The two agree on real inputs (negating a
+  zero imag lane is a no-op); on complex `'` also flips the sign of
+  every imag entry, matching numbl's conjugate-transpose semantics.
+  Scalar real / char inputs are identity; a scalar complex `z'`
+  folds to `conj(z)`. Char arrays and `ndim > 2` are rejected at
+  lowering
 - Index reads:
   - **Scalar** on any multi-element tensor (real / complex / char):
     `v(i)`, `M(i, j)`, `T(i, j, k)`, `v(end)`, `M(end, end)`. Two
