@@ -27,7 +27,7 @@ function usage(): never {
     [
       "Usage:",
       "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir]",
-      "  mtoc run <input.m> [--check-leaks]",
+      "  mtoc run <input.m> [--check-leaks] [--fast-math]",
       "  mtoc serve --passkey <key> [--port N] [--host HOST]",
       "",
       "Options:",
@@ -41,6 +41,13 @@ function usage(): never {
       "  --check-leaks   (run only) Build with -fsanitize=address so",
       "                  AddressSanitizer + LeakSanitizer flag any unfreed",
       "                  buffer at exit. ~2x slowdown; off by default.",
+      "  --fast-math     (run only) Add -ffast-math to the build. Lets the",
+      "                  C compiler reassociate floating-point ops so hot",
+      "                  loops vectorize more aggressively. NOT IEEE-754",
+      "                  strict; results may drift in the last few ulps.",
+      "                  Off by default to keep the CLI's default `run`",
+      "                  output bit-stable with the cross-runner oracle.",
+      "                  -O3 -march=native is always on regardless.",
       "",
       "When <output.c> is omitted, the translated C is written to stdout.",
       "",
@@ -59,6 +66,7 @@ interface ParsedArgs {
   noRuntime: boolean;
   dumpIr: boolean;
   checkLeaks: boolean;
+  fastMath: boolean;
 }
 
 function parseArgs(args: string[]): ParsedArgs {
@@ -66,6 +74,7 @@ function parseArgs(args: string[]): ParsedArgs {
   let noRuntime = false;
   let dumpIr = false;
   let checkLeaks = false;
+  let fastMath = false;
   for (const a of args) {
     if (a === "--no-runtime") {
       noRuntime = true;
@@ -73,6 +82,8 @@ function parseArgs(args: string[]): ParsedArgs {
       dumpIr = true;
     } else if (a === "--check-leaks") {
       checkLeaks = true;
+    } else if (a === "--fast-math") {
+      fastMath = true;
     } else if (a.startsWith("--")) {
       process.stderr.write(`mtoc: unknown option '${a}'\n`);
       usage();
@@ -80,7 +91,7 @@ function parseArgs(args: string[]): ParsedArgs {
       positional.push(a);
     }
   }
-  return { positional, noRuntime, dumpIr, checkLeaks };
+  return { positional, noRuntime, dumpIr, checkLeaks, fastMath };
 }
 
 function reportError(
@@ -248,7 +259,7 @@ function dumpIrAsJson(
 }
 
 function cmdRun(args: string[]): void {
-  const { positional, noRuntime, checkLeaks } = parseArgs(args);
+  const { positional, noRuntime, checkLeaks, fastMath } = parseArgs(args);
   if (positional.length !== 1) usage();
   if (noRuntime) {
     process.stderr.write(
@@ -267,13 +278,14 @@ function cmdRun(args: string[]): void {
   writeFileSync(cFile, cSource);
 
   const cc = process.env.CC || "cc";
-  // --check-leaks builds with AddressSanitizer (which includes
-  // LeakSanitizer at exit). On a leak the report goes to stderr with
-  // a stack trace and the process exits non-zero. Off by default
-  // because ASan adds noticeable runtime + memory overhead — the
-  // cross-runner enables it for every test_scripts/ run.
-  const ccArgs = [cFile, "-o", exeFile, "-lm"];
+  // Always compile with -O3 -march=native so the emitted tensor
+  // loops auto-vectorize and the generated binary is representative
+  // of what mtoc users will ship. --check-leaks adds AddressSanitizer
+  // on top (cross-runner enables this); --fast-math adds -ffast-math
+  // on top (IEEE-non-strict reassociation, off by default).
+  const ccArgs = [cFile, "-o", exeFile, "-lm", "-O3", "-march=native"];
   if (checkLeaks) ccArgs.push("-fsanitize=address", "-g");
+  if (fastMath) ccArgs.push("-ffast-math");
   try {
     execFileSync(cc, ccArgs, { stdio: "inherit" });
   } catch {
