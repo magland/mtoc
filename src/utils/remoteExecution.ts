@@ -54,6 +54,11 @@ export function regeneratePasskey(): string {
   return key;
 }
 
+/** Persist a user-supplied passkey. Callers must validate non-empty. */
+export function setPasskey(key: string): void {
+  localStorage.setItem(PASSKEY_KEY, key);
+}
+
 function generatePasskey(): string {
   // 16 hex chars = 64 bits of entropy. Plenty for a localhost auth
   // token; short enough to be paste-friendly.

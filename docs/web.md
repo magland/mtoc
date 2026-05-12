@@ -120,10 +120,11 @@ detects and uses to SIGTERM the child process.
 
 The passkey is generated in the browser by `src/utils/remoteExecution.ts` and
 stored in `localStorage` (so it sticks around until the user clears the
-browser's site data or hits "Regenerate passkey"). The settings dialog shows
-the user the full `mtoc serve --passkey …` command to paste into a terminal.
-`regeneratePasskey` cycles it; the server has to be restarted with the new
-key for the IDE to reconnect.
+browser's site data or hits "Regenerate passkey"). The settings dialog also
+exposes the passkey as an editable field, so the user can paste in their own
+value instead of using the generated one. Either way, the dialog shows the
+full `mtoc serve --passkey …` command to paste into a terminal; the server
+has to be (re)started with whatever key the IDE holds.
 
 `src/hooks/useRemoteExecution.ts` is the React-side state machine: holds
 `{status, connection, lines}`, exposes `run(c)`, `stop()`, and a

@@ -21,6 +21,7 @@ import {
   getPasskey,
   getRemoteServiceUrl,
   regeneratePasskey,
+  setPasskey,
   setRemoteServiceUrl,
 } from "../utils/remoteExecution";
 
@@ -44,23 +45,25 @@ export function ExecutionSettingsDialog({
   onChanged,
 }: ExecutionSettingsDialogProps) {
   const [url, setUrl] = useState(getRemoteServiceUrl());
-  const [passkey, setPasskey] = useState(getPasskey());
+  const [passkey, setPasskeyState] = useState(getPasskey());
   const [probe, setProbe] = useState<ProbeStatus>({ state: "idle" });
 
   useEffect(() => {
     if (open) {
       setUrl(getRemoteServiceUrl());
-      setPasskey(getPasskey());
+      setPasskeyState(getPasskey());
       setProbe({ state: "idle" });
     }
   }, [open]);
 
-  const command = `npx tsx src/cli.ts serve --passkey ${passkey}`;
-  const npmCommand = `npm run serve -- --passkey ${passkey}`;
+  const trimmedPasskey = passkey.trim();
+  const passkeyValid = trimmedPasskey.length > 0;
+  const command = `npx tsx src/cli.ts serve --passkey ${trimmedPasskey}`;
+  const npmCommand = `npm run serve -- --passkey ${trimmedPasskey}`;
 
   const handleCheck = async () => {
     setProbe({ state: "checking" });
-    const health = await checkRemoteServiceHealth(url, passkey);
+    const health = await checkRemoteServiceHealth(url, trimmedPasskey);
     if (health) {
       setProbe({ state: "ok", cc: health.cc });
     } else {
@@ -74,12 +77,13 @@ export function ExecutionSettingsDialog({
 
   const handleSave = () => {
     setRemoteServiceUrl(url);
+    if (passkeyValid) setPasskey(trimmedPasskey);
     onChanged?.();
     onClose();
   };
 
   const handleRegeneratePasskey = () => {
-    setPasskey(regeneratePasskey());
+    setPasskeyState(regeneratePasskey());
     setProbe({ state: "idle" });
   };
 
@@ -105,6 +109,24 @@ export function ExecutionSettingsDialog({
             placeholder={DEFAULT_REMOTE_SERVICE_URL}
             fullWidth
             size="small"
+          />
+
+          <TextField
+            label="Passkey"
+            value={passkey}
+            onChange={e => {
+              setPasskeyState(e.target.value);
+              setProbe({ state: "idle" });
+            }}
+            fullWidth
+            size="small"
+            error={!passkeyValid}
+            helperText={
+              passkeyValid
+                ? "Auto-generated for you, but you can replace it with your own. Whatever you use here must match the --passkey you pass to the server."
+                : "Passkey cannot be empty."
+            }
+            slotProps={{ htmlInput: { spellCheck: false, autoCorrect: "off" } }}
           />
 
           <Box>
@@ -162,7 +184,11 @@ export function ExecutionSettingsDialog({
       </DialogContent>
       <DialogActions>
         <Button onClick={onClose}>Cancel</Button>
-        <Button variant="contained" onClick={handleSave}>
+        <Button
+          variant="contained"
+          onClick={handleSave}
+          disabled={!passkeyValid}
+        >
           Save
         </Button>
       </DialogActions>
