@@ -4,13 +4,22 @@
  * The numeric tower is `NumericType` — every numeric value mtoc tracks
  * is in it: scalar or tensor, real or complex, with shape carried
  * alongside element kind. Scalars are 1×1 numerics (no separate
- * "Scalar" variant). The first non-numeric sibling, `StringType`,
- * lives alongside it for double-quoted scalar string handles. The
- * `kind` discriminator is reserved to grow further variants (Logical,
- * Char, Cell, Struct, Handle) — those land when there's a concrete
- * need; keeping the discriminator means adding them won't ripple
- * through numeric-only code paths.
+ * "Scalar" variant). Non-numeric siblings live alongside it:
+ * `StringType` for double-quoted scalar strings, `StructType` for
+ * scalar structs, and `HandleType` for function handles (`@name` /
+ * `@(...) ...`). The `kind` discriminator is reserved to grow further
+ * variants (Logical, Char, Cell, Class) — those land when there's a
+ * concrete need; keeping the discriminator means adding them won't
+ * ripple through numeric-only code paths.
  */
+
+import type { Stmt } from "../parser/index.js";
+
+/** AST shape of a `function … end` declaration. Re-derived from the
+ *  parser's `Stmt` union to avoid a circular import through
+ *  `../workspace/workspace.js` (whose `FunctionStmt` re-export
+ *  transitively imports `../lowering/types.js` via `./builtins.js`). */
+type FunctionStmt = Extract<Stmt, { type: "Function" }>;
 
 export type ElemKind = "double" | "char";
 
@@ -161,6 +170,134 @@ export function isStruct(t: MType): t is StructType {
   return t.kind === "Struct";
 }
 
+/**
+ * Function-handle type. Carries the statically-resolved target of a
+ * `@name` or `@(...) ...` expression. v1 representation is *phantom*:
+ * `cTypeFor(HandleType)` returns `null`, so handle-typed variables and
+ * parameters are elided from the emitted C entirely — the handle's
+ * identity flows through the type system at lowering time and every
+ * `h(args)` call site resolves to a concrete mangled C function ahead
+ * of codegen. The handle therefore has no runtime representation,
+ * no owned-kind allocation, and zero ABI cost.
+ *
+ * Three target shapes:
+ *  - `userFunc`   — `@my_func`. Carries the resolved AST + source
+ *                   file so the handle-call path can hand them to the
+ *                   existing `specializeUserCall` pipeline. Identity
+ *                   for unify / canonicalize / storageCategory is just
+ *                   `{kind, name, file}`; the AST is excluded from the
+ *                   canonical JSON.
+ *  - `builtin`    — `@sin`, `@sqrt`, etc. Identity is the builtin name.
+ *                   The call site looks the sig up via `getBuiltin` so
+ *                   we don't have to thread it through the type.
+ *  - `anonymous`  — `@(x) x.^2 + 1`. The body is synthesized into a
+ *                   `FunctionStmt`-shaped AST at the `@(...)` site and
+ *                   registered with `mangledBase` as its synthetic
+ *                   user-function name. v1 rejects any anonymous body
+ *                   that references an outer-scope local — captures
+ *                   are deferred to Phase 2.
+ *
+ * Reassigning a handle variable to a different target identity is a
+ * top-level variable split (the existing scalar↔tensor split machinery,
+ * driven by `storageCategory`); inside control flow it errors. That
+ * keeps the "every `h(x)` resolves to one mangled C function"
+ * invariant straightforward.
+ */
+export type HandleTarget =
+  | {
+      kind: "userFunc";
+      /** numbl source name of the target function (for diagnostics). */
+      name: string;
+      /** Source file of the target's declaration. Salts the
+       *  specialization key so two same-named workspace functions in
+       *  different files stay distinct. */
+      file: string;
+      /** Resolved AST of the target function, threaded into
+       *  `specializeUserCall` at the handle-call site. Not part of the
+       *  canonical hash. */
+      ast: FunctionStmt;
+    }
+  | {
+      kind: "builtin";
+      /** numbl name of the builtin (e.g. "sin"). The handle-call path
+       *  looks the `BuiltinSig` up via `getBuiltin` so the sig itself
+       *  doesn't need to ride on the type. */
+      name: string;
+    }
+  | {
+      kind: "anonymous";
+      /** Synthetic mangled-base name (`_mtoc_anon__<8hex>`) the
+       *  anonymous body registers under in the specialization cache.
+       *  Derived from the source span so two textually distinct
+       *  `@(...)` expressions have distinct identities even if their
+       *  bodies happen to be alpha-equivalent. */
+      mangledBase: string;
+      /** Synthesized `function _ = _(params) <body> end` AST handed to
+       *  `specializeUserCall`. */
+      ast: FunctionStmt;
+      /** Source file the `@(...)` expression appeared in. */
+      file: string;
+    };
+
+export interface HandleType {
+  kind: "Handle";
+  target: HandleTarget;
+}
+
+/** True when `t` is a function handle. */
+export function isHandle(t: MType): t is HandleType {
+  return t.kind === "Handle";
+}
+
+/** Constructor for a `@user_func` handle. */
+export function userFuncHandle(
+  name: string,
+  file: string,
+  ast: FunctionStmt
+): HandleType {
+  return { kind: "Handle", target: { kind: "userFunc", name, file, ast } };
+}
+
+/** Constructor for a `@builtin_name` handle. */
+export function builtinHandle(name: string): HandleType {
+  return { kind: "Handle", target: { kind: "builtin", name } };
+}
+
+/** Constructor for a `@(...)` anonymous-function handle. */
+export function anonymousHandle(
+  mangledBase: string,
+  ast: FunctionStmt,
+  file: string
+): HandleType {
+  return {
+    kind: "Handle",
+    target: { kind: "anonymous", mangledBase, ast, file },
+  };
+}
+
+/** Stable identity string for a handle's target. Used by
+ *  `storageCategory` (so two different identities split into distinct
+ *  C bindings) and as the deterministic shard of `canonicalizeType`
+ *  (so a higher-order function specializes per-handle-target). */
+function handleTargetId(target: HandleTarget): string {
+  switch (target.kind) {
+    case "userFunc":
+      return `userFunc:${target.file}:${target.name}`;
+    case "builtin":
+      return `builtin:${target.name}`;
+    case "anonymous":
+      return `anonymous:${target.mangledBase}`;
+  }
+}
+
+/** True when two handle targets refer to the same concrete function.
+ *  Anonymous handles use their synthesized mangledBase as identity;
+ *  user-func handles compare by `(file, name)`; builtin handles compare
+ *  by name. */
+function handleTargetsEqual(a: HandleTarget, b: HandleTarget): boolean {
+  return handleTargetId(a) === handleTargetId(b);
+}
+
 /** FNV-1a 32-bit hash of a UTF-16 string, returned as zero-padded 8-hex.
  *  Matches `mangleSpecName` in `lowerFuncCall.ts` so struct type IDs
  *  share the same hash flavor as function specialization keys. */
@@ -199,6 +336,7 @@ export type MType =
   | NumericType
   | StringType
   | StructType
+  | HandleType
   | { kind: "Unknown" }
   | { kind: "Void" };
 
@@ -461,6 +599,11 @@ export function staticNumElements(t: MType): number | null {
 export function cTypeFor(t: MType): string | null {
   if (t.kind === "String") return "mtoc_string_t";
   if (t.kind === "Struct") return structMangledName(t);
+  // Function handles are phantom in v1 — no C representation. Callers
+  // (codegen) treat a `null` here as "this slot is elided from the
+  // emitted source": handle params skip the C signature, handle args
+  // skip the call site, and handle-typed Assigns drop their RHS.
+  if (t.kind === "Handle") return null;
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
     if (isScalar(t)) return "char";
@@ -496,6 +639,17 @@ export function shapeCategory(t: NumericType): string {
  *  (`canShareStorage`, `absentDefaultFor`) picks it up automatically. */
 export function storageCategory(t: MType): string | null {
   if (t.kind === "String") return "string";
+  if (t.kind === "Handle") {
+    // Storage category encodes the resolved target identity. Two
+    // handle values share a single binding only when they point at
+    // the same concrete function — `f = @foo; f = @foo` keeps a
+    // single binding; `f = @foo; f = @bar` (different identity)
+    // trips `canShareStorage` and falls into the split / error path
+    // depending on `controlDepth`. The phantom representation means
+    // codegen still emits no C declaration; the category is just for
+    // the variable-tracking logic.
+    return `handle:${handleTargetId(t.target)}`;
+  }
   if (t.kind === "Struct") {
     // Storage category is keyed on the SORTED FIELD-NAME SET only,
     // not on the field types. Two struct values with the same field
@@ -563,6 +717,18 @@ export function absentDefaultFor(present: ReadonlyArray<MType>): MType {
       // the absent default is that shape (the predeclared empty handle
       // matches it). Fall back to scalar zero for anything else.
       if (cat.startsWith("struct:") && isStruct(present[0])) {
+        return present[0];
+      }
+      // Handle category: every arm carries the same handle target
+      // (the category-equality check above guaranteed it), so the
+      // "absent default" is that handle. Branch-divergent handle
+      // identity is rejected upstream by the storage-category check
+      // in `recordAssignment` — but a branch that simply doesn't
+      // assign the handle on every arm is fine as long as the
+      // resulting C code never tries to *call* through the absent
+      // path. v1 handles are phantom (no C declaration), so an
+      // absent arm produces no codegen issue.
+      if (cat.startsWith("handle:") && isHandle(present[0])) {
         return present[0];
       }
       return scalarDouble("zero");
@@ -820,6 +986,15 @@ export function unify(a: MType, b: MType): MType {
       ? STRING
       : { kind: "Unknown" };
   }
+  // Handle: two handles unify iff their target identity matches —
+  // identity is keyed on `(kind, name, file?)`, the same shard
+  // `canonicalizeType` and `storageCategory` use. Different identity
+  // (or handle-vs-anything-else) collapses to Unknown so
+  // `recordAssignment` produces a clear category-mismatch diagnostic.
+  if (a.kind === "Handle" || b.kind === "Handle") {
+    if (a.kind !== "Handle" || b.kind !== "Handle") return { kind: "Unknown" };
+    return handleTargetsEqual(a.target, b.target) ? a : { kind: "Unknown" };
+  }
   // Struct sibling variant. Two structs unify iff they have the same
   // field-name set AND each pairwise field type unifies. Different
   // field sets or any field-pair unify→Unknown collapses the whole
@@ -984,6 +1159,15 @@ export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Unknown") return { kind: "Unknown" };
   if (t.kind === "Void") return { kind: "Void" };
   if (t.kind === "String") return { kind: "String" };
+  if (t.kind === "Handle") {
+    // Encode only the target's identity in the canonical hash —
+    // excluding the AST so the JSON is small and stable. This is what
+    // makes a higher-order user function specialize per-handle-target:
+    // `apply(@foo, x)` and `apply(@bar, x)` produce two distinct
+    // `apply__<hex>` specializations because their first arg's
+    // canonical hash differs in the embedded `name`/`file` shard.
+    return { kind: "Handle", target: handleTargetId(t.target) };
+  }
   if (t.kind === "Struct") {
     return {
       kind: "Struct",
@@ -1019,6 +1203,16 @@ export function typeToString(t: MType): string {
   if (t.kind === "Unknown") return "Unknown";
   if (t.kind === "Void") return "Void";
   if (t.kind === "String") return "String";
+  if (t.kind === "Handle") {
+    switch (t.target.kind) {
+      case "userFunc":
+        return `Handle<@${t.target.name} from ${t.target.file}>`;
+      case "builtin":
+        return `Handle<@${t.target.name}>`;
+      case "anonymous":
+        return `Handle<@(...) ${t.target.mangledBase}>`;
+    }
+  }
   if (t.kind === "Struct") {
     const parts = t.fields.map(f => `${f.name}:${typeToString(f.type)}`);
     return `Struct<{${parts.join(", ")}}>`;

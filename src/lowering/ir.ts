@@ -208,6 +208,26 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Function-handle literal — produced by `@name` (named handle to
+       *  a user function or builtin) and by `@(...) ...` (anonymous
+       *  function). The lowerer resolves the target identity at the
+       *  literal site and stores it in `ty` as a `HandleType` (whose
+       *  `target` discriminator carries the resolved AST / builtin /
+       *  anonymous body). v1 handles are phantom: codegen emits NOTHING
+       *  for a `HandleLit`. The Assign that holds one is dropped from
+       *  the emitted C entirely; the handle's identity flows through
+       *  the type system only. Every `h(args)` call site reads the
+       *  bound variable's `HandleType` and dispatches statically to
+       *  the right specialization or builtin emit.
+       *
+       *  Restricted to the RHS of an Assign by `validateIR` — nested
+       *  uses (`apply(@foo, x)`) require the user to assign the handle
+       *  to a name first. */
+      kind: "HandleLit";
+      ty: MType;
+      span: Span;
+    }
+  | {
       /** Reference to the `end` keyword inside an index expression.
        *  Resolved at lowering time to the relevant axis size of the
        *  enclosing index's base. The result is a nonneg long-valued

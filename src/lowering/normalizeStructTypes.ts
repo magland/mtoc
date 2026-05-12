@@ -236,6 +236,7 @@ function rewriteExpr(
     case "StringLit":
     case "CharLit":
     case "EndRef":
+    case "HandleLit":
       return e;
   }
 }

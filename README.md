@@ -192,6 +192,19 @@ The subset is growing iteratively. Roughly:
   zero parameters; the remaining functions register as ordinary
   locals callable from the entry. Matches numbl, which calls the
   first function with no args when the file has no script body
+- Function handles. `@my_func`, `@sin`, and `@(x) x.^2 + 1` are
+  supported under a _phantom_ representation: the handle's target
+  identity rides on its MType so every `h(args)` call resolves
+  statically to a concrete mangled C function — no runtime function
+  pointer, no dispatcher. Handles can be assigned, passed as args
+  (`apply(@my_func, x)`), and returned from factory functions (which
+  emit as `void` and have their side effects preserved). The handle's
+  target is part of the higher-order function's specialization key,
+  so `apply(@foo, x)` and `apply(@bar, x)` produce distinct
+  `apply__<hex>` specializations. Anonymous functions with captures
+  (`@(x) x + k` where `k` is from the enclosing scope) are deferred to
+  Phase 2; see [docs/limitations.md](docs/limitations.md) for the full
+  v1 surface
 - Cross-file user functions. A call like `helper(x)` resolves to the
   primary function of a sibling `helper.m` in the same directory.
   Resolution is delegated to numbl's vendored `functionResolve.ts`

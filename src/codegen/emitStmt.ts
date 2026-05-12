@@ -141,6 +141,30 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // `mtoc_tensor_assign` / `mtoc_string_assign`, so the new
       // lifetime starts here — drop the LHS from the freed set so a
       // subsequent dead-after pass can free it again on its own terms.
+      if (s.ty.kind === "Handle") {
+        // Function-handle assignment is phantom on the LHS side: no
+        // C declaration, no value to assign. But if the RHS is a
+        // user-function call (a "factory function" returning a
+        // handle), we still need to emit the call so its body's side
+        // effects fire. The callee was emitted with `void` return
+        // type by `emitFunction` because its single output is a
+        // phantom handle. Other RHS shapes (HandleLit, Var, etc.)
+        // have no side effects and are dropped entirely.
+        if (s.rhs.kind === "Call" && s.rhs.callee.kind === "userFunc") {
+          const argStrs: string[] = [];
+          for (const a of s.rhs.args) {
+            if (a.ty.kind === "Handle") continue;
+            argStrs.push(wrapOwnedArgCopy(state, a.ty, emitExpr(state, a, 0)));
+          }
+          pushStmt(
+            state,
+            level,
+            `${s.rhs.callee.mangled}(${argStrs.join(", ")});`
+          );
+        }
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
+        break;
+      }
       if (isOwned(s.ty)) {
         state.freedOwned.delete(s.cName);
       }
@@ -598,11 +622,18 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // emitted by `emitFunction`.
         pushStmt(state, level, `return;`);
       } else if (outputs.length === 1) {
-        // Classic single-output convention: return-by-value of the
-        // local that holds the output's current value at this exit
-        // point. The lowerer captured that live cName when it built
-        // the IR node.
-        pushStmt(state, level, `return ${s.outputCNames[0]};`);
+        if (outputs[0].ty.kind === "Handle") {
+          // Phantom handle output: the function was emitted with
+          // `void` return type; emit a bare `return;` instead of
+          // `return <cName>;`.
+          pushStmt(state, level, `return;`);
+        } else {
+          // Classic single-output convention: return-by-value of the
+          // local that holds the output's current value at this exit
+          // point. The lowerer captured that live cName when it built
+          // the IR node.
+          pushStmt(state, level, `return ${s.outputCNames[0]};`);
+        }
       } else {
         // Multi-output sret writes already emitted above; just return.
         pushStmt(state, level, `return;`);
@@ -621,10 +652,15 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // because that case routes to `Assign` / `ExprStmt(Call)` in
       // lowering (1-output is return-by-value).
       // Copy-on-arg-pass for tensor / char-array args, mirroring the
-      // regular `Call` path in `emitExpr`.
-      const argStrs = s.args.map(a =>
-        wrapOwnedArgCopy(state, a.ty, emitExpr(state, a, 0))
-      );
+      // regular `Call` path in `emitExpr`. Handle-typed args are
+      // phantom — their identity is baked into the callee's mangled
+      // specialization name via `canonicalizeType`, so they don't
+      // appear in the rendered C argument list at all.
+      const argStrs: string[] = [];
+      for (const a of s.args) {
+        if (a.ty.kind === "Handle") continue;
+        argStrs.push(wrapOwnedArgCopy(state, a.ty, emitExpr(state, a, 0)));
+      }
       if (s.outputs.length === 0) {
         // Zero-output: simplest form — bare `<mangled>(args);`. No
         // discard temps, no surrounding block.

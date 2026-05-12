@@ -512,6 +512,12 @@ function isPureElementwiseExpr(e: IRExpr): boolean {
     case "Var":
     case "EndRef":
       return true;
+    case "HandleLit":
+      // Handles are phantom values — they never appear inside a
+      // multi-element tensor expression. Treat any HandleLit reached
+      // here as "not inlinable" so the inliner falls back to the
+      // standard emit path.
+      return false;
     case "Binary":
       return isPureElementwiseExpr(e.left) && isPureElementwiseExpr(e.right);
     case "Unary":
@@ -719,6 +725,7 @@ function appearsInNonSlotPosition(e: IRExpr, cName: string): boolean {
     case "StringLit":
     case "CharLit":
     case "EndRef":
+    case "HandleLit":
       return false;
     case "Binary":
       return (
@@ -807,6 +814,7 @@ function substituteVar(e: IRExpr, target: string, replacement: IRExpr): IRExpr {
     case "StringLit":
     case "CharLit":
     case "EndRef":
+    case "HandleLit":
     case "TensorLit":
     case "IndexSlice":
     case "MakeRange":

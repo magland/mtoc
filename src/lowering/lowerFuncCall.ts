@@ -18,6 +18,7 @@ import type { IRExpr, IRFunction } from "./ir.js";
 import {
   arithResult,
   canonicalizeType,
+  isHandle,
   isMultiElement,
   isOwned,
   isScalar,
@@ -591,10 +592,15 @@ export function specializeUserCall(
   }
   const args = argExprs.map(a => this.lowerExpr(a));
   for (const a of args) {
-    if (!isNumeric(a.ty) && !isStruct(a.ty)) {
+    // Handles ride alongside numeric/struct args under the phantom
+    // representation: their identity is encoded in `canonicalizeType`
+    // so each `(handle-target, ...)` arg tuple lands in its own
+    // specialization, and codegen drops handle-typed params/args
+    // from the emitted C signature/call site entirely.
+    if (!isNumeric(a.ty) && !isStruct(a.ty) && !isHandle(a.ty)) {
       throw new UnsupportedConstruct(
-        `function '${name}' only accepts numeric or struct arguments ` +
-          `(got ${typeToString(a.ty)})`,
+        `function '${name}' only accepts numeric, struct, or function-handle ` +
+          `arguments (got ${typeToString(a.ty)})`,
         a.span
       );
     }
@@ -784,12 +790,16 @@ function specialize(
           fnAst.span
         );
       }
-      // Accept scalars (real / complex / char) and owned kinds (real or
-      // complex double tensors, char tensors, scalar strings). The
-      // owned path carries the return through `mtoc_<kind>_assign` at
-      // the caller, and the callee excludes its output from the
-      // scope-exit free walk so ownership transfers cleanly.
-      const okReturn = isScalar(ty) || isOwned(ty);
+      // Accept scalars (real / complex / char), owned kinds (real or
+      // complex double tensors, char tensors, scalar strings), and
+      // function handles. The owned path carries the return through
+      // `mtoc_<kind>_assign` at the caller, and the callee excludes
+      // its output from the scope-exit free walk so ownership
+      // transfers cleanly. Handles are phantom — there is no value to
+      // return at the C level; the caller picks up the handle's
+      // identity via the call's IR type and reconstructs dispatch
+      // statically.
+      const okReturn = isScalar(ty) || isOwned(ty) || isHandle(ty);
       if (!okReturn) {
         throw new UnsupportedConstruct(
           `function '${matlabName}' return type ${typeToString(ty)} is ` +

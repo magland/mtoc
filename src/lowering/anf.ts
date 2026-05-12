@@ -393,6 +393,7 @@ function anfExprChildren(
     case "CharLit":
     case "Var":
     case "EndRef":
+    case "HandleLit":
       return e;
   }
 }

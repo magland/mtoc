@@ -177,7 +177,33 @@ workaround or a roadmap note.
   after the call. Zero-output functions (`function foo(x)`) and the
   bare-statement call form `foo(x);` also work. See `docs/specialization.md`
   for the full ABI.
-- **No anonymous functions / function handles** (`@(x) x*x`, `@sin`).
+- **Function handles** (`@name`, `@(...) ...`) are supported under a
+  phantom-representation rule: the handle's target identity rides on
+  the MType, so every `h(args)` call resolves statically to a concrete
+  mangled C function (no runtime function pointer, no dispatcher).
+  v1 admits named handles to user functions (`@my_helper`), named
+  handles to builtins (`@sin`, `@sqrt`, ...), and anonymous functions
+  WITHOUT captures (`@(x) x.^2`, `@(a,b) a+b`, `@(x) sq(x)+1`). The
+  handle's identity is part of the higher-order function's
+  specialization key — `apply(@foo, x)` and `apply(@bar, x)` produce
+  two distinct `apply__<hex>` specializations. What's deferred:
+  - **Captures.** `k = 5; f = @(x) x + k` rejects at lowering with a
+    span. Workaround: pass the captured value through as a parameter
+    (`f = @(x, k) x + k; disp(f(3, 5));`), or replace the closure
+    with a named function. Captures are Phase 2.
+  - **Branch-divergent handle identity.** An `if`/`while`/`for` body
+    that assigns different handle targets to the same name (e.g.
+    `if c; f = @foo; else; f = @bar; end`) rejects with the same
+    storage-category error as the scalar↔tensor split. Top-level
+    reassignment with different identity is fine — it splits into a
+    fresh C binding like any other category change. Workaround:
+    hoist the if/else around the call itself
+    (`if c; y = foo(x); else; y = bar(x); end`).
+  - **Handles inside struct fields / tensors / cells** are rejected.
+  - **`feval`, `class(h)`, `nargin(h)`, `disp(h)`** are not yet
+    wired — call the handle directly with `h(args)` instead.
+  - **Builtin handles in multi-output / zero-output positions** are
+    rejected (builtins are single-return-value).
 - **Cross-file user functions are supported via numbl's vendored resolver.**
   A call like `helper(x)` resolves to the primary function of a sibling
   `helper.m` in the same directory (numbl's "filename wins" rule applies —

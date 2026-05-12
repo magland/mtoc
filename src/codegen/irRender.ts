@@ -121,6 +121,12 @@ export function renderExpr(e: IRExpr, parentPrec = 0): string {
         .join(", ");
       return `struct(${pairs})`;
     }
+    case "HandleLit": {
+      if (e.ty.kind !== "Handle") return "@?";
+      const t = e.ty.target;
+      if (t.kind === "userFunc" || t.kind === "builtin") return `@${t.name}`;
+      return "@(...)";
+    }
   }
 }
 

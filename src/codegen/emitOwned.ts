@@ -18,6 +18,7 @@
 import type { IRFunction, VarBinding } from "../lowering/ir.js";
 import {
   isCharScalar,
+  isHandle,
   isMultiElement,
   isScalarComplex,
   isScalarReal,
@@ -47,6 +48,10 @@ export function emitDeclarations(
   for (const key of cNames) {
     const binding = vars.get(key)!;
     const { ty, cName } = binding;
+    // Function handles are phantom in v1 — no C representation, no
+    // predeclaration, no runtime value. The handle's identity lives
+    // on the MType only; every call site resolves statically.
+    if (isHandle(ty)) continue;
     // Owned kinds (string, char-array, multi-element double tensor)
     // share one shape: predeclare a known-empty handle whose later
     // re-assignments go through the kind's `assign` helper. The empty

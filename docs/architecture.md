@@ -149,6 +149,23 @@ if(_mtoc_n > 1024)` above the outermost loop of both the flat-iter
   the first function's body as the script body. The function still
   registers as a local so cross-calls work; the entry must take zero
   parameters. Mirrors numbl's "first-function call with 0 args".
+- **Function handles** (`src/lowering/lowerHandle.ts`): `@name` and
+  `@(...) ...` lower to a new `IRExpr.HandleLit` whose MType is a
+  phantom `HandleType` carrying the resolved target identity (user
+  function AST + file, or builtin name, or synthesized anonymous AST).
+  The handle's identity participates in `canonicalizeType` so a
+  higher-order function like `apply(h, x)` specializes per-target —
+  `apply(@foo, x)` and `apply(@bar, x)` produce distinct
+  `apply__<hex>` specializations. Inside the body, `h(args)` is
+  recognized when `envLookup(h)` returns a `HandleType` and dispatches
+  through `lowerHandleCall`, which peels off the target and runs the
+  existing `specializeUserCall` / `lowerBuiltinCall` pipeline. Codegen
+  elides handle-typed params from the C signature, handle-typed args
+  from the call site, and handle-typed Assigns from the body —
+  factory functions that return a handle are emitted with `void`
+  return type so their side effects survive. Anonymous functions with
+  captures are not yet supported (rejected at lowering with a span);
+  see `docs/limitations.md` for the full v1 surface.
 
 ### IR walkers (`src/lowering/walk.ts`)
 
@@ -166,10 +183,12 @@ that genuinely needs to look at the new kind.
 
 A discriminated-union IR. Two trees:
 
-- `IRExpr` — `NumLit`, `Var`, `TensorLit`, `Call`, `Binary`, `Unary`. `Call`
-  carries a `callee: CallTarget` discriminator (`libm` / `runtime` /
-  `userFunc`) — codegen no longer does string lookups against the runtime
-  registry.
+- `IRExpr` — `NumLit`, `Var`, `TensorLit`, `Call`, `Binary`, `Unary`,
+  `HandleLit`, .... `Call` carries a `callee: CallTarget` discriminator
+  (`builtin` / `userFunc`) — codegen no longer does string lookups
+  against the runtime registry. `HandleLit` is a leaf that carries the
+  resolved function-handle target on its `ty: HandleType`; it never
+  reaches `emitExpr` directly (the enclosing Assign is elided).
 - `IRStmt` — `Assign`, `ExprStmt`, `Disp`, `If`, `While`, `For`, `Break`,
   `Continue`, `ReturnFromFunction`. `Assign` carries any RHS — scalar,
   `TensorLit`, or any other multi-element expression; codegen dispatches on

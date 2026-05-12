@@ -1,8 +1,9 @@
 # Type system
 
 Lives in `src/lowering/types.ts`. Designed to grow — the discriminated union
-has room for non-numeric variants (Logical, Cell, Struct, Handle) without
-reshaping. Today `Numeric`, `String`, and the sentinels are populated.
+has room for non-numeric variants (Logical, Cell, Class) without
+reshaping. Today `Numeric`, `String`, `Struct`, `Handle`, and the
+sentinels are populated.
 
 ## MType
 
@@ -13,6 +14,7 @@ MType =
   | NumericType
   | StringType
   | StructType
+  | HandleType
   | { kind: "Unknown" }
   | { kind: "Void" }
 ```
@@ -183,6 +185,76 @@ Today only one binary op is defined for strings: `+` is concatenation
 ops on strings raise `UnsupportedConstruct`. The introspection builtins
 `length(s)` and `numel(s)` are folded to the constant `1` at lowering (numbl
 semantics — a numbl `string` is a scalar handle, not a char vector).
+
+## HandleType
+
+```
+HandleType {
+  kind: "Handle"
+  target: HandleTarget
+}
+
+HandleTarget =
+  | { kind: "userFunc"; name; file; ast }      // @my_func
+  | { kind: "builtin";  name }                  // @sin
+  | { kind: "anonymous"; mangledBase; ast; file } // @(x) ...
+```
+
+A function-handle type carrying the _statically resolved_ target of an
+`@name` or `@(...) ...` expression. The v1 representation is
+**phantom**: `cTypeFor(HandleType)` returns `null`, so handle-typed
+variables, parameters, and Assigns vanish from the emitted C entirely.
+The handle's identity flows through the type system only, and every
+`h(args)` call site resolves to a concrete mangled C function at
+lowering time.
+
+This is what makes the static-dispatch design tractable. Three
+properties fall out of "identity lives in the type":
+
+- **`unify(handle_a, handle_b)`** returns `handle_a` iff both targets
+  match by deep identity (kind + name + file for userFunc, name for
+  builtin, mangledBase for anonymous). Mismatch collapses to
+  `Unknown`, which `recordAssignment` reports as a clear category
+  conflict.
+- **`storageCategory(handle)`** encodes the target identity as a
+  string. `canShareStorage` therefore returns false across distinct
+  targets — `f = @foo; f = @bar` at top level splits into a fresh C
+  binding (the existing variable-split machinery), and inside control
+  flow it errors with the standard category-mismatch diagnostic.
+- **`canonicalizeType(handle)`** encodes the target identity only —
+  no AST, no body — so the JSON shard contributed by a handle arg is
+  small and deterministic. A higher-order function `apply(h, x)`
+  specializes per-handle-target: `apply(@foo, x)` and `apply(@bar, x)`
+  produce two distinct `apply__<hex>` specializations, and the body
+  of each one calls the concrete underlying user function.
+
+Codegen consequences:
+
+- A handle-typed parameter is **elided** from the C signature. The
+  per-specialization header comment annotates it as `(handle, elided)`
+  so the generated C remains self-explanatory.
+- A handle-typed argument is elided from the rendered call argument
+  list. The static dispatch already happened — there's nothing to
+  pass.
+- A handle-typed Assign is elided from main / function bodies. If the
+  RHS is a user-function `Call` (a "factory function" returning a
+  handle), the call still emits as a bare statement so its body's side
+  effects fire; the discarded handle value is implicit.
+- A 1-output user function whose output is a handle is emitted with
+  `void` return type. The body's side effects emit normally; the
+  implicit fall-through `return <cName>;` is dropped.
+
+Anonymous functions get a synthesized `FunctionStmt` AST and a
+counter-derived `mangledBase` (`anon_<N>`). The output assign is named
+`anonOut_<N>`. Capture detection runs before synthesis: any Ident in
+the body that's bound in the enclosing scope and not in the param list
+is rejected with a clear "captures are not yet supported" diagnostic.
+
+Storage-category guarantees: a `Handle:userFunc:<file>:<name>` ≠
+`Handle:userFunc:<file>:<other-name>` ≠ `Handle:builtin:<name>` ≠
+`Handle:anonymous:<mangledBase>`. Two anonymous expressions at different
+source spans bump the shared counter and so always produce distinct
+identities; an anonymous's identity is independent of its body text.
 
 ## Sign
 

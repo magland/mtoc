@@ -41,6 +41,7 @@ export function forEachSubExpr(
     case "CharLit":
     case "Var":
     case "EndRef":
+    case "HandleLit":
       return;
     case "Binary":
       forEachSubExpr(e.left, visit);

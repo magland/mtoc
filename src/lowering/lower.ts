@@ -35,6 +35,7 @@ import type {
 import {
   absentDefaultFor,
   canShareStorage,
+  isHandle,
   isMultiElement,
   isNumeric,
   isScalarComplex,
@@ -73,6 +74,12 @@ import {
   lowerFuncCall,
   lowerMultiAssignCall,
 } from "./lowerFuncCall.js";
+import {
+  handleUserCallable,
+  lowerAnonFunc,
+  lowerFuncHandle,
+  lowerHandleCall,
+} from "./lowerHandle.js";
 import { lowerIndexStore } from "./lowerIndexStore.js";
 import { lowerIndexSliceStore } from "./lowerIndexSliceStore.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
@@ -161,6 +168,10 @@ export interface SharedSpecState {
   order: IRFunction[];
   /** Mangled names currently being lowered, used to reject recursion. */
   inFlight: Set<string>;
+  /** Per-program counter for synthetic anonymous-function names
+   *  (`_mtoc_anon_<N>`). Each `@(...)` site bumps this once; subsequent
+   *  specializations of the same anonymous body share the base name. */
+  anonCounter: { value: number };
 }
 
 export class Lowerer {
@@ -663,19 +674,30 @@ export class Lowerer {
           // route (0-output / N≥2-output) and the regular expression
           // path. envLookup'd names (variable index) and builtins fall
           // through to the regular path; their dispatch happens inside
-          // `lowerFuncCall`.
+          // `lowerFuncCall`. Handle-bound names take a parallel route:
+          // a 0/N-output handle call needs `MultiAssignCall` too, since
+          // the underlying user function's C ABI is `void` + out-pointers.
           let userTarget: {
             ast: import("../workspace/workspace.js").FunctionStmt;
             file: string;
+            callName: string;
           } | null = null;
-          if (this.envLookup(s.expr.name) === undefined) {
+          const envTy = this.envLookup(s.expr.name);
+          if (envTy !== undefined && isHandle(envTy)) {
+            const u = handleUserCallable(envTy, s.span);
+            userTarget = { ast: u.ast, file: u.file, callName: u.name };
+          } else if (envTy === undefined) {
             const target = this.shared.workspace.resolve(
               s.expr.name,
               { file: this.currentFile },
               s.expr.span
             );
             if (target?.kind === "userFunction") {
-              userTarget = { ast: target.ast, file: target.file };
+              userTarget = {
+                ast: target.ast,
+                file: target.file,
+                callName: target.name,
+              };
             }
           }
           if (userTarget && userTarget.ast.outputs.length !== 1) {
@@ -683,7 +705,7 @@ export class Lowerer {
               this,
               userTarget.ast,
               userTarget.file,
-              s.expr.name,
+              userTarget.callName,
               s.expr.args,
               [],
               s.span
@@ -751,12 +773,26 @@ export class Lowerer {
 
       case "MultiAssign": {
         // `[a, b, ~] = foo(x);` — only legal when `foo` resolves to a
-        // user function; multi-assigning a builtin isn't supported
+        // user function or a user-function-backed handle. Multi-
+        // assigning a builtin (named or handle) isn't supported
         // because builtins are scalar return-by-value and have no
         // multi-output convention in mtoc today.
         if (s.expr.type !== "FuncCall") {
           throw new UnsupportedConstruct(
             `multi-assign right-hand side must be a user-function call`,
+            s.span
+          );
+        }
+        const envTy = this.envLookup(s.expr.name);
+        if (envTy !== undefined && isHandle(envTy)) {
+          const u = handleUserCallable(envTy, s.span);
+          return lowerMultiAssignCall.call(
+            this,
+            u.ast,
+            u.file,
+            u.name,
+            s.expr.args,
+            s.lvalues,
             s.span
           );
         }
@@ -950,7 +986,26 @@ export class Lowerer {
         if (e.name === "struct" && this.envLookup(e.name) === undefined) {
           return lowerStructConstructor.call(this, e);
         }
+        // Function-handle call: when `e.name` is bound to a
+        // `HandleType` in the current env, dispatch through the
+        // handle's resolved target instead of treating `e.name(args)`
+        // as either a function call by name or an index expression.
+        // This branch must precede `lowerFuncCall` since that helper
+        // would otherwise route an env-bound name to `IndexLoad` /
+        // `IndexSlice`.
+        {
+          const envTy = this.envLookup(e.name);
+          if (envTy !== undefined && isHandle(envTy)) {
+            return lowerHandleCall.call(this, e.name, envTy, e.args, e.span);
+          }
+        }
         return lowerFuncCall.call(this, e);
+
+      case "FuncHandle":
+        return lowerFuncHandle.call(this, e);
+
+      case "AnonFunc":
+        return lowerAnonFunc.call(this, e);
 
       case "Member":
         return lowerMemberRead.call(this, e);
@@ -1219,6 +1274,7 @@ export function lower(
     cache: new Map(),
     order: [],
     inFlight: new Set(),
+    anonCounter: { value: 0 },
   };
   const top = new Lowerer(shared);
   top.primeStructShapes(bodyToLower);
