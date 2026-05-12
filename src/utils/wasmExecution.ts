@@ -102,7 +102,7 @@ export async function buildWasm(
         source: cSource,
         fastMath: opts.fastMath ?? false,
         simd: opts.simd ?? false,
-        optLevel: opts.optLevel ?? "O2",
+        optLevel: opts.optLevel ?? "O3",
       }),
       signal: abortSignal,
     });

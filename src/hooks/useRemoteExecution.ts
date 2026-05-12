@@ -143,7 +143,7 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
             enableTempInlining: opts.enableTempInlining ?? false,
             fastMath: opts.fastMath ?? false,
             simd: opts.simd ?? false,
-            optLevel: opts.optLevel ?? "O2",
+            optLevel: opts.optLevel ?? "O3",
           },
           wasmUrl,
           abort.signal

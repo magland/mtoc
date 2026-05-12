@@ -62,7 +62,10 @@ function readExecutionMode(): ExecutionMode {
 function readWasmOptLevel(): WasmOptLevel {
   const v = localStorage.getItem(WASM_OPT_LEVEL_KEY);
   if (v === "O0" || v === "O2" || v === "O3") return v;
-  return "O2";
+  // Default to -O3: emcc compile time is acceptable (a few seconds even
+  // for tensor-heavy programs) and the runtime win matters for users
+  // exploring numbl in the IDE. O2 stays a one-click choice.
+  return "O3";
 }
 
 function readWasmSimd(): boolean {
