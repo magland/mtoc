@@ -20,6 +20,7 @@ import {
   isStruct,
   isText,
   structMangledName,
+  typeToString,
   type StructType,
   type MType,
 } from "../lowering/types.js";
@@ -92,6 +93,33 @@ function topoSort(table: StructTable): StructType[] {
   return order;
 }
 
+/** Header comment for a struct shape — orients the reader by spelling
+ *  out the field-name set and each field's inferred MType in numbl's
+ *  `typeToString` form. Same shape as the per-function header comment
+ *  emitted by `emitFunction.ts::functionHeaderComment`. */
+function structHeaderComment(t: StructType): string[] {
+  const fieldNames = t.fields.map(f => f.name).join(", ");
+  const labelWidth = Math.max(
+    "mangled".length,
+    ...t.fields.map(f => f.name.length)
+  );
+  const pad = (s: string) => s.padEnd(labelWidth);
+  const lines: string[] = [];
+  if (t.fields.length === 0) {
+    lines.push(`/* Struct typedef: struct() (empty)`);
+  } else {
+    lines.push(`/* Struct typedef: {${fieldNames}}`);
+  }
+  lines.push(` *   ${pad("mangled")} : ${structMangledName(t)}`);
+  for (const f of t.fields) {
+    lines.push(` *   ${pad(f.name)} : ${typeToString(f.type)}`);
+  }
+  lines.push(` *`);
+  lines.push(` * Helpers: <typedef>_empty / _free / _copy / _assign / _disp`);
+  lines.push(` */`);
+  return lines;
+}
+
 /** Render the C source block for one struct shape: typedef + the
  *  four owned-kind helpers + the disp helper. The `disp` helper is
  *  emitted unconditionally (cheap and always wanted when any
@@ -99,6 +127,10 @@ function topoSort(table: StructTable): StructType[] {
 function renderStructBlock(state: EmitState, t: StructType): string[] {
   const name = structMangledName(t);
   const lines: string[] = [];
+  // Header comment listing the field-name set + per-field inferred
+  // types — orients a reader who would otherwise see a bare
+  // `_mtoc_struct__<hash>` with no clue what shape it represents.
+  for (const l of structHeaderComment(t)) lines.push(l);
   const fieldDeclLines: string[] = [];
   for (const f of t.fields) {
     const cTy = cTypeFor(f.type);
@@ -107,21 +139,28 @@ function renderStructBlock(state: EmitState, t: StructType): string[] {
         `codegen internal: struct field '${f.name}' has unsupported C type`
       );
     }
-    fieldDeclLines.push(`  ${cTy} ${f.name};`);
+    // Inline comment giving the numbl-side type for the field. Helps
+    // a reader bridge the C typedef name (which for nested struct
+    // fields is itself a `_mtoc_struct__<hash>`) back to the numbl
+    // shape it represents.
+    fieldDeclLines.push(`  ${cTy} ${f.name}; /* ${typeToString(f.type)} */`);
   }
   lines.push(`typedef struct ${name} {`);
   if (fieldDeclLines.length === 0) {
     // C forbids zero-member struct types; pad with a single byte so
     // the empty `struct()` literal (`{0}`) is well-formed. The pad is
     // never read by user code.
-    lines.push(`  char _mtoc_empty_pad;`);
+    lines.push(`  char _mtoc_empty_pad; /* C requires >= 1 member */`);
   } else {
     for (const l of fieldDeclLines) lines.push(l);
   }
   lines.push(`} ${name};`);
   lines.push("");
 
-  // empty()
+  // empty() — returns a zero-initialized handle. Used to predeclare
+  // a struct local before any user write (and to seed owned-discard
+  // slots at multi-output call sites). Safe to feed back into _free.
+  lines.push(`/* Zero-initialized handle (predeclaration default). */`);
   lines.push(`static ${name} ${name}_empty(void) {`);
   lines.push(`  ${name} _s = {0};`);
   lines.push(`  return _s;`);
@@ -131,6 +170,10 @@ function renderStructBlock(state: EmitState, t: StructType): string[] {
   // free(&s) — recursively releases any owned field, then zeros the
   // local pointers. Idempotent on a zeroed handle (each child kind's
   // free is, so by induction the struct's is too).
+  lines.push(
+    `/* Recursively releases any owned field (tensor / string / nested struct).`
+  );
+  lines.push(` * Idempotent on a zeroed handle. */`);
   lines.push(`static void ${name}_free(${name} *s) {`);
   for (const f of t.fields) {
     const fieldFree = freeForField(state, f.name, f.type);
@@ -142,6 +185,10 @@ function renderStructBlock(state: EmitState, t: StructType): string[] {
   lines.push("");
 
   // copy(s) — deep-copy each field. Returns a new struct value.
+  lines.push(`/* Deep copy: each owned field gets its own buffer. Drives the`);
+  lines.push(
+    ` * copy-on-arg-pass semantics for struct function parameters. */`
+  );
   lines.push(`static ${name} ${name}_copy(${name} s) {`);
   lines.push(`  ${name} _out = {0};`);
   for (const f of t.fields) {
@@ -157,6 +204,8 @@ function renderStructBlock(state: EmitState, t: StructType): string[] {
   // assign(&lhs, rhs) — consume-replace: free lhs's current contents,
   // then move rhs in. Caller passes either a fresh value (from a copy
   // or a constructor) or a temporary returned from a function.
+  lines.push(`/* Consume-replace: frees lhs's prior contents, installs rhs.`);
+  lines.push(` * Mirrors mtoc_tensor_assign / mtoc_string_assign. */`);
   lines.push(`static void ${name}_assign(${name} *lhs, ${name} rhs) {`);
   lines.push(`  ${name}_free(lhs);`);
   lines.push(`  *lhs = rhs;`);
@@ -169,6 +218,10 @@ function renderStructBlock(state: EmitState, t: StructType): string[] {
   // doesn't add extra indentation for nested levels — the first line
   // appears inline after `<name>: `, and subsequent lines start at
   // column 0 of the output).
+  lines.push(`/* disp(s): one line per field, matching numbl's formatStruct.`);
+  lines.push(
+    ` * Nested structs / tensors / strings contribute their own disp output. */`
+  );
   lines.push(`static void ${name}_disp(${name} s) {`);
   for (const f of t.fields) {
     const namelit = formatStringLit(f.name);
