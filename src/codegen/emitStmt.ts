@@ -64,6 +64,15 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   if (srcLine !== null) {
     pushStmt(state, level, `/* ${sanitizeForBlockComment(srcLine)} */`);
   }
+  // Fusion plan hook: a producer `Assign` that was inlined into a
+  // downstream consumer's elementwise loop has its loop emission
+  // skipped here. The source-line comment above still emits, so the
+  // reader can follow each numbl statement; the consumer's emit
+  // below produces the single fused C loop. See
+  // `src/codegen/opt/fuseSameShape.ts`.
+  if (state.fusionPlan !== null && state.fusionPlan.skipProducers.has(s)) {
+    return;
+  }
   switch (s.kind) {
     case "Assign": {
       // `state.needMath` and runtime activations were set up by the
@@ -133,7 +142,12 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           s.rhs.kind !== "Var" &&
           !isDirectOwnedCall
         ) {
-          emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
+          // Fusion plan hook: if this Assign is a consumer whose RHS
+          // has had a producer's RHS inlined, emit from the rewritten
+          // expression instead of `s.rhs`. The producer's own Assign
+          // is in `state.fusionPlan.skipProducers` and emits no loop.
+          const effectiveRhs = state.fusionPlan?.consumerRhs.get(s) ?? s.rhs;
+          emitTensorAssignFromExpr(state, level, s.cName, effectiveRhs);
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
           break;
         }

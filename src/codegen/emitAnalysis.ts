@@ -21,6 +21,7 @@ import {
 } from "../lowering/types.js";
 import { forEachStmtInTree, forEachTopLevelExpr } from "../lowering/walk.js";
 import { topLevelOwnedDefs, topLevelOwnedUses } from "./liveness.js";
+import { fusedOwnedUses } from "./opt/fuseSameShape.js";
 import { ownedOps } from "./ownedKinds.js";
 import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 import { analyzeExpr, emitExpr, wrapTextView } from "./emitExpr.js";
@@ -52,12 +53,24 @@ export function analyzeStmts(
  *  `s`'s top-level uses or defs but is NOT touched (read or written)
  *  at any successor — i.e. `s` was its last touch on this level.
  *  Returns sorted (stable C output) and excludes names already freed
- *  on this linear path. */
+ *  on this linear path.
+ *
+ *  Fusion-plan interaction: when `s` is a consumer that has had a
+ *  producer's RHS inlined (see `src/codegen/opt/fuseSameShape.ts`),
+ *  the post-fusion uses come from the rewritten RHS, not from the
+ *  original. The future-touch map is computed pre-fusion, but its
+ *  values (touches at *successors* of s) are unchanged by fusion —
+ *  fusion only moves reads earlier on the linear path, never later.
+ *  So substituting the consumer's uses with the rewritten-RHS uses
+ *  is safe; the comparison against `futureTouchOut(s)` still
+ *  identifies last-touch correctly. */
 export function deadAfterStmt(state: EmitState, s: IRStmt): string[] {
   if (state.futureTouches === null) return [];
   const futureTouchOut = state.futureTouches.get(s);
   if (futureTouchOut === undefined) return [];
-  const touched = topLevelOwnedUses(s);
+  const fused =
+    state.fusionPlan === null ? null : fusedOwnedUses(s, state.fusionPlan);
+  const touched = fused ?? topLevelOwnedUses(s);
   for (const d of topLevelOwnedDefs(s)) touched.add(d);
   const out: string[] = [];
   for (const v of touched) {

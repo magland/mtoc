@@ -25,7 +25,7 @@ export const example1Path = join(repoRoot, "examples", "example1.m");
 
 export function translate(
   source: string,
-  opts: { includeRuntime?: boolean } = {}
+  opts: { includeRuntime?: boolean; disableOptimizations?: boolean } = {}
 ): string {
   const ast = parseMFile(source, "test.m");
   const ws = new Workspace("test.m");

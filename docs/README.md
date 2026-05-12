@@ -14,6 +14,9 @@ _concepts and roles_ so they stay accurate as files move around.
   helpers, how a builtin participates in lowering and codegen.
 - [runtime.md](runtime.md) — the C runtime helpers (`.h` snippets), dependency
   ordering, how scalars vs multi-element tensors are represented in C.
+- [optimizations.md](optimizations.md) — codegen-time peephole optimizations
+  under `src/codegen/opt/` and the contract every optimization is expected to
+  follow.
 - [specialization.md](specialization.md) — how user-defined functions get
   specialized per call-site type tuple, and how the mangled C name is derived.
 - [testing.md](testing.md) — the cross-runner harness, vitest layout, where new

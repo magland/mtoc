@@ -17,6 +17,7 @@ import type { VarBinding } from "../lowering/ir.js";
 import type { MType } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import type { FutureTouchMap } from "./liveness.js";
+import type { FusionPlan } from "./opt/fuseSameShape.js";
 import { RUNTIME_HELPERS, type RuntimeSnippet } from "./runtime.js";
 
 /** A frame on the per-element-loop stack. `flat` is the same-shape
@@ -120,6 +121,21 @@ export interface EmitState {
    *  adjacent calls don't collide even though the temps are scoped
    *  inside per-call `{}` blocks. */
   multiAssignCallCounter: number;
+  /** Optimizer fusion plan for the scope currently being emitted, or
+   *  `null` when fusion is disabled or no scope is active. The plan
+   *  is a value-typed read-only record: a set of producer `Assign`s
+   *  to skip, plus a map of consumer `Assign`s to their rewritten
+   *  RHSes (with fused producers' RHSes inlined). Hook points in
+   *  `emitStmt.ts` and `emitAnalysis.ts` consult this field; a `null`
+   *  plan returns the codegen to its pre-fusion behavior. See
+   *  `src/codegen/opt/fuseSameShape.ts`. */
+  fusionPlan: FusionPlan | null;
+  /** When true, every per-scope plan-build site substitutes the
+   *  empty plan (no fusion). Mirrors the
+   *  `EmitOptions.disableOptimizations` knob; carried on the state
+   *  so `emitFunctionBody`'s plan-build call doesn't need an extra
+   *  parameter. */
+  disableOptimizations: boolean;
 }
 
 /** Build the small facade view passed to `BuiltinSig.emit` closures.

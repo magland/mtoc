@@ -167,7 +167,8 @@ The codegen is split across one orchestrator and several topical
 modules:
 
 - `emit.ts` — top-level `emitC(prog, opts)` driver. Builds the
-  `EmitState`, runs the analysis pre-walk, and assembles headers +
+  `EmitState`, runs the analysis pre-walk, builds the per-scope
+  optimization plans (see `opt/` below), and assembles headers +
   runtime snippets + function blocks + main into the final C string.
 - `emitState.ts` — `EmitState` interface plus the small helpers that
   every other module needs (`useRuntime` / `useRuntimeByName` /
@@ -193,6 +194,14 @@ modules:
   as a `/* ... */` comment above each emitted statement so a reader
   of the generated C can follow the original program shape without
   going back to the `.m` source.
+- `opt/` — codegen-time peephole optimizations. Each file is a self-
+  contained plan-builder that the emitter consults at a small number
+  of narrow, null-guarded hook sites. The MVP is `fuseSameShape.ts`
+  (same-shape elementwise fusion: collapses back-to-back
+  single-use elementwise `Assign`s into one fused loop). Optimizations
+  are always on by default; pass `disableOptimizations: true` to
+  `emitC` to bypass them. See `docs/optimizations.md` for the
+  contract every optimization is expected to follow.
 
 `emit.ts` walks an `IRProgram` and produces a single C source string.
 Responsibilities:

@@ -35,6 +35,7 @@ import { analyzeStmts } from "./emitAnalysis.js";
 import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
+import { buildFusionPlan, EMPTY_FUSION_PLAN } from "./opt/fuseSameShape.js";
 
 /** Options for `emitC`. */
 export interface EmitOptions {
@@ -48,10 +49,17 @@ export interface EmitOptions {
    *  mtoc output into a project that supplies its own runtime.
    *  Default: true (full self-contained translation unit). */
   includeRuntime?: boolean;
+  /** When true, disable all codegen optimization passes (currently
+   *  same-shape elementwise fusion — see
+   *  `src/codegen/opt/fuseSameShape.ts`). Useful for diffing the
+   *  pre- vs post-optimization C output, or for tests that want to
+   *  pin the unfused emission. Default: false (optimizations on). */
+  disableOptimizations?: boolean;
 }
 
 export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   const includeRuntime = opts.includeRuntime ?? true;
+  const disableOptimizations = opts.disableOptimizations ?? false;
 
   const state: EmitState = {
     needMath: { value: false },
@@ -69,6 +77,8 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     freedOwned: new Set(),
     currentFunctionOutputs: null,
     multiAssignCallCounter: 0,
+    fusionPlan: null,
+    disableOptimizations,
   };
 
   // One-pass pre-walk: activates runtime helpers referenced by the
@@ -90,6 +100,12 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   state.currentScopeVars = prog.assignedVars;
   state.futureTouches = computeFutureTouches(prog.stmts);
   state.freedOwned = new Set();
+  // Build the same-shape elementwise fusion plan for main once
+  // liveness is available; if the optimizer is disabled, install
+  // the empty plan so the hook sites short-circuit uniformly.
+  state.fusionPlan = disableOptimizations
+    ? EMPTY_FUSION_PLAN
+    : buildFusionPlan(prog.stmts, state.futureTouches);
   emitDeclarations(state, 1, prog.assignedVars);
   for (const s of prog.stmts) emitStmt(state, 1, s);
   // Free every tensor backing allocated for top-level vars not
@@ -99,6 +115,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   emitScopeExitFrees(state, 1, prog.assignedVars, state.freedOwned);
   state.currentScopeVars = null;
   state.futureTouches = null;
+  state.fusionPlan = null;
 
   // Headers: explicit needs from user code, plus runtime-snippet
   // headers when those snippets are part of the output. With
