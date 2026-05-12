@@ -25,11 +25,13 @@ export interface BuildOptions {
    *  Default false to keep run output bit-stable with the
    *  cross-runner oracle. */
   fastMath?: boolean;
-  /** Run the tensor-expression fusion pass before codegen. Collapses
-   *  chains of single-use elementwise tensor Assigns into one fused
-   *  loop. Default false during rollout; see
-   *  `src/codegen/fuse/inlinePass.ts`. */
-  enableTensorFusion?: boolean;
+  /** Run the tensor-expression inlining pass before codegen.
+   *  Substitutes every single-use multi-element tensor Assign's RHS
+   *  into its unique consumer, eliminating large intermediate
+   *  tensors that thrash cache between separate loops. Default
+   *  false during rollout; see
+   *  `src/codegen/inline/inlinePass.ts`. */
+  enableTempInlining?: boolean;
 }
 
 /** Build the argv array for the C compiler. Both `mtoc run` and the

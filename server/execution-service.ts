@@ -39,9 +39,10 @@ interface ServerOptions {
 interface RunRequest {
   files: SourceFile[];
   activeName: string;
-  /** When true, run the tensor-expression fusion pass during translation.
-   *  See `src/codegen/fuse/inlinePass.ts`. Optional, defaults to false. */
-  enableTensorFusion?: boolean;
+  /** When true, run the tensor-expression inlining pass during
+   *  translation. See `src/codegen/inline/inlinePass.ts`. Optional,
+   *  defaults to false. */
+  enableTempInlining?: boolean;
   /** When true, add `-ffast-math` to the build. See
    *  `src/build.ts::BuildOptions.fastMath`. Optional, defaults to false. */
   fastMath?: boolean;
@@ -119,12 +120,12 @@ function validateRunRequest(
     };
   }
   if (
-    r.enableTensorFusion !== undefined &&
-    typeof r.enableTensorFusion !== "boolean"
+    r.enableTempInlining !== undefined &&
+    typeof r.enableTempInlining !== "boolean"
   ) {
     return {
       ok: false,
-      message: "'enableTensorFusion' must be a boolean if provided.",
+      message: "'enableTempInlining' must be a boolean if provided.",
     };
   }
   if (r.fastMath !== undefined && typeof r.fastMath !== "boolean") {
@@ -227,7 +228,7 @@ async function handleRun(
 
     // Translate on the server using the same pipeline the IDE uses.
     const translateResult = translateProject(parsed.files, parsed.activeName, {
-      enableTensorFusion: parsed.enableTensorFusion ?? false,
+      enableTempInlining: parsed.enableTempInlining ?? false,
     });
     if (translateResult.error) {
       sendEvent({

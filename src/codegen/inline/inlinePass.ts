@@ -1,28 +1,24 @@
 /**
- * Tensor-expression fusion: pass 1 (IR inlining).
+ * Tensor-expression inlining (a.k.a. temporary elimination).
  *
- * Replaces chains of single-use elementwise Assigns with one fat
- * Assign whose RHS is the substituted expression tree. Runs between
- * lowering+ANF and codegen as a pure `(IRProgram) → IRProgram`
- * rewrite. The codegen sees a smaller, fatter IR and emits one loop
- * per surviving multi-element Assign — no new emitter machinery is
- * needed for the MVP because the iter-loop emitter already walks
- * arbitrary Binary/Unary/Call/Var trees.
+ * Substitutes a single-use producer Assign's RHS into its consumer's
+ * RHS and deletes the producer. Runs between lowering+ANF and codegen
+ * as a pure `(IRProgram) → IRProgram` rewrite. Conceptually classic
+ * compiler inlining / let-binding elimination / value forwarding —
+ * NOT loop fusion (mtoc's codegen already fuses ops over a shared
+ * iteration domain inside its per-Assign elementwise emitter; this
+ * pass just hands that emitter deeper expressions to fuse).
  *
- * # The two-pass architecture
+ * # Why this matters
  *
- *   Pass 1 (here) : inline single-use multi-element Assigns whose RHS
- *                   is pure elementwise. Decoupled from codegen.
- *   Pass 2 (codegen, future extension): generalized iter-context
- *                   renderer that can splice IndexSlice / transpose /
- *                   broadcast operands without materializing them.
- *
- * The MVP only implements pass 1, and only for the case where both
- * producer and consumer go through the existing flat-iter
- * (`emitFlatAssign`) emission path — i.e. their static shapes match
- * and no operand needs broadcasting. That covers the `r2 → val`
- * step in compute_kernel; extending pass 1 to broadcast and pass 2
- * to slice/transpose is the V3 follow-up.
+ * Without inlining, every intermediate tensor `b = a + 1; c = b * 2`
+ * materializes `b` as a heap buffer, then reads it back in a second
+ * loop. For 16M-element intermediates the bandwidth cost of the
+ * read-back dominates compute. After inlining, the consumer's loop
+ * computes the whole expression per-slot — no intermediate write,
+ * no intermediate read, no allocation. The codegen already knew how
+ * to do this for one big expression; the pass just stops producing
+ * many small ones.
  *
  * # Inlinability predicate
  *
@@ -34,7 +30,9 @@
  *   2. P's RHS is "pure elementwise": only NumLit / ImagLit / Var /
  *      Binary / Unary / IndexLoad / EndRef / elementwise libm Call.
  *      No TensorLit, no IndexSlice, no user-fn Call, no
- *      direct-owned-Call builtin (transpose, reshape, sum, etc.).
+ *      direct-owned-Call builtin (transpose, reshape, sum, etc.) —
+ *      those are valid only at the top of an Assign.rhs by ANF
+ *      invariant; nesting them would break codegen.
  *   3. X is used exactly once in the body. The count includes every
  *      `Var(X)` occurrence reachable via `forEachSubExpr`. Function
  *      output cNames get a +1 protective bump so the returned value
@@ -47,95 +45,152 @@
  *   5. C is a multi-element real-double Assign whose RHS goes
  *      through the elementwise-loop path. Same gate as
  *      `emitTensorAssignFromExpr`'s entry condition.
- *   6. P and C have the same static result shape, AND every
- *      multi-element operand of C's RHS (excluding X, which we're
- *      replacing) shares that shape. This keeps the fused result on
- *      the flat-iter path. (V3 will relax this.)
- *   7. P and C are at the same body level (no fusion across If /
+ *   6. P and C are at the same body level (no inlining across If /
  *      While / For).
- *   8. No statement between P and C writes to X or to any free Var
+ *   7. No statement between P and C writes to X or to any free Var
  *      in P's RHS, and no statement reads X (so we genuinely have
  *      the unique consumer).
+ *
+ * Note: P and C do NOT need to have matching static shapes.
+ * Different shapes simply route C through the broadcast emitter
+ * after substitution — the codegen handles either case uniformly.
  *
  * The substitution is a pure IR-tree rewrite: every `Var(X)` in C's
  * RHS becomes a fresh copy of P's RHS subtree. The producer Assign
  * is removed from the body. Its `assignedVars` predecl entry stays
  * (the predeclare-as-empty + scope-exit `mtoc_tensor_free` of an
  * empty struct are no-ops at the C level), so the rest of codegen
- * doesn't need to know fusion happened.
+ * doesn't need to know inlining happened.
  *
  * # Algorithm
  *
  * Per body: iterate `inlineOnePass` to fixed point. Each pass walks
  * candidate producers in source order, scans forward for the single
- * consumer, checks all gates, substitutes if eligible. Chained
- * inlining (`a → b → c`) needs multiple iterations because each
- * substitution can expose a previously-second-use as single-use.
+ * consumer, checks all gates, substitutes ONE pair if eligible.
+ * Chained inlining (`a → b → c`) needs multiple iterations because
+ * each substitution can expose a previously-multi-use as single-use.
  * The number of iterations is bounded by chain depth; we cap at 32
  * defensively.
  *
  * # Codegen invariants this preserves
  *
- *   - Every multi-element `Var` in the post-fusion IR is either a
+ *   - Every multi-element `Var` in the post-inlining IR is either a
  *     function param, a TensorLit-producing Assign LHS, an
  *     IndexSlice-producing Assign LHS, a direct-owned-Call LHS, or
  *     a multi-element Assign LHS whose RHS we kept. None of these
  *     reach the empty-handle predecl path.
- *   - The post-fusion IR is still well-typed: every node's `.ty`
+ *   - The post-inlining IR is still well-typed: every node's `.ty`
  *     stays as-is. The substitution doesn't change types because
- *     `Var(X).ty === X's Assign.ty === P.rhs.ty` (the producer's
- *     RHS type IS what the LHS gets).
- *   - The post-fusion IR still satisfies ANF for owned producers:
+ *     `Var(X).ty === X's Assign.ty === P.rhs.ty`.
+ *   - The post-inlining IR still satisfies ANF for owned producers:
  *     we only inline producers whose RHS is NOT an owned producer
  *     (no TensorLit, IndexSlice, owned Call). So nested owned
- *     producers cannot appear post-fusion.
+ *     producers cannot appear post-inlining.
  *
  * # Why the existing codegen Just Works
  *
- * After fusion, a consumer's RHS contains nested `Binary` / `Unary`
- * / `Call` / `Var` / `NumLit`. The flat-iter emitter
- * (`emitTensor.ts:emitFlatAssign`) collects multi-element Vars via
- * `collectMultiElementVarsByCName`, walks the RHS once per slot via
- * `emitExpr`, and renders multi-element `Var` reads as
- * `<cName>.real[<iter>]`. Nothing in that path cares whether the
- * RHS was originally one Assign or three fused-in producers — it
- * just walks the tree.
+ * After inlining, a consumer's RHS contains nested `Binary` / `Unary`
+ * / `Call` / `Var` / `NumLit`. The elementwise emitter
+ * (`emitTensor.ts:emitTensorAssignFromExpr`) walks any such tree
+ * once per output slot, dispatching on operand static shapes between
+ * its flat-iter and broadcast paths. Nothing in that path cares
+ * whether the RHS was originally one Assign or several inlined-in
+ * producers — it just walks the tree.
  */
 
 import type { IRExpr, IRStmt, IRProgram } from "../../lowering/ir.js";
-import {
-  isMultiElement,
-  isNumeric,
-  type NumericType,
-} from "../../lowering/types.js";
-import { forEachSubExpr } from "../../lowering/walk.js";
+import { isMultiElement, isNumeric } from "../../lowering/types.js";
+import { forEachStmtInTree, forEachSubExpr } from "../../lowering/walk.js";
+import { renderStmt } from "../irRender.js";
+
+/** Map from a SURVIVING consumer Assign's IRStmt to the ordered
+ *  list of pre-inlining comment strings for each producer that got
+ *  inlined into it. Each entry is the `renderStmt(producer)`
+ *  snapshot taken BEFORE any inlining happened, so a reader of the
+ *  emitted C can see the original numbl-source form of every
+ *  collapsed statement. The list is built up through pass-iteration
+ *  chaining: if `b` inlined into `d` and then `d` inlined into `e`,
+ *  `e`'s entry ends up as `[b's comment, d's comment]` — both
+ *  producers in source order.
+ *
+ *  The map is keyed by IRStmt identity (NOT by cName) because two
+ *  function specializations can share the same cName for a local
+ *  variable, and the same cName can mean different things in
+ *  different bodies. Each substitution creates a fresh consumer
+ *  IRStmt; we transfer the old consumer's chain to the new one and
+ *  remove the old key in `inlineOnePass`. */
+export type InlinedFromMap = Map<IRStmt, string[]>;
 
 /** Top-level entry. Mutates `prog.stmts` and each function's `body`
- *  in place (replacing them with new arrays) when fusion fires.
- *  Returns the same program reference for convenience. */
-export function inlinePass(prog: IRProgram): IRProgram {
-  prog.stmts = inlineInBody(prog.stmts, new Set());
+ *  in place (replacing them with new arrays) when inlining fires.
+ *  Returns the inlined-from map so the codegen can emit
+ *  `/* inlined: … *\/` lines above each consumer. */
+export function inlinePass(prog: IRProgram): InlinedFromMap {
+  // `originalComments` is computed PER body (main + each function
+  // specialization) because cNames are scoped per body. Different
+  // function specializations of the same source often share local
+  // cNames like `rx`, `ry`, `val` — a global cName-keyed map would
+  // let the second specialization's comments shadow the first's,
+  // showing the wrong original source line in the inlined comments.
+  // `inlinedFrom` is keyed by IRStmt identity (which IS globally
+  // unique) and so stays a single program-wide map.
+  const inlinedFrom: InlinedFromMap = new Map();
+  prog.stmts = inlineInBody(
+    prog.stmts,
+    new Set(),
+    computeOriginalCommentsForBody(prog.stmts),
+    inlinedFrom
+  );
   for (const fn of prog.functions) {
     const protectedNames = new Set<string>();
     for (const o of fn.outputs) protectedNames.add(o.cName);
-    fn.body = inlineInBody(fn.body, protectedNames);
+    fn.body = inlineInBody(
+      fn.body,
+      protectedNames,
+      computeOriginalCommentsForBody(fn.body),
+      inlinedFrom
+    );
   }
-  return prog;
+  return inlinedFrom;
+}
+
+/** Snapshot the `renderStmt` output for every Assign in `body`
+ *  (including nested control-flow body Assigns). Done once before
+ *  any inlining, since substitution rewrites RHSes in place. cName
+ *  is unique within a single body. */
+function computeOriginalCommentsForBody(
+  body: ReadonlyArray<IRStmt>
+): Map<string, string> {
+  const out = new Map<string, string>();
+  forEachStmtInTree(body, s => {
+    if (s.kind === "Assign") {
+      const rendered = renderStmt(s);
+      if (rendered !== null) out.set(s.cName, rendered);
+    }
+  });
+  return out;
 }
 
 /** Iterate `inlineOnePass` to fixed point over a single body. */
 function inlineInBody(
   stmts: IRStmt[],
-  protectedNames: ReadonlySet<string>
+  protectedNames: ReadonlySet<string>,
+  originalComments: ReadonlyMap<string, string>,
+  inlinedFrom: InlinedFromMap
 ): IRStmt[] {
   // Also process nested-body inlining first so each control-flow
   // child stabilizes before its parent re-counts uses. The outer
-  // body's fixpoint then operates on the post-nested-fusion shape.
-  recurseInlineNested(stmts);
+  // body's fixpoint then operates on the post-nested-inlining shape.
+  recurseInlineNested(stmts, originalComments, inlinedFrom);
 
   let cur = stmts;
   for (let iter = 0; iter < 32; iter++) {
-    const next = inlineOnePass(cur, protectedNames);
+    const next = inlineOnePass(
+      cur,
+      protectedNames,
+      originalComments,
+      inlinedFrom
+    );
     if (next === cur) return cur;
     cur = next;
   }
@@ -143,16 +198,37 @@ function inlineInBody(
 }
 
 /** Recurse into If/While/For bodies and run inlining on each. */
-function recurseInlineNested(stmts: IRStmt[]): void {
+function recurseInlineNested(
+  stmts: IRStmt[],
+  originalComments: ReadonlyMap<string, string>,
+  inlinedFrom: InlinedFromMap
+): void {
   for (const s of stmts) {
     if (s.kind === "If") {
-      s.thenBody = inlineInBody(s.thenBody, new Set());
+      s.thenBody = inlineInBody(
+        s.thenBody,
+        new Set(),
+        originalComments,
+        inlinedFrom
+      );
       for (const eif of s.elseifs) {
-        eif.body = inlineInBody(eif.body, new Set());
+        eif.body = inlineInBody(
+          eif.body,
+          new Set(),
+          originalComments,
+          inlinedFrom
+        );
       }
-      if (s.elseBody) s.elseBody = inlineInBody(s.elseBody, new Set());
+      if (s.elseBody) {
+        s.elseBody = inlineInBody(
+          s.elseBody,
+          new Set(),
+          originalComments,
+          inlinedFrom
+        );
+      }
     } else if (s.kind === "While" || s.kind === "For") {
-      s.body = inlineInBody(s.body, new Set());
+      s.body = inlineInBody(s.body, new Set(), originalComments, inlinedFrom);
     }
   }
 }
@@ -167,7 +243,9 @@ function recurseInlineNested(stmts: IRStmt[]): void {
  *  by 32 iterations. */
 function inlineOnePass(
   stmts: IRStmt[],
-  protectedNames: ReadonlySet<string>
+  protectedNames: ReadonlySet<string>,
+  originalComments: ReadonlyMap<string, string>,
+  inlinedFrom: InlinedFromMap
 ): IRStmt[] {
   const useCounts = computeUseCounts(stmts, protectedNames);
 
@@ -190,7 +268,7 @@ function inlineOnePass(
     let bail = false;
     for (let j = i + 1; j < stmts.length; j++) {
       const s = stmts[j];
-      // Control flow ends the safe-fusion window.
+      // Control flow ends the safe-inlining window.
       if (
         s.kind === "If" ||
         s.kind === "While" ||
@@ -203,7 +281,7 @@ function inlineOnePass(
         break;
       }
       // Intervening write to producer's LHS or any free var in its
-      // RHS invalidates the fusion (the consumer would read a
+      // RHS invalidates the inlining (the consumer would read a
       // different value than the producer captured).
       if (stmtWritesAny(s, prodAssign.cName, prodFreeVars)) {
         bail = true;
@@ -225,13 +303,38 @@ function inlineOnePass(
     if (appearsInNonSlotPosition(consAssign.rhs, prodAssign.cName)) continue;
 
     // Substitute, remove the producer, and return immediately.
-    // The fixpoint loop will re-walk to catch chained fusions.
+    // The fixpoint loop will re-walk to catch chained inlinings.
     const newRhs = substituteVar(
       consAssign.rhs,
       prodAssign.cName,
       prodAssign.rhs
     );
     const newConsumer: IRStmt = { ...consAssign, rhs: newRhs };
+
+    // Update inlinedFrom: the NEW consumer IRStmt now records P's
+    // full chain (P's own inherited inlined-from list followed by P's
+    // own original comment) appended to whatever the OLD consumer
+    // had. Order: outermost-source-first, so on a chain
+    // `b → d → e`, e ends up with `[b's comment, d's comment]`.
+    // P and the old C identities are removed from the map; the new
+    // C identity carries the merged chain forward.
+    //
+    // `originalComments` is keyed by cName because, within a single
+    // body, cNames are unique and survive across consumer
+    // replacements (the LHS cName doesn't change when we substitute
+    // into the RHS). Across bodies cName collisions are possible
+    // but harmless — the lap2d case with two `compute_kernel`
+    // specializations both producing an `r2` cName picks up the
+    // same source comment in either body.
+    const pComment = originalComments.get(prodAssign.cName);
+    const pChain = inlinedFrom.get(producer) ?? [];
+    const cExisting = inlinedFrom.get(consumer) ?? [];
+    const merged = [...cExisting, ...pChain];
+    if (pComment !== undefined) merged.push(pComment);
+    if (merged.length > 0) inlinedFrom.set(newConsumer, merged);
+    inlinedFrom.delete(producer);
+    inlinedFrom.delete(consumer);
+
     const out: IRStmt[] = [];
     for (const s of stmts) {
       if (s === producer) continue;
@@ -244,7 +347,7 @@ function inlineOnePass(
 }
 
 /** Walk a body's stmts (this level only — NOT into If/While/For
- *  bodies; nested fusion is handled separately) and count Var
+ *  bodies; nested inlining is handled separately) and count Var
  *  occurrences per cName. Function output cNames get a +1 bump
  *  so they are never inlined out. */
 function computeUseCounts(
@@ -436,9 +539,23 @@ function isPureElementwiseExpr(e: IRExpr): boolean {
   }
 }
 
-/** Predicate (gate 5+6): the consumer is a multi-element real-double
- *  Assign whose RHS goes through the elementwise-loop emit path AND
- *  has compatible shape with the producer for flat-iter fusion. */
+/** Predicate (gate 5): the consumer is a multi-element real-double
+ *  Assign whose RHS goes through the elementwise-loop emit path. The
+ *  producer must also be real-double — mixing complex/char/double
+ *  through substitution would land mismatched element types in the
+ *  per-slot rendering, which the codegen's iter loop doesn't expect.
+ *
+ *  Earlier MVP versions of this predicate ALSO required producer and
+ *  consumer to share static result shape (and every operand to share
+ *  that shape), to keep the inlined result on the flat-iter path. That
+ *  restriction was the only thing blocking broadcast producers (e.g.
+ *  the column+row patterns in lap2d_green's compute_kernel) from
+ *  being inlined into flat-iter consumers — but
+ *  `emitTensorAssignFromExpr` already has a broadcast path that
+ *  handles mixed-shape operands. Dropping the shape gate lets the
+ *  codegen route the inlined expression to whichever emitter
+ *  (flat-iter or broadcast) actually fits its operands at runtime,
+ *  with no new emitter machinery required. */
 function isInlinableConsumer(
   s: IRStmt,
   producer: Extract<IRStmt, { kind: "Assign" }>
@@ -449,8 +566,18 @@ function isInlinableConsumer(
   if (s.ty.isComplex) return false;
   if (!isMultiElement(s.ty)) return false;
 
+  // Element-type matching: both producer and consumer must be real
+  // double. (Complex / char-tensor are deferred — mixing would
+  // require different per-slot rendering paths.)
+  if (!isNumeric(producer.ty)) return false;
+  if (producer.ty.elem !== "double") return false;
+  if (producer.ty.isComplex) return false;
+
   // RHS must go through emitTensorAssignFromExpr (not TensorLit,
-  // Var, IndexSlice, direct-owned-Call).
+  // Var, IndexSlice, direct-owned-Call). Those owned-producing
+  // forms are valid only at the top of an Assign.rhs by ANF
+  // invariant; substituting into a nested position would break
+  // codegen.
   const rhs = s.rhs;
   if (rhs.kind === "TensorLit") return false;
   if (rhs.kind === "Var") return false;
@@ -464,45 +591,11 @@ function isInlinableConsumer(
       return false;
     }
   }
-
-  // MVP same-shape gate: producer's output static shape must equal
-  // the consumer's output shape AND every multi-element operand on
-  // the consumer's RHS (excluding the producer's cName, which we'll
-  // replace) must share that shape. After substitution the fused
-  // RHS will have the producer's operands plus the consumer's
-  // other operands — they all need to be same-shape for flat-iter.
-  const prodTy = producer.ty as NumericType;
-  const consTy = s.ty as NumericType;
-  if (!sameStaticShape(prodTy, consTy)) return false;
-  // Producer's RHS operands all need to share that shape too.
-  let ok = true;
-  forEachSubExpr(producer.rhs, sub => {
-    if (sub.kind === "Var" && isMultiElement(sub.ty)) {
-      if (!isNumeric(sub.ty) || !sameStaticShape(prodTy, sub.ty)) ok = false;
-    }
-  });
-  if (!ok) return false;
-  // Consumer's other multi-elem operands need to share too.
-  forEachSubExpr(rhs, sub => {
-    if (sub.kind === "Var" && isMultiElement(sub.ty)) {
-      if (sub.cName === producer.cName) return;
-      if (!isNumeric(sub.ty) || !sameStaticShape(prodTy, sub.ty)) ok = false;
-    }
-  });
-  return ok;
-}
-
-/** Static-shape equality under the dim lattice. */
-function sameStaticShape(a: NumericType, b: NumericType): boolean {
-  if (a.dims.length !== b.dims.length) return false;
-  for (let i = 0; i < a.dims.length; i++) {
-    if (a.dims[i].kind !== b.dims[i].kind) return false;
-  }
   return true;
 }
 
 /** Free Var cNames in `e`. Used to detect intervening writes that
- *  would invalidate fusion. */
+ *  would invalidate inlining. */
 function collectFreeVarCNames(e: IRExpr): Set<string> {
   const out = new Set<string>();
   forEachSubExpr(e, sub => {

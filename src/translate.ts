@@ -56,12 +56,13 @@ export interface TranslateOptions {
    *  derived from the basename. The web IDE leaves this undefined —
    *  flat file names are treated as already-relative. */
   searchPaths?: ReadonlyArray<string>;
-  /** Enable the tensor-expression fusion pass. Collapses chains of
-   *  single-use elementwise Assigns into one fused loop, eliminating
-   *  large intermediate tensors. Currently MVP (V2): same-shape
-   *  flat-iter chains only. Default false during rollout. See
-   *  `src/codegen/fuse/inlinePass.ts`. */
-  enableTensorFusion?: boolean;
+  /** Enable the tensor-expression inlining pass. Substitutes every
+   *  single-use multi-element Assign's RHS into its unique consumer,
+   *  eliminating large intermediate tensors that would otherwise
+   *  thrash cache between the producer's and consumer's loops.
+   *  Default false during rollout. See
+   *  `src/codegen/inline/inlinePass.ts`. */
+  enableTempInlining?: boolean;
 }
 
 /**
@@ -74,7 +75,7 @@ export function translateProject(
   opts: TranslateOptions = {}
 ): TranslateResult {
   const includeRuntime = opts.includeRuntime ?? true;
-  const enableTensorFusion = opts.enableTensorFusion ?? false;
+  const enableTempInlining = opts.enableTempInlining ?? false;
   const active = files.find(f => f.name === activeName);
   if (!active) {
     return {
@@ -112,7 +113,7 @@ export function translateProject(
 
   try {
     const ir = lower(activeAst, workspace);
-    return { c: emitC(ir, { includeRuntime, enableTensorFusion }) };
+    return { c: emitC(ir, { includeRuntime, enableTempInlining }) };
   } catch (e) {
     if (e instanceof UnsupportedConstruct || e instanceof TypeError) {
       return {

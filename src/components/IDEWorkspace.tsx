@@ -2,10 +2,8 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Box,
   Button,
-  FormControlLabel,
   IconButton,
   Stack,
-  Switch,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -70,7 +68,7 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
   const loadedRef = useRef(new Set<string>());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [includeRuntime, setIncludeRuntime] = useState(false);
-  const [enableTensorFusion, setEnableTensorFusion] = useState(false);
+  const [enableTempInlining, setEnableTempInlining] = useState(false);
   const [fastMath, setFastMath] = useState(false);
   const exec = useRemoteExecution();
 
@@ -133,7 +131,7 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
     active ?? "",
     editorModel,
     includeRuntime,
-    enableTensorFusion
+    enableTempInlining
   );
 
   const handleEditorMount: OnMount = editorInstance => {
@@ -165,7 +163,7 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
       return;
     }
     if (!active) return;
-    exec.run(sourceFiles, active, { enableTensorFusion, fastMath });
+    exec.run(sourceFiles, active, { enableTempInlining, fastMath });
   };
 
   return (
@@ -197,8 +195,6 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
         onRun={handleRun}
         onStop={exec.stop}
         onOpenSettings={() => setSettingsOpen(true)}
-        fastMath={fastMath}
-        onFastMathChange={setFastMath}
       />
       <Box sx={{ flex: 1, minHeight: 0 }}>
         <Splitter direction="vertical" initialSize={220} minSize={140}>
@@ -249,8 +245,11 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
               activeName={active ?? ""}
               includeRuntime={includeRuntime}
               onIncludeRuntimeChange={setIncludeRuntime}
-              enableTensorFusion={enableTensorFusion}
-              onEnableTensorFusionChange={setEnableTensorFusion}
+              enableTempInlining={enableTempInlining}
+              onEnableTempInliningChange={setEnableTempInlining}
+              fastMath={fastMath}
+              onFastMathChange={setFastMath}
+              isRunning={isRunning}
             />
           </Splitter>
         </Splitter>
@@ -272,8 +271,6 @@ interface ToolbarProps {
   onRun: () => void;
   onStop: () => void;
   onOpenSettings: () => void;
-  fastMath: boolean;
-  onFastMathChange: (value: boolean) => void;
 }
 
 function Toolbar({
@@ -284,8 +281,6 @@ function Toolbar({
   onRun,
   onStop,
   onOpenSettings,
-  fastMath,
-  onFastMathChange,
 }: ToolbarProps) {
   const { color, label } = connectionDisplay(connection);
   const runButton = (
@@ -322,24 +317,6 @@ function Toolbar({
       ) : (
         runButton
       )}
-      <Tooltip title="Build the binary with -ffast-math. Lets the C compiler reassociate floating-point ops so hot loops vectorize more aggressively. NOT IEEE-754 strict; results may drift in the last few ulps. Affects only the compiled binary's behavior — the generated C source is identical.">
-        <FormControlLabel
-          sx={{ m: 0 }}
-          control={
-            <Switch
-              size="small"
-              checked={fastMath}
-              onChange={e => onFastMathChange(e.target.checked)}
-              disabled={isRunning}
-            />
-          }
-          label={
-            <Typography variant="caption" color="text.secondary">
-              fast math
-            </Typography>
-          }
-        />
-      </Tooltip>
       <Stack direction="row" alignItems="center" spacing={0.5}>
         <Tooltip title="Execution settings">
           <IconButton size="small" onClick={onOpenSettings} sx={{ color }}>

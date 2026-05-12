@@ -35,7 +35,7 @@ import { analyzeStmts } from "./emitAnalysis.js";
 import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
-import { inlinePass } from "./fuse/inlinePass.js";
+import { inlinePass } from "./inline/inlinePass.js";
 
 /** Options for `emitC`. */
 export interface EmitOptions {
@@ -50,25 +50,27 @@ export interface EmitOptions {
    *  Default: true (full self-contained translation unit). */
   includeRuntime?: boolean;
   /** When true, run the tensor-expression inlining pass before
-   *  codegen. Collapses chains of single-use elementwise Assigns
-   *  into one fat Assign whose RHS gets emitted as one fused loop,
-   *  eliminating large intermediates that thrash the cache. MVP
-   *  scope: same-shape flat-iter chains only (V2). Off by default
-   *  during rollout; flip on per-call once the cross-runner has
-   *  stabilized. See `src/codegen/fuse/inlinePass.ts`. */
-  enableTensorFusion?: boolean;
+   *  codegen. Substitutes every single-use multi-element Assign's
+   *  RHS into its unique consumer, eliminating large intermediates
+   *  that would otherwise thrash cache between the producer's and
+   *  consumer's loops. Off by default during rollout; flip on per-
+   *  call once you're happy with the byte-for-byte numerics. See
+   *  `src/codegen/inline/inlinePass.ts`. */
+  enableTempInlining?: boolean;
 }
 
 export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   const includeRuntime = opts.includeRuntime ?? true;
-  const enableTensorFusion = opts.enableTensorFusion ?? false;
+  const enableTempInlining = opts.enableTempInlining ?? false;
 
-  // Pass 1: tensor-expression inlining. Pure IR-to-IR rewrite.
-  // Runs before any codegen analysis so liveness, runtime-helper
-  // activation, and emission all see the post-fusion shape. With
-  // the flag off this is a no-op call (compiler should inline it
-  // away after the early return).
-  if (enableTensorFusion) inlinePass(prog);
+  // Tensor-expression inlining: pure IR-to-IR rewrite. Runs before
+  // any codegen analysis so liveness, runtime-helper activation,
+  // and emission all see the post-inlining shape. The returned
+  // `inlinedFrom` map keys each surviving consumer to the ordered
+  // list of pre-inlining comment strings so emitStmt can emit
+  // `/* inlined: <src> */` lines above the consumer's source-line
+  // comment.
+  const inlinedFrom = enableTempInlining ? inlinePass(prog) : new Map();
 
   const state: EmitState = {
     needMath: { value: false },
@@ -86,6 +88,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     freedOwned: new Set(),
     currentFunctionOutputs: null,
     multiAssignCallCounter: 0,
+    inlinedFrom,
   };
 
   // One-pass pre-walk: activates runtime helpers referenced by the

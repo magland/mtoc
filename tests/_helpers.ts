@@ -27,7 +27,7 @@ export function translate(
   source: string,
   opts: {
     includeRuntime?: boolean;
-    enableTensorFusion?: boolean;
+    enableTempInlining?: boolean;
   } = {}
 ): string {
   const ast = parseMFile(source, "test.m");

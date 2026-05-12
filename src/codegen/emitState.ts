@@ -17,6 +17,7 @@ import type { VarBinding } from "../lowering/ir.js";
 import type { MType } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import type { FutureTouchMap } from "./liveness.js";
+import type { InlinedFromMap } from "./inline/inlinePass.js";
 import { RUNTIME_HELPERS, type RuntimeSnippet } from "./runtime.js";
 
 /** A frame on the per-element-loop stack. `flat` is the same-shape
@@ -120,6 +121,15 @@ export interface EmitState {
    *  adjacent calls don't collide even though the temps are scoped
    *  inside per-call `{}` blocks. */
   multiAssignCallCounter: number;
+  /** Map from each surviving consumer Assign's cName to the ordered
+   *  list of pre-inlining comment strings for every producer that
+   *  was inlined into it. Populated by `inlinePass` when inlining is
+   *  enabled; empty (default) when inlining is off. `emitStmt` reads
+   *  this when emitting the per-stmt source-line comment and
+   *  prefixes one `/* inlined: <comment> *\/` line per entry so the
+   *  C reader can see every collapsed numbl statement, in source
+   *  order. */
+  inlinedFrom: InlinedFromMap;
 }
 
 /** Build the small facade view passed to `BuiltinSig.emit` closures.

@@ -19,8 +19,17 @@ interface CSourcePanelProps {
   activeName: string;
   includeRuntime: boolean;
   onIncludeRuntimeChange: (value: boolean) => void;
-  enableTensorFusion: boolean;
-  onEnableTensorFusionChange: (value: boolean) => void;
+  enableTempInlining: boolean;
+  onEnableTempInliningChange: (value: boolean) => void;
+  /** `-ffast-math` toggle. Does NOT change the displayed C — only
+   *  affects the compile-and-run output. Lives here alongside the
+   *  other build toggles for a single place to find them. */
+  fastMath: boolean;
+  onFastMathChange: (value: boolean) => void;
+  /** True while a remote run is in flight — toggling fast-math
+   *  mid-run wouldn't take effect until the next run. We disable
+   *  the switch to make that obvious. */
+  isRunning: boolean;
 }
 
 const UNRESOLVED_PATTERN = /unresolved function or builtin '(\w+)'/;
@@ -65,8 +74,11 @@ export function CSourcePanel({
   activeName,
   includeRuntime,
   onIncludeRuntimeChange,
-  enableTensorFusion,
-  onEnableTensorFusionChange,
+  enableTempInlining,
+  onEnableTempInliningChange,
+  fastMath,
+  onFastMathChange,
+  isRunning,
 }: CSourcePanelProps) {
   return (
     <Box
@@ -95,19 +107,37 @@ export function CSourcePanel({
           GENERATED C
         </Typography>
         <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
-          <Tooltip title="Collapse chains of single-use elementwise tensor expressions into one fused C loop. Eliminates large intermediate tensors that thrash cache. Numerically identical to the unfused build. Affects both the displayed C and the compile-and-run output. MVP scope: same-shape chains only (broadcast / slice / transpose deferred).">
+          <Tooltip title="Substitute every single-use multi-element tensor variable's defining expression into its unique reader. Eliminates large intermediate tensors that thrash cache between separate loops. Numerically identical to the un-inlined build. Affects both the displayed C and the compile-and-run output.">
             <FormControlLabel
               sx={{ m: 0 }}
               control={
                 <Switch
                   size="small"
-                  checked={enableTensorFusion}
-                  onChange={e => onEnableTensorFusionChange(e.target.checked)}
+                  checked={enableTempInlining}
+                  onChange={e => onEnableTempInliningChange(e.target.checked)}
                 />
               }
               label={
                 <Typography variant="caption" color="text.secondary">
-                  fuse tensors
+                  inline temps
+                </Typography>
+              }
+            />
+          </Tooltip>
+          <Tooltip title="Build the binary with -ffast-math. Lets the C compiler reassociate floating-point ops so hot loops vectorize more aggressively. NOT IEEE-754 strict; numerics may drift in the last few ulps. Affects only the compile-and-run output; the displayed C source is identical.">
+            <FormControlLabel
+              sx={{ m: 0 }}
+              control={
+                <Switch
+                  size="small"
+                  checked={fastMath}
+                  onChange={e => onFastMathChange(e.target.checked)}
+                  disabled={isRunning}
+                />
+              }
+              label={
+                <Typography variant="caption" color="text.secondary">
+                  fast math
                 </Typography>
               }
             />

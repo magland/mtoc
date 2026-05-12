@@ -60,6 +60,24 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   // without bouncing back to the `.m` source. `renderStmt` returns
   // null for kinds where the C line is already identical to the numbl
   // form (`break`, `continue`).
+  //
+  // When tensor-expression inlining fired, every consumer carries an
+  // ordered list of pre-inlining source-line comments from the
+  // producers that got inlined into it. Emit those FIRST (oldest
+  // producer first), then the consumer's own (post-inlining) source
+  // line. This way the reader sees the original numbl shape and the
+  // collapsed form side by side. See
+  // `src/codegen/inline/inlinePass.ts`.
+  const inlined = state.inlinedFrom.get(s);
+  if (inlined !== undefined) {
+    for (const comment of inlined) {
+      pushStmt(
+        state,
+        level,
+        `/* inlined: ${sanitizeForBlockComment(comment)} */`
+      );
+    }
+  }
   const srcLine = renderStmt(s);
   if (srcLine !== null) {
     pushStmt(state, level, `/* ${sanitizeForBlockComment(srcLine)} */`);
