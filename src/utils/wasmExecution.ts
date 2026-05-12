@@ -25,6 +25,7 @@ import {
   type SourceFile,
   type TranslateError,
 } from "../translate";
+import { computeCacheKey, getCachedWasm, putCachedWasm } from "../db/wasmCache";
 import type { RunEvent, RunResult } from "./remoteExecution";
 
 export type WasmOptLevel = "O0" | "O2" | "O3";
@@ -92,7 +93,17 @@ export async function buildWasm(
   }
   const cSource = translateResult.c!;
 
-  // Step 2: POST to the compile service.
+  // Step 2: cache lookup. Computed on the *translated* C so changes to
+  // numbl source that compile to identical C are cache hits, and so
+  // user-source-side bugs in the cache key are impossible.
+  const cacheKey = await computeCacheKey(cSource, opts).catch(() => null);
+  if (cacheKey) {
+    const cached = await getCachedWasm(cacheKey);
+    if (cached) return { ok: true, artifact: cached };
+  }
+  if (abortSignal?.aborted) return { ok: false, kind: "aborted" };
+
+  // Step 3: POST to the compile service.
   let response: Response;
   try {
     response = await fetch(`${wasmServiceUrl}/compile`, {
@@ -165,23 +176,26 @@ export async function buildWasm(
     };
   }
   const meta = (r.meta ?? {}) as Record<string, unknown>;
-  return {
-    ok: true,
-    artifact: {
-      wasm: base64ToUint8Array(r.wasm),
-      glue: r.glue,
-      meta: {
-        simd: meta.simd === true,
-        fastMath: meta.fastMath === true,
-        optLevel:
-          meta.optLevel === "O0" ||
-          meta.optLevel === "O2" ||
-          meta.optLevel === "O3"
-            ? meta.optLevel
-            : "O2",
-      },
+  const artifact: WasmBuildArtifact = {
+    wasm: base64ToUint8Array(r.wasm),
+    glue: r.glue,
+    meta: {
+      simd: meta.simd === true,
+      fastMath: meta.fastMath === true,
+      optLevel:
+        meta.optLevel === "O0" ||
+        meta.optLevel === "O2" ||
+        meta.optLevel === "O3"
+          ? meta.optLevel
+          : "O2",
     },
   };
+  // Best-effort cache store. Fire-and-forget so a slow IDB write
+  // doesn't delay handing the artifact off to the runner.
+  if (cacheKey) {
+    void putCachedWasm(cacheKey, artifact);
+  }
+  return { ok: true, artifact };
 }
 
 /** Minimal type for the Emscripten module factory we expect from the

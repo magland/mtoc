@@ -8,6 +8,7 @@ import {
   type RunEvent,
 } from "../utils/remoteExecution";
 import { buildWasm, runWasm, type WasmOptLevel } from "../utils/wasmExecution";
+import { evictExpiredWasm } from "../db/wasmCache";
 import type { SourceFile } from "../translate";
 
 export type ConnectionStatus =
@@ -249,8 +250,13 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
   // Probe the local server once on mount so the icon shows a meaningful
   // state before the user does anything. Wasm mode doesn't need this
   // (it talks to a separate public service that's effectively always up).
+  // Same mount also kicks off one wasm-cache sweep so expired entries
+  // from previous sessions don't sit forever — get/put are fast either
+  // way, but a multi-MB stale cache is wasteful and slightly slower to
+  // open the DB.
   useEffect(() => {
     checkConnection();
+    void evictExpiredWasm();
   }, [checkConnection]);
 
   return { status, connection, lines, checkConnection, run, stop };
