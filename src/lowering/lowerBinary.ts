@@ -54,6 +54,8 @@ const SUPPORTED_BIN_OPS: ReadonlySet<BinOp> = new Set([
   "GreaterEqual",
   "AndAnd",
   "OrOr",
+  "BitAnd",
+  "BitOr",
 ] as BinOp[]);
 
 const COMPARISON_BIN_OPS: ReadonlySet<BinOp> = new Set([
@@ -65,6 +67,8 @@ const COMPARISON_BIN_OPS: ReadonlySet<BinOp> = new Set([
   "GreaterEqual",
   "AndAnd",
   "OrOr",
+  "BitAnd",
+  "BitOr",
 ] as BinOp[]);
 
 /** Map a parser BinaryOperation onto the abstract arith kind used by
@@ -235,8 +239,8 @@ function lowerComparison(
   // (handled by arithResult below).
   //
   // `&&` and `||` stay scalar-only — MATLAB defines them as short-
-  // circuit on scalar conditions; elementwise logical conjunction uses
-  // `&` / `|`, which the parser doesn't surface yet.
+  // circuit on scalar conditions. Elementwise logical conjunction /
+  // disjunction uses `&` / `|`, which lift over tensor operands.
   const isDoubleNumeric = (t: MType): boolean =>
     isNumeric(t) && t.elem === "double";
   if (
@@ -247,7 +251,7 @@ function lowerComparison(
     if (e.op === "AndAnd" || e.op === "OrOr") {
       throw new UnsupportedConstruct(
         `${e.op === "AndAnd" ? "&&" : "||"} on tensor operands is not ` +
-          `supported (only scalars; use a scalar reduction first)`,
+          `supported (use the elementwise '${e.op === "AndAnd" ? "&" : "|"}' instead)`,
         e.span
       );
     }

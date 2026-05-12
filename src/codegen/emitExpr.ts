@@ -487,15 +487,17 @@ function emitComplexCmpOrLogical(
   let right = emitExpr(state, e.right, 0);
 
   // For ops that use each complex operand twice (Equal / NotEqual expand
-  // into re+im comparisons; AndAnd / OrOr expand truthy into re+im checks),
-  // hoist any non-Var complex operand to a temp so a Call-bearing expression
-  // (e.g. csqrt(z)) is not evaluated twice in the generated C.
-  // Var operands are pure reads — double-use is harmless.
+  // into re+im comparisons; AndAnd / OrOr / BitAnd / BitOr expand truthy
+  // into re+im checks), hoist any non-Var complex operand to a temp so
+  // a Call-bearing expression (e.g. csqrt(z)) is not evaluated twice in
+  // the generated C. Var operands are pure reads — double-use is harmless.
   const doubledOp =
     e.op === "Equal" ||
     e.op === "NotEqual" ||
     e.op === "AndAnd" ||
-    e.op === "OrOr";
+    e.op === "OrOr" ||
+    e.op === "BitAnd" ||
+    e.op === "BitOr";
   if (doubledOp) {
     if (lc && e.left.kind !== "Var") {
       const tmp = `_mtoc_cx_tmp_${state.complexTmpCounter++}`;
@@ -538,11 +540,17 @@ function emitComplexCmpOrLogical(
         `${imOf(left, lc)} != ${imOf(right, rc)}`;
       break;
     }
-    case "AndAnd": {
+    case "AndAnd":
+    case "BitAnd": {
+      // Elementwise `&` (BitAnd) and short-circuit `&&` (AndAnd) collapse
+      // to the same truthy-AND form on already-evaluated IR operands;
+      // numbl's non-short-circuit semantics for `&` are preserved because
+      // there are no IR-level side effects to observe a re-evaluation of.
       inner = `${truthy(left, lc)} && ${truthy(right, rc)}`;
       break;
     }
-    case "OrOr": {
+    case "OrOr":
+    case "BitOr": {
       inner = `${truthy(left, lc)} || ${truthy(right, rc)}`;
       break;
     }

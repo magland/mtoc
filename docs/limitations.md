@@ -89,10 +89,18 @@ workaround or a roadmap note.
   transpose `'` and the `transpose` / `ctranspose` builtin spellings
   are not yet wired; transpose of a char array or an `ndim > 2` tensor
   is rejected at lowering.
-- **Tensor comparisons lift.** `a == b`, `a < b`, `a > 0`, `a ~= b`, etc.
-  produce 0.0/1.0 tensors at the element-wise broadcast shape. `&&` /
-  `||` stay scalar-only — there is no `&` / `|` parser shape yet for the
-  element-wise logical conjunction / disjunction.
+- **Tensor comparisons and elementwise logicals lift.** `a == b`,
+  `a < b`, `a > 0`, `a ~= b`, `a & b`, `a | b`, etc. produce 0.0/1.0
+  tensors at the element-wise broadcast shape. `&&` / `||` stay
+  scalar-only (short-circuit semantics); elementwise logical
+  conjunction / disjunction over tensors uses `&` / `|`. Note that
+  numbl's `&` / `|` runtime helper (`elementWiseLogicalOp`) does NOT
+  implement MATLAB-style implicit expansion for differently-shaped
+  same-numel operands — it linearly pairs by flat index and returns
+  the first operand's shape. mtoc instead routes through the same
+  broadcast emitter the comparisons use, which produces MATLAB-correct
+  results. Practically this only matters for row + col operands; the
+  scalar + tensor and same-shape cases agree byte-for-byte with numbl.
 - **Indexing covers scalar reads, range/colon reads, scalar writes,
   and range/colon writes** — all on real-or-complex double tensors,
   including N-D. Scalar reads also work on char tensors. Two acceptable

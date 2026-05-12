@@ -286,3 +286,32 @@ describe("range expressions", () => {
     expect(err?.message).toMatch(/range start must be a real scalar/);
   });
 });
+
+describe("elementwise logical `&` / `|`", () => {
+  // Non-short-circuit logical AND / OR. Scalars produce a 0/1
+  // double; tensor operands lift through the same broadcast emitter
+  // the comparison ops use. `&&` / `||` stay scalar-only.
+
+  it("emits `&&` / `||` C operators for scalar `&` / `|`", () => {
+    const c = translate("a = 1;\nb = 0;\ndisp(a & b);\ndisp(a | b);\n");
+    expect(c).toMatch(/mtoc_disp_double\(a && b\)/);
+    expect(c).toMatch(/mtoc_disp_double\(a \|\| b\)/);
+  });
+
+  it("lifts `&` / `|` over same-shape tensor operands element-wise", () => {
+    const c = translate("a = [1 0 1];\nb = [1 1 0];\ny = a & b;\n");
+    // The elementwise iter loop emits `&&` per slot.
+    expect(c).toMatch(/a\.real\[[^\]]+\] && b\.real\[[^\]]+\]/);
+  });
+
+  it("rejects `&&` on tensor operands with a pointer to the elementwise form", () => {
+    let err: Error | null = null;
+    try {
+      translate("a = [1 0];\nb = [1 1];\ndisp(a && b);\n");
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.message).toMatch(/use the elementwise '&'/);
+  });
+});

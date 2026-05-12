@@ -121,6 +121,15 @@ export const BIN_OP_C: Partial<Record<BinaryOperation, string>> = {
   GreaterEqual: ">=",
   AndAnd: "&&",
   OrOr: "||",
+  // numbl's elementwise `&` / `|` are non-short-circuit, but since
+  // mtoc's IR Binary operands are pure values (no IR-level side
+  // effects), `a && b` / `a || b` in C produces the same 0/1 result
+  // and auto-promotes to `double` when assigned. The matching
+  // entries in `precedence` / `CMP_OR_LOGICAL` route them through
+  // the same scalar / complex / per-slot paths as the boolean
+  // operators above.
+  BitAnd: "&&",
+  BitOr: "||",
 };
 
 export const UN_OP_C: Partial<Record<UnaryOperation, string>> = {
@@ -133,8 +142,10 @@ export const UN_OP_C: Partial<Record<UnaryOperation, string>> = {
 export function precedence(op: BinaryOperation | UnaryOperation): number {
   switch (op) {
     case "OrOr":
+    case "BitOr":
       return 1;
     case "AndAnd":
+    case "BitAnd":
       return 2;
     case "Equal":
     case "NotEqual":
@@ -176,4 +187,6 @@ export const CMP_OR_LOGICAL: ReadonlySet<BinaryOperation> =
     BinaryOperation.NotEqual,
     BinaryOperation.AndAnd,
     BinaryOperation.OrOr,
+    BinaryOperation.BitAnd,
+    BinaryOperation.BitOr,
   ]);

@@ -100,7 +100,8 @@ becomes IR. `BuiltinSig` closures (in call targets) are stubbed as
 
 The subset is growing iteratively. Roughly:
 
-- Scalars: arithmetic, comparisons, logicals, unary `+ - !`,
+- Scalars: arithmetic, comparisons, logicals (`&& ||` short-circuit;
+  elementwise `& |` also lift over tensor operands), unary `+ - !`,
   non-conjugate transpose `.'` (identity on scalars)
 - Constants: `pi`, `eps`, `Inf`, `NaN`, `realmax`, `realmin`, `true`, `false`
 - Control flow: `if` / `elseif` / `else`, `while`, `for k = a:b` (and `a:s:b`),
