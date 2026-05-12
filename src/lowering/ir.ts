@@ -182,6 +182,44 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Struct literal — either the `struct('f1', v1, ...)` constructor
+       *  form or a synthetic placeholder produced when a struct value
+       *  is first introduced via `s.f = v` dot-assign (the `_struct_init`
+       *  helper assigns a zero-valued struct here). Fields are stored
+       *  in INSERTION order — i.e. the source order — matching numbl's
+       *  Map-of-fields insertion semantics so `disp` renders fields in
+       *  the user-written order. The result type is a `StructType`
+       *  whose own `fields` are sorted by name (canonical form) and
+       *  whose `insertionOrder` matches this literal's `fields` order.
+       *
+       *  Like other owned producers (`TensorLit` / `IndexSlice` /
+       *  `MakeRange`), after ANF a `StructLit` only appears as the
+       *  full RHS of an owned-LHS `Assign`. */
+      kind: "StructLit";
+      fields: ReadonlyArray<{ name: string; value: IRExpr; span: Span }>;
+      ty: MType;
+      span: Span;
+    }
+  | {
+      /** Member load `s.f1.f2....` — a chain of dot accesses on a
+       *  struct value. The base is always an `IRExpr.Var` reading a
+       *  struct-typed variable; the path is a non-empty list of field
+       *  names. The result type is whatever the innermost field's
+       *  static type is.
+       *
+       *  Codegen renders this as `<base.cName>.f1.f2....`. For an owned
+       *  field type (nested struct, tensor, string), this expression
+       *  appears at owned-consume sites that don't transfer ownership
+       *  (e.g. `disp(s.f)`, `s.f` on the RHS of an `Assign` that
+       *  copies); the ANF pass hoists struct-typed loads at consume
+       *  sites and the owned-arg-copy machinery deep-copies through. */
+      kind: "MemberLoad";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      path: ReadonlyArray<string>;
+      ty: MType;
+      span: Span;
+    }
+  | {
       /** Reference to the `end` keyword inside an index expression.
        *  Resolved at lowering time to the relevant axis size of the
        *  enclosing index's base. The result is a nonneg long-valued
@@ -257,6 +295,27 @@ export type IRStmt =
       cName: string;
       rhs: IRExpr;
       ty: MType;
+      span: Span;
+    }
+  | {
+      /** Member store `s.f1.f2.... = rhs` — in-place write at a field
+       *  of a struct value. `path` is non-empty and walks one or more
+       *  field accesses on the base struct variable. The base's
+       *  storage is mutated in place; the surrounding `_assign` /
+       *  liveness bookkeeping is unaffected (the base remains the same
+       *  owned binding).
+       *
+       *  For owned field types (tensor, string, nested struct), the
+       *  field's previous buffer is freed before the new value is
+       *  installed — via the kind's `_assign` helper (struct, tensor,
+       *  string, char-array) or a direct C assignment for POD fields.
+       *  When the assignment introduces a new field on a previously
+       *  smaller struct, the pre-pass has already widened the static
+       *  type so the field's C-side slot is present in the typedef. */
+      kind: "MemberStore";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      path: ReadonlyArray<string>;
+      rhs: IRExpr;
       span: Span;
     }
   | {

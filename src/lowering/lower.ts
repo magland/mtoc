@@ -66,6 +66,8 @@ import { lowerIndexStore } from "./lowerIndexStore.js";
 import { lowerIndexSliceStore } from "./lowerIndexSliceStore.js";
 import { lowerTensorLiteral } from "./lowerTensorLiteral.js";
 import { isSliceArg } from "./indexResolve.js";
+import { lowerMemberRead, lowerMemberStore } from "./lowerStruct.js";
+import { collectStructShapes } from "./structPrePass.js";
 import {
   forEachStmtInTree,
   forEachSubExpr,
@@ -501,6 +503,12 @@ export class Lowerer {
 
   private lowerStmt(s: Stmt): IRStmt | null {
     switch (s.type) {
+      case "Directive":
+        // `%!numbl:assert_jit` and similar magic-comment directives are
+        // numbl-JIT-internal markers; mtoc has no JIT (it's a static
+        // translator), so we silently drop them. Returning `null`
+        // signals "no IR contribution".
+        return null;
       case "Function":
         // Function declarations are pulled out of the script body before
         // statement-level lowering runs (see `lower()` below). Reaching
@@ -525,9 +533,16 @@ export class Lowerer {
 
       case "AssignLValue": {
         // The parser produces this for any non-bare-identifier LHS:
-        // `v(i) = x`, `obj.field = x`, `M(i,j) = x`, etc. We only
-        // handle the indexed-write form today; other lvalue kinds
-        // raise UnsupportedConstruct with a span.
+        // `v(i) = x`, `obj.field = x`, `M(i,j) = x`, etc.
+        if (s.lvalue.type === "Member") {
+          return lowerMemberStore.call(this, s.lvalue, s.expr, s.span);
+        }
+        if (s.lvalue.type === "MemberDynamic") {
+          throw new UnsupportedConstruct(
+            "dynamic field access `s.(expr)` is not yet supported by mtoc",
+            s.span
+          );
+        }
         if (s.lvalue.type !== "Index") {
           throw new UnsupportedConstruct(
             `assignment to a ${s.lvalue.type} lvalue is not yet supported`,
@@ -859,6 +874,15 @@ export class Lowerer {
       case "Range":
         return this.lowerBareRange(e);
 
+      case "Member":
+        return lowerMemberRead.call(this, e);
+
+      case "MemberDynamic":
+        throw new UnsupportedConstruct(
+          "dynamic field access `s.(expr)` is not yet supported by mtoc",
+          e.span
+        );
+
       default:
         throw new UnsupportedConstruct(
           `unsupported expression: ${e.type}`,
@@ -1028,6 +1052,14 @@ export function lower(
     order: [],
     inFlight: new Set(),
   };
+  // Run the struct field-set pre-pass over the script body — surfaces
+  // unsupported patterns (dynamic field access, struct-array `s(i).f`,
+  // mismatched fresh-struct introduction inside a branch) ahead of
+  // statement-level lowering so the user sees clean spans. The result
+  // is currently advisory only (the main lowering pass infers each
+  // field's type itself); the early-rejection side effects are what
+  // matter for v1.
+  collectStructShapes(bodyToLower);
   const top = new Lowerer(shared);
   const stmts = top.lowerStmts(bodyToLower);
   const prog: IRProgram = {

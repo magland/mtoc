@@ -36,6 +36,8 @@ import { Lowerer, assertNotMtocReserved, cNameFor } from "./lower.js";
 import { lowerIndexLoad } from "./lowerIndexLoad.js";
 import { lowerIndexSlice } from "./lowerIndexSlice.js";
 import { isSliceArg } from "./indexResolve.js";
+import { lowerStructConstructor } from "./lowerStruct.js";
+import { collectStructShapes } from "./structPrePass.js";
 
 /** Top-level dispatcher for `name(args)` syntax. Splits out the
  *  reserved `disp` (only valid as a stmt) and routes user functions
@@ -54,6 +56,12 @@ export function lowerFuncCall(
       return lowerIndexSlice.call(this, e.name, e.args, e.span);
     }
     return lowerIndexLoad.call(this, e.name, e.args, e.span);
+  }
+  // Struct constructor — has dedicated lowering. Not in the builtins
+  // table because its arg list is name/value pairs, not the typed
+  // signature DSL the rest of the registry expects.
+  if (e.name === "struct") {
+    return lowerStructConstructor.call(this, e.args, e.span);
   }
   const target = this.shared.workspace.resolve(
     e.name,
@@ -696,6 +704,11 @@ function specialize(
       true,
       fnFile
     );
+    // Run the struct pre-pass over the function body to surface
+    // unsupported struct patterns (dynamic field access, struct
+    // arrays, fresh-struct introduction inside a branch) with clean
+    // spans before statement-level lowering.
+    collectStructShapes(fnAst.body);
     const body = inner.lowerStmts(fnAst.body);
     // After body lowering: every declared output must have an assigned
     // type on every path, and must be a scalar (tensor returns aren't

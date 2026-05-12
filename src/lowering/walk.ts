@@ -83,6 +83,12 @@ export function forEachSubExpr(
       forEachSubExpr(e.step, visit);
       forEachSubExpr(e.end, visit);
       return;
+    case "StructLit":
+      for (const f of e.fields) forEachSubExpr(f.value, visit);
+      return;
+    case "MemberLoad":
+      forEachSubExpr(e.base, visit);
+      return;
   }
 }
 
@@ -181,6 +187,10 @@ export function forEachTopLevelExpr(s: IRStmt, fn: (e: IRExpr) => void): void {
       }
       fn(s.rhs);
       return;
+    case "MemberStore":
+      fn(s.base);
+      fn(s.rhs);
+      return;
     case "Break":
     case "Continue":
     case "ReturnFromFunction":
@@ -219,6 +229,7 @@ export function forEachStmtInTree(
       case "MultiAssignCall":
       case "IndexStore":
       case "IndexSliceStore":
+      case "MemberStore":
       case "Break":
       case "Continue":
       case "ReturnFromFunction":

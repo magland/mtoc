@@ -21,6 +21,8 @@ import {
   isMultiElement,
   isNumeric,
   isString,
+  isStruct,
+  structMangledName,
   type MType,
 } from "../lowering/types.js";
 
@@ -96,12 +98,25 @@ const DOUBLE_TENSOR_OPS: OwnedKindOps = {
  *  non-owned types — scalars, Void, Unknown — so callers can early-out
  *  without a redundant `isOwned` check. The dispatch order mirrors the
  *  predicate order used in the prior hand-rolled chains: string first,
- *  then char-array, then any multi-element double tensor. */
+ *  then char-array, then any multi-element double tensor, then any
+ *  struct kind (which routes to its per-mangled-name generated helpers). */
 export function ownedOps(ty: MType): OwnedKindOps | null {
   if (isString(ty)) return STRING_OPS;
   if (isCharArray(ty)) return CHAR_TENSOR_OPS;
   if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
     return DOUBLE_TENSOR_OPS;
+  }
+  if (isStruct(ty)) {
+    const mangled = structMangledName(ty);
+    return {
+      cType: mangled,
+      structSnippet: mangled,
+      empty: `${mangled}_empty`,
+      free: `${mangled}_free`,
+      assign: `${mangled}_assign`,
+      copy: () => `${mangled}_copy`,
+      disp: () => `${mangled}_disp`,
+    };
   }
   return null;
 }

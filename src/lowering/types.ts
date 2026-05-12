@@ -134,9 +134,38 @@ export const STRING: StringType = { kind: "String" };
  *  instead of a runtime abort. */
 export const MTOC_MAX_NDIM = 8;
 
+/**
+ * Scalar struct value with statically-known field set.
+ *
+ * `fields` is the canonical field list — SORTED by name. Two struct
+ * types are equal iff their sorted field lists match name-by-name and
+ * each field's type unifies. Sorting in storage gives canonical hashing
+ * for free; `insertionOrder` preserves the source program's field order
+ * so `disp` can render fields in numbl-faithful order.
+ *
+ * The C representation is a generated typedef
+ * `_mtoc_struct__<8-hex>` (see `cTypeFor`), where `<8-hex>` is the
+ * FNV-1a 32-bit hash of `canonicalizeType` — same scheme as user
+ * function specializations. Owned fields (tensors / strings / nested
+ * structs) are stored by value within the struct; their lifecycle is
+ * managed by generated `_assign` / `_free` / `_copy` helpers emitted
+ * alongside the typedef.
+ *
+ * Struct arrays are NOT supported in v1; only scalar structs.
+ */
+export interface StructType {
+  kind: "Struct";
+  /** Sorted by `name`. Canonical form. */
+  fields: ReadonlyArray<{ name: string; type: MType }>;
+  /** Source-order field names (numbl `disp` uses this). May be empty
+   *  for an empty struct. Always a permutation of `fields.map(f=>f.name)`. */
+  insertionOrder: ReadonlyArray<string>;
+}
+
 export type MType =
   | NumericType
   | StringType
+  | StructType
   | { kind: "Unknown" }
   | { kind: "Void" };
 
@@ -260,6 +289,49 @@ export function isString(t: MType): t is StringType {
   return t.kind === "String";
 }
 
+/** True when `t` is a struct type (v1: scalar structs only). */
+export function isStruct(t: MType): t is StructType {
+  return t.kind === "Struct";
+}
+
+/** Construct a struct type from an insertion-ordered list of fields.
+ *  The result stores `fields` sorted by name (canonical form) and
+ *  `insertionOrder` as given. */
+export function structType(
+  fields: ReadonlyArray<{ name: string; type: MType }>
+): StructType {
+  const sorted = [...fields].sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+  );
+  return {
+    kind: "Struct",
+    fields: sorted,
+    insertionOrder: fields.map(f => f.name),
+  };
+}
+
+/** Stable mangled C identifier for a struct type. Two `StructType`s
+ *  with the same sorted field-set (name + canonical field type) hash
+ *  to the same identifier. The hash is FNV-1a 32-bit over
+ *  `JSON.stringify(canonicalizeType(t))`, formatted as 8-char hex,
+ *  same scheme used for user-function specializations. */
+export function structMangledName(t: StructType): string {
+  const json = JSON.stringify(canonicalizeType(t));
+  const hash = fnv1a32(json);
+  return `_mtoc_struct__${hash.toString(16).padStart(8, "0")}`;
+}
+
+/** FNV-1a 32-bit. Inlined here to avoid a circular import — the
+ *  lowering side specialization-name hasher uses the same constants. */
+function fnv1a32(s: string): number {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return h >>> 0;
+}
+
 /** Statically known to be exactly 1 — i.e. broadcastable in this axis. */
 export function dimIsOne(d: DimInfo): boolean {
   return d.kind === "one";
@@ -361,12 +433,16 @@ export function isText(t: MType): boolean {
 
 /** True when the value of type `t` is backed by a heap allocation that
  *  the generated code is responsible for releasing — currently
- *  multi-element tensors (double and char) and strings. Drives the
- *  "free at last use" liveness pass, the scope-exit free walks, and
- *  the "owned-allocating expression cannot appear nested" lowering
- *  check. New owned kinds (cell arrays, structs, …) plug in here. */
+ *  multi-element tensors (double and char), strings, and structs.
+ *  Structs are owned even when all their fields are POD — the per-kind
+ *  `_free` / `_copy` / `_assign` helpers are still generated and act
+ *  as no-ops on the POD case, keeping the surrounding pipeline (ANF
+ *  pass, liveness, scope-exit walks, copy-on-arg-pass) uniform across
+ *  every value kind. Drives the "free at last use" liveness pass, the
+ *  scope-exit free walks, and the "owned-allocating expression cannot
+ *  appear nested" lowering check. */
 export function isOwned(t: MType): boolean {
-  return isMultiElement(t) || isString(t);
+  return isMultiElement(t) || isString(t) || isStruct(t);
 }
 
 export function isScalarReal(t: MType): boolean {
@@ -390,10 +466,12 @@ export function staticNumElements(t: MType): number | null {
 /** The C type used to represent values of this MType in the generated
  *  source. Scalars become bare `double` (real) or `double _Complex`
  *  (complex); char scalars become bare `char`; multi-element tensors
- *  become `mtoc_tensor_t`; char arrays become `mtoc_char_tensor_t`.
+ *  become `mtoc_tensor_t`; char arrays become `mtoc_char_tensor_t`;
+ *  structs become a generated `_mtoc_struct__<hash>` typedef.
  *  Returns null for types codegen does not yet handle (Unknown, Void). */
 export function cTypeFor(t: MType): string | null {
   if (t.kind === "String") return "mtoc_string_t";
+  if (t.kind === "Struct") return structMangledName(t);
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
     if (isScalar(t)) return "char";
@@ -429,6 +507,7 @@ export function shapeCategory(t: NumericType): string {
  *  (`canShareStorage`, `absentDefaultFor`) picks it up automatically. */
 export function storageCategory(t: MType): string | null {
   if (t.kind === "String") return "string";
+  if (t.kind === "Struct") return `struct:${structMangledName(t)}`;
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
     if (isScalar(t)) return "scalar-char";
@@ -480,6 +559,10 @@ export function absentDefaultFor(present: ReadonlyArray<MType>): MType {
     case "scalar-char":
       return scalarChar();
     default:
+      // Struct category: every present type shares one mangled name,
+      // so the first one's type IS the absent default (a same-shaped
+      // empty/zero struct — codegen predeclares with `{0}`).
+      if (cat.startsWith("struct:")) return present[0];
       return scalarDouble("zero");
   }
 }
@@ -735,6 +818,28 @@ export function unify(a: MType, b: MType): MType {
       ? STRING
       : { kind: "Unknown" };
   }
+  // Struct — same shape required (field names + each field's unify
+  // result). Mixed kinds collapse to Unknown (recordAssignment then
+  // surfaces as a category-change conflict).
+  if (a.kind === "Struct" || b.kind === "Struct") {
+    if (a.kind !== "Struct" || b.kind !== "Struct") return { kind: "Unknown" };
+    if (a.fields.length !== b.fields.length) return { kind: "Unknown" };
+    const merged: { name: string; type: MType }[] = [];
+    for (let i = 0; i < a.fields.length; i++) {
+      const fa = a.fields[i];
+      const fb = b.fields[i];
+      if (fa.name !== fb.name) return { kind: "Unknown" };
+      const t = unify(fa.type, fb.type);
+      if (t.kind === "Unknown") return { kind: "Unknown" };
+      merged.push({ name: fa.name, type: t });
+    }
+    // Keep `a`'s insertion order — it's the first-encountered shape.
+    return {
+      kind: "Struct",
+      fields: merged,
+      insertionOrder: a.insertionOrder,
+    };
+  }
   // Build a fresh NumericType. Shape is array-valued so it's joined
   // separately; the template walks only the scalar fields.
   const out: Record<string, unknown> = {
@@ -880,6 +985,15 @@ export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Unknown") return { kind: "Unknown" };
   if (t.kind === "Void") return { kind: "Void" };
   if (t.kind === "String") return { kind: "String" };
+  if (t.kind === "Struct") {
+    return {
+      kind: "Struct",
+      fields: t.fields.map(f => ({
+        name: f.name,
+        type: canonicalizeType(f.type),
+      })),
+    };
+  }
   // Normalize before serializing so two complex types differing only
   // in a leftover `sign` field hash to the same specialization key.
   const normalized = normalizeComplexSign(t);
@@ -907,6 +1021,10 @@ export function typeToString(t: MType): string {
   if (t.kind === "Unknown") return "Unknown";
   if (t.kind === "Void") return "Void";
   if (t.kind === "String") return "String";
+  if (t.kind === "Struct") {
+    const parts = t.fields.map(f => `${f.name}:${typeToString(f.type)}`);
+    return `Struct<{${parts.join(", ")}}>`;
+  }
   const cat = shapeCategory(t);
   // dims is array-valued so rendered into the framing prefix; the
   // NUMERIC_FIELDS entries for rows/cols contribute empty fragments.
