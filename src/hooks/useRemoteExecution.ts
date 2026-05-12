@@ -42,7 +42,7 @@ interface UseRemoteExecutionResult {
   run: (
     files: SourceFile[],
     activeName: string,
-    opts?: { enableTensorFusion?: boolean }
+    opts?: { enableTensorFusion?: boolean; fastMath?: boolean }
   ) => Promise<void>;
   /** Abort the currently-running execution. */
   stop: () => void;
@@ -74,7 +74,7 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
     async (
       files: SourceFile[],
       activeName: string,
-      opts: { enableTensorFusion?: boolean } = {}
+      opts: { enableTensorFusion?: boolean; fastMath?: boolean } = {}
     ) => {
       if (status === "running") return;
       const url = getRemoteServiceUrl();
@@ -108,7 +108,10 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
         url,
         passkey,
         abort.signal,
-        { enableTensorFusion: opts.enableTensorFusion ?? false }
+        {
+          enableTensorFusion: opts.enableTensorFusion ?? false,
+          fastMath: opts.fastMath ?? false,
+        }
       );
       abortRef.current = null;
 

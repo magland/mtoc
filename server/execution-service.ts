@@ -26,6 +26,7 @@ import { join } from "path";
 import { tmpdir } from "os";
 import { promisify } from "util";
 import { translateProject, type SourceFile } from "../src/translate.js";
+import { buildCcArgs } from "../src/build.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -41,6 +42,9 @@ interface RunRequest {
   /** When true, run the tensor-expression fusion pass during translation.
    *  See `src/codegen/fuse/inlinePass.ts`. Optional, defaults to false. */
   enableTensorFusion?: boolean;
+  /** When true, add `-ffast-math` to the build. See
+   *  `src/build.ts::BuildOptions.fastMath`. Optional, defaults to false. */
+  fastMath?: boolean;
 }
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8 MB
@@ -123,16 +127,30 @@ function validateRunRequest(
       message: "'enableTensorFusion' must be a boolean if provided.",
     };
   }
+  if (r.fastMath !== undefined && typeof r.fastMath !== "boolean") {
+    return {
+      ok: false,
+      message: "'fastMath' must be a boolean if provided.",
+    };
+  }
   return { ok: true };
 }
 
 async function compile(
   cFile: string,
   exeFile: string,
-  cc: string
+  cc: string,
+  buildOpts: { fastMath?: boolean }
 ): Promise<{ ok: true } | { ok: false; stderr: string }> {
+  // Compile flags come from `src/build.ts::buildCcArgs` so a binary
+  // built by this server's `/run` endpoint is bit-identical to one
+  // built by `mtoc run` for the same toggles. `checkLeaks` is not
+  // exposed over the wire — AddressSanitizer-wrapped binaries are a
+  // local-only feature (used by the cross-runner) and would change
+  // failure-output shape over SSE.
+  const ccArgs = buildCcArgs(cFile, exeFile, { fastMath: buildOpts.fastMath });
   try {
-    await execFileAsync(cc, [cFile, "-o", exeFile, "-lm"], {
+    await execFileAsync(cc, ccArgs, {
       timeout: 15_000,
       maxBuffer: 4 * 1024 * 1024,
     });
@@ -224,7 +242,9 @@ async function handleRun(
     }
     await writeFile(cFile, translateResult.c!, "utf-8");
 
-    const compileResult = await compile(cFile, exeFile, cc);
+    const compileResult = await compile(cFile, exeFile, cc, {
+      fastMath: parsed.fastMath ?? false,
+    });
     if (!compileResult.ok) {
       sendEvent({ type: "compile_error", text: compileResult.stderr });
       sendEvent({ type: "done", exitCode: 1, phase: "compile" });

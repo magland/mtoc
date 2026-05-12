@@ -126,7 +126,7 @@ export async function executeRemoteRun(
   serviceUrl: string,
   passkey: string,
   abortSignal?: AbortSignal,
-  opts: { enableTensorFusion?: boolean } = {}
+  opts: { enableTensorFusion?: boolean; fastMath?: boolean } = {}
 ): Promise<RunResult> {
   let response: Response;
   try {
@@ -140,6 +140,7 @@ export async function executeRemoteRun(
         files,
         activeName,
         enableTensorFusion: opts.enableTensorFusion ?? false,
+        fastMath: opts.fastMath ?? false,
       }),
       signal: abortSignal,
     });

@@ -21,6 +21,7 @@ import { SyntaxError as ParseSyntaxError } from "./parser/errors.js";
 import { offsetToLine } from "./parser/sourceLoc.js";
 import { scanMFiles } from "./numbl-cli/cli-scan.js";
 import { startServer } from "../server/execution-service.js";
+import { buildCcArgs } from "./build.js";
 
 function usage(): never {
   process.stderr.write(
@@ -299,14 +300,11 @@ function cmdRun(args: string[]): void {
   writeFileSync(cFile, cSource);
 
   const cc = process.env.CC || "cc";
-  // Always compile with -O3 -march=native so the emitted tensor
-  // loops auto-vectorize and the generated binary is representative
-  // of what mtoc users will ship. --check-leaks adds AddressSanitizer
-  // on top (cross-runner enables this); --fast-math adds -ffast-math
-  // on top (IEEE-non-strict reassociation, off by default).
-  const ccArgs = [cFile, "-o", exeFile, "-lm", "-O3", "-march=native"];
-  if (checkLeaks) ccArgs.push("-fsanitize=address", "-g");
-  if (fastMath) ccArgs.push("-ffast-math");
+  // Compile flags are shared with the execution server via
+  // `src/build.ts::buildCcArgs` so a binary built by `mtoc run` is
+  // bit-identical to one built by the remote `/run` endpoint for
+  // the same toggles. See `BuildOptions` for what each flag does.
+  const ccArgs = buildCcArgs(cFile, exeFile, { checkLeaks, fastMath });
   try {
     execFileSync(cc, ccArgs, { stdio: "inherit" });
   } catch {
