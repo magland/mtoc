@@ -1748,8 +1748,20 @@ function reshapeLowerExpr(
     }
   }
   const ndim = dimArgs.length;
+  // Refine the result-dim lattice when the dim arg is a positive-int
+  // NumLit: literal `1` → `one`, literal integer > 1 → `notOne`, else
+  // `unknown`. Lets downstream lowering (sum/min/max reductions on a
+  // statically-known matrix; codegen elementwise on a known N-D shape)
+  // see useful shape info when the user passes constant dims.
   const resultDims: DimInfo[] = [];
-  for (let i = 0; i < ndim; i++) resultDims.push({ kind: "unknown" });
+  for (let i = 0; i < ndim; i++) {
+    const d = dimArgs[i];
+    if (d.kind === "NumLit" && Number.isInteger(d.value) && d.value >= 1) {
+      resultDims.push(d.value === 1 ? { kind: "one" } : { kind: "notOne" });
+    } else {
+      resultDims.push({ kind: "unknown" });
+    }
+  }
   const isComplex = a.ty.isComplex;
   const resultTy = numericTypeND(resultDims, isComplex, "unknown");
   const helper = isComplex

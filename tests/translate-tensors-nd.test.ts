@@ -35,6 +35,21 @@ describe("N-D elementwise codegen", () => {
     );
   });
 
+  it("refines literal-int reshape dims so reductions accept the result", () => {
+    // Before the refinement, `reshape(v, 2, 3, 2)` produced a result
+    // with `dims = [unknown, unknown, unknown]` and `sum(A)` rejected
+    // it as statically ambiguous. With the refinement the reduction
+    // lowerer sees a known matrix and lowers to the per-axis helper.
+    const c = translate(
+      "v = [1 2 3 4 5 6 7 8 9 10 11 12];\n" +
+        "A = reshape(v, 2, 3, 2);\n" +
+        "S = sum(A);\n" +
+        "disp(S);\n"
+    );
+    expect(c).toContain("mtoc_sum_default(");
+    expect(c).toContain("mtoc_tensor_assign(&S, mtoc_sum_default(A));");
+  });
+
   it("keeps the legacy 2-D alloc shape for 2-D results", () => {
     // Pure refactor regression guard: a plain 2-D elementwise op
     // should still emit `mtoc_tensor_alloc(M.dims[0], M.dims[1])`,
