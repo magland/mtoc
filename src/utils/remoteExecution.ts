@@ -126,7 +126,11 @@ export async function executeRemoteRun(
   serviceUrl: string,
   passkey: string,
   abortSignal?: AbortSignal,
-  opts: { enableTempInlining?: boolean; fastMath?: boolean } = {}
+  opts: {
+    enableTempInlining?: boolean;
+    fastMath?: boolean;
+    threads?: number | "auto";
+  } = {}
 ): Promise<RunResult> {
   let response: Response;
   try {
@@ -141,6 +145,7 @@ export async function executeRemoteRun(
         activeName,
         enableTempInlining: opts.enableTempInlining ?? false,
         fastMath: opts.fastMath ?? false,
+        threads: opts.threads ?? 1,
       }),
       signal: abortSignal,
     });

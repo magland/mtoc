@@ -63,6 +63,13 @@ export interface TranslateOptions {
    *  Default false during rollout. See
    *  `src/codegen/inline/inlinePass.ts`. */
   enableTempInlining?: boolean;
+  /** Max threads to use for parallelizable loops.
+   *  - `1` / omitted: pure serial codegen. No `#pragma omp` lines.
+   *  - `"auto"`: emit pragmas; OpenMP picks the thread count.
+   *  - number `>= 2`: emit pragmas; emit a startup
+   *    `omp_set_num_threads(N)` call. See
+   *    [build.ts::BuildOptions.threads](./build.ts). */
+  threads?: number | "auto";
 }
 
 /**
@@ -76,6 +83,7 @@ export function translateProject(
 ): TranslateResult {
   const includeRuntime = opts.includeRuntime ?? true;
   const enableTempInlining = opts.enableTempInlining ?? false;
+  const threads = opts.threads ?? 1;
   const active = files.find(f => f.name === activeName);
   if (!active) {
     return {
@@ -113,7 +121,7 @@ export function translateProject(
 
   try {
     const ir = lower(activeAst, workspace);
-    return { c: emitC(ir, { includeRuntime, enableTempInlining }) };
+    return { c: emitC(ir, { includeRuntime, enableTempInlining, threads }) };
   } catch (e) {
     if (e instanceof UnsupportedConstruct || e instanceof TypeError) {
       return {

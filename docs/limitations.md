@@ -262,6 +262,14 @@ workaround or a roadmap note.
 - **No source map / debugger integration.** Function header comments contain
   the source span (file + line range), but there are no `#line` directives
   yet.
+- **Parallel loops cover elementwise only.** The `--threads N` / IDE
+  thread-count option enables OpenMP on flat-iter and broadcast
+  elementwise loops; reductions (`sum`, `min`, `max`, `prod`, and
+  their tensor-returning along-axis siblings) stay serial regardless.
+  They need a different parallelization shape (a reduction clause for
+  the scalar-result form; explicit per-output-slot index derivation
+  for the tensor-result form to avoid the shared `out_idx`
+  counter). Tracked separately.
 
 ## When to add a new entry to this list
 

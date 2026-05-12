@@ -21,7 +21,8 @@ export function useTranslation(
   activeName: string,
   editorModel: editor.ITextModel | null,
   includeRuntime: boolean = false,
-  enableTempInlining: boolean = false
+  enableTempInlining: boolean = false,
+  threads: number | "auto" = 1
 ): UseTranslationResult {
   const [c, setC] = useState<string>("");
   const [error, setError] = useState<TranslateError | null>(null);
@@ -33,6 +34,7 @@ export function useTranslation(
       const result = translateProject(files, activeName, {
         includeRuntime,
         enableTempInlining,
+        threads,
       });
       if (result.error) {
         setError(result.error);
@@ -45,7 +47,7 @@ export function useTranslation(
       }
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(handle);
-  }, [files, activeName, includeRuntime, enableTempInlining]);
+  }, [files, activeName, includeRuntime, enableTempInlining, threads]);
 
   // Drive Monaco markers off of (error, editorModel, monaco).
   useEffect(() => {

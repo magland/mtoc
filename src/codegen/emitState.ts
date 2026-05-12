@@ -130,6 +130,14 @@ export interface EmitState {
    *  C reader can see every collapsed numbl statement, in source
    *  order. */
   inlinedFrom: InlinedFromMap;
+  /** Max threads to use for parallelizable loops; see
+   *  [../build.ts::BuildOptions.threads](../build.ts). Read by the
+   *  tensor-loop emitters (and the reduction helpers) to decide
+   *  whether to emit `#pragma omp parallel for if(_mtoc_n >
+   *  MTOC_PARALLEL_MIN_N)` lines, and by `emitC` to decide whether
+   *  to include `<omp.h>` and emit a startup `omp_set_num_threads`
+   *  call. */
+  threads: number | "auto";
 }
 
 /** Build the small facade view passed to `BuiltinSig.emit` closures.

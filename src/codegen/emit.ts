@@ -30,12 +30,13 @@
 
 import type { IRProgram } from "../lowering/ir.js";
 import { computeFutureTouches } from "./liveness.js";
-import { type EmitState } from "./emitState.js";
+import { pushStmt, type EmitState } from "./emitState.js";
 import { analyzeStmts } from "./emitAnalysis.js";
 import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
 import { inlinePass } from "./inline/inlinePass.js";
+import { isParallelThreadsOption } from "../build.js";
 
 /** Options for `emitC`. */
 export interface EmitOptions {
@@ -57,11 +58,18 @@ export interface EmitOptions {
    *  call once you're happy with the byte-for-byte numerics. See
    *  `src/codegen/inline/inlinePass.ts`. */
   enableTempInlining?: boolean;
+  /** Max threads to use for parallelizable loops. See
+   *  [../build.ts::BuildOptions.threads](../build.ts). `1`/undefined
+   *  → no pragmas emitted; `"auto"` → pragmas + no
+   *  `omp_set_num_threads()`; number `>= 2` → pragmas + startup
+   *  `omp_set_num_threads(N)`. */
+  threads?: number | "auto";
 }
 
 export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   const includeRuntime = opts.includeRuntime ?? true;
   const enableTempInlining = opts.enableTempInlining ?? false;
+  const threads = opts.threads ?? 1;
 
   // Tensor-expression inlining: pure IR-to-IR rewrite. Runs before
   // any codegen analysis so liveness, runtime-helper activation,
@@ -89,6 +97,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     currentFunctionOutputs: null,
     multiAssignCallCounter: 0,
     inlinedFrom,
+    threads,
   };
 
   // One-pass pre-walk: activates runtime helpers referenced by the
@@ -111,6 +120,14 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   state.futureTouches = computeFutureTouches(prog.stmts);
   state.freedOwned = new Set();
   emitDeclarations(state, 1, prog.assignedVars);
+  // When the user has requested a specific thread count (anything
+  // other than "auto" or 1), pin OpenMP to that count at startup.
+  // The pinning applies to every subsequent `#pragma omp parallel
+  // for` region in the process (main and user functions alike), so
+  // one call here suffices.
+  if (typeof threads === "number" && threads > 1) {
+    pushStmt(state, 1, `omp_set_num_threads(${threads});`);
+  }
   for (const s of prog.stmts) emitStmt(state, 1, s);
   // Free every tensor backing allocated for top-level vars not
   // already released earlier on the linear path before `return 0;`.
@@ -129,6 +146,12 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   if (state.needMath.value) headerSet.add("<math.h>");
   if (state.needComplex.value) headerSet.add("<complex.h>");
   if (state.needStdlib.value) headerSet.add("<stdlib.h>");
+  // `<omp.h>` is only needed when parallel pragmas have been emitted.
+  // Add it whenever the threads option is non-serial — that matches
+  // the predicate `emitTensor.ts::parallelForPragma` uses to decide
+  // whether to emit a `#pragma omp parallel for` and the predicate
+  // `buildCcArgs` uses to decide whether to link `-fopenmp`.
+  if (isParallelThreadsOption(threads)) headerSet.add("<omp.h>");
   if (includeRuntime) {
     for (const snippet of state.runtime) {
       for (const h of snippet.headers) headerSet.add(h);

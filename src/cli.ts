@@ -27,8 +27,8 @@ function usage(): never {
   process.stderr.write(
     [
       "Usage:",
-      "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir] [--inline-temps]",
-      "  mtoc run <input.m> [--check-leaks] [--fast-math] [--inline-temps]",
+      "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir] [--inline-temps] [--threads N|auto]",
+      "  mtoc run <input.m> [--check-leaks] [--fast-math] [--inline-temps] [--threads N|auto]",
       "  mtoc serve --passkey <key> [--port N] [--host HOST]",
       "",
       "Options:",
@@ -57,6 +57,13 @@ function usage(): never {
       "                  numerical results as the un-inlined build (cross-",
       "                  runner is byte-for-byte parity-tested with the",
       "                  flag on AND off).",
+      "  --threads N|auto",
+      "                  Max threads for parallelizable elementwise loops.",
+      "                  N = a positive integer; `auto` = let OpenMP pick",
+      "                  (uses OMP_NUM_THREADS or # cores). Default 1",
+      "                  (pure serial — no #pragma omp lines emitted, no",
+      "                  -fopenmp on the link, binary bit-identical to",
+      "                  today's serial output).",
       "",
       "When <output.c> is omitted, the translated C is written to stdout.",
       "",
@@ -77,6 +84,7 @@ interface ParsedArgs {
   checkLeaks: boolean;
   fastMath: boolean;
   inlineTemps: boolean;
+  threads: number | "auto";
 }
 
 function parseArgs(args: string[]): ParsedArgs {
@@ -86,7 +94,9 @@ function parseArgs(args: string[]): ParsedArgs {
   let checkLeaks = false;
   let fastMath = false;
   let inlineTemps = false;
-  for (const a of args) {
+  let threads: number | "auto" = 1;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
     if (a === "--no-runtime") {
       noRuntime = true;
     } else if (a === "--dump-ir") {
@@ -97,6 +107,26 @@ function parseArgs(args: string[]): ParsedArgs {
       fastMath = true;
     } else if (a === "--inline-temps") {
       inlineTemps = true;
+    } else if (a === "--threads") {
+      const v = args[++i];
+      if (v === undefined) {
+        process.stderr.write(
+          `mtoc: --threads requires a value (N or 'auto')\n`
+        );
+        usage();
+      }
+      if (v === "auto") {
+        threads = "auto";
+      } else {
+        const n = parseInt(v, 10);
+        if (!Number.isFinite(n) || n < 1 || String(n) !== v) {
+          process.stderr.write(
+            `mtoc: --threads value must be a positive integer or 'auto' (got '${v}')\n`
+          );
+          usage();
+        }
+        threads = n;
+      }
     } else if (a.startsWith("--")) {
       process.stderr.write(`mtoc: unknown option '${a}'\n`);
       usage();
@@ -104,7 +134,15 @@ function parseArgs(args: string[]): ParsedArgs {
       positional.push(a);
     }
   }
-  return { positional, noRuntime, dumpIr, checkLeaks, fastMath, inlineTemps };
+  return {
+    positional,
+    noRuntime,
+    dumpIr,
+    checkLeaks,
+    fastMath,
+    inlineTemps,
+    threads,
+  };
 }
 
 function reportError(
@@ -150,20 +188,23 @@ function compile(
   absInputPath: string,
   includeRuntime: boolean,
   inputPath: string,
-  enableTempInlining: boolean
+  enableTempInlining: boolean,
+  threads: number | "auto"
 ): string {
   const { files, searchPaths } = buildProjectFiles(absInputPath, source);
   const result = translateProject(files, absInputPath, {
     includeRuntime,
     searchPaths,
     enableTempInlining,
+    threads,
   });
   if (result.error) reportError(result.error, inputPath, source);
   return result.c!;
 }
 
 function cmdTranslate(args: string[]): void {
-  const { positional, noRuntime, dumpIr, inlineTemps } = parseArgs(args);
+  const { positional, noRuntime, dumpIr, inlineTemps, threads } =
+    parseArgs(args);
   if (positional.length < 1 || positional.length > 2) usage();
   const [inputPath, outputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
@@ -190,7 +231,8 @@ function cmdTranslate(args: string[]): void {
     absInputPath,
     !noRuntime,
     inputPath,
-    inlineTemps
+    inlineTemps,
+    threads
   );
   if (outputPath === undefined) {
     process.stdout.write(cSource);
@@ -280,7 +322,7 @@ function dumpIrAsJson(
 }
 
 function cmdRun(args: string[]): void {
-  const { positional, noRuntime, checkLeaks, fastMath, inlineTemps } =
+  const { positional, noRuntime, checkLeaks, fastMath, inlineTemps, threads } =
     parseArgs(args);
   if (positional.length !== 1) usage();
   if (noRuntime) {
@@ -292,7 +334,14 @@ function cmdRun(args: string[]): void {
   const [inputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
   const absInputPath = resolve(inputPath);
-  const cSource = compile(source, absInputPath, true, inputPath, inlineTemps);
+  const cSource = compile(
+    source,
+    absInputPath,
+    true,
+    inputPath,
+    inlineTemps,
+    threads
+  );
 
   const dir = mkdtempSync(join(tmpdir(), "mtoc-"));
   const cFile = join(dir, "out.c");
@@ -304,7 +353,7 @@ function cmdRun(args: string[]): void {
   // `src/build.ts::buildCcArgs` so a binary built by `mtoc run` is
   // bit-identical to one built by the remote `/run` endpoint for
   // the same toggles. See `BuildOptions` for what each flag does.
-  const ccArgs = buildCcArgs(cFile, exeFile, { checkLeaks, fastMath });
+  const ccArgs = buildCcArgs(cFile, exeFile, { checkLeaks, fastMath, threads });
   try {
     execFileSync(cc, ccArgs, { stdio: "inherit" });
   } catch {

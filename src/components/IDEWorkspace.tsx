@@ -70,6 +70,7 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
   const [includeRuntime, setIncludeRuntime] = useState(false);
   const [enableTempInlining, setEnableTempInlining] = useState(false);
   const [fastMath, setFastMath] = useState(false);
+  const [threads, setThreads] = useState<number | "auto">(1);
   const exec = useRemoteExecution();
 
   // Register the numbl Monaco language exactly once per Monaco instance.
@@ -131,7 +132,8 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
     active ?? "",
     editorModel,
     includeRuntime,
-    enableTempInlining
+    enableTempInlining,
+    threads
   );
 
   const handleEditorMount: OnMount = editorInstance => {
@@ -163,7 +165,7 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
       return;
     }
     if (!active) return;
-    exec.run(sourceFiles, active, { enableTempInlining, fastMath });
+    exec.run(sourceFiles, active, { enableTempInlining, fastMath, threads });
   };
 
   return (
@@ -249,6 +251,8 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
               onEnableTempInliningChange={setEnableTempInlining}
               fastMath={fastMath}
               onFastMathChange={setFastMath}
+              threads={threads}
+              onThreadsChange={setThreads}
               isRunning={isRunning}
             />
           </Splitter>

@@ -110,6 +110,20 @@ Lowering does several jobs in one walk:
   the operand's dim field. Same-shape operands still use the legacy
   flat-iter path so the byte-for-byte form of all pre-existing tests
   is preserved.
+- **Parallel elementwise loops (OpenMP)**: opt-in via the `threads`
+  build option (`mtoc run --threads N`, the IDE's thread dropdown, or
+  `BuildOptions.threads` programmatically). Off by default — when
+  `threads = 1` (or omitted) the emitted C has no `#pragma omp` lines,
+  no `<omp.h>` include, and the binary is bit-identical to today's
+  serial output. Non-serial values emit `#pragma omp parallel for
+if(_mtoc_n > 1024)` above the outermost loop of both the flat-iter
+  and broadcast elementwise emitters; the if-clause keeps small
+  tensors serial so OpenMP fork overhead doesn't dominate. The
+  reduction emitters (`sum`, `min`, `max`, `prod`, `prod_complex` and
+  their tensor-returning siblings) are deliberately left serial in
+  this pass — they need a different parallelization shape (reduction
+  clause + index derivation) and will land separately. See
+  `src/codegen/emitTensor.ts::parallelForPragma`.
 - **ANF normalization (`src/lowering/anf.ts`)**: a post-lowering pass that
   hoists every owned-producing sub-expression (TensorLit, IndexSlice,
   string concat, user-function call returning an owned kind) out of

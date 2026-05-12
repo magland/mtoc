@@ -46,6 +46,11 @@ interface RunRequest {
   /** When true, add `-ffast-math` to the build. See
    *  `src/build.ts::BuildOptions.fastMath`. Optional, defaults to false. */
   fastMath?: boolean;
+  /** Max threads for parallel elementwise loops. Positive integer or
+   *  `"auto"` (let OpenMP pick). Defaults to 1 (pure serial — no
+   *  `#pragma omp`, no `-fopenmp`). See
+   *  [../src/build.ts::BuildOptions.threads](../src/build.ts). */
+  threads?: number | "auto";
 }
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8 MB
@@ -134,6 +139,20 @@ function validateRunRequest(
       message: "'fastMath' must be a boolean if provided.",
     };
   }
+  if (r.threads !== undefined) {
+    const ok =
+      r.threads === "auto" ||
+      (typeof r.threads === "number" &&
+        Number.isInteger(r.threads) &&
+        r.threads >= 1);
+    if (!ok) {
+      return {
+        ok: false,
+        message:
+          "'threads' must be a positive integer or the string 'auto' if provided.",
+      };
+    }
+  }
   return { ok: true };
 }
 
@@ -141,7 +160,7 @@ async function compile(
   cFile: string,
   exeFile: string,
   cc: string,
-  buildOpts: { fastMath?: boolean }
+  buildOpts: { fastMath?: boolean; threads?: number | "auto" }
 ): Promise<{ ok: true } | { ok: false; stderr: string }> {
   // Compile flags come from `src/build.ts::buildCcArgs` so a binary
   // built by this server's `/run` endpoint is bit-identical to one
@@ -149,7 +168,10 @@ async function compile(
   // exposed over the wire — AddressSanitizer-wrapped binaries are a
   // local-only feature (used by the cross-runner) and would change
   // failure-output shape over SSE.
-  const ccArgs = buildCcArgs(cFile, exeFile, { fastMath: buildOpts.fastMath });
+  const ccArgs = buildCcArgs(cFile, exeFile, {
+    fastMath: buildOpts.fastMath,
+    threads: buildOpts.threads,
+  });
   try {
     await execFileAsync(cc, ccArgs, {
       timeout: 15_000,
@@ -229,6 +251,7 @@ async function handleRun(
     // Translate on the server using the same pipeline the IDE uses.
     const translateResult = translateProject(parsed.files, parsed.activeName, {
       enableTempInlining: parsed.enableTempInlining ?? false,
+      threads: parsed.threads ?? 1,
     });
     if (translateResult.error) {
       sendEvent({
@@ -245,6 +268,7 @@ async function handleRun(
 
     const compileResult = await compile(cFile, exeFile, cc, {
       fastMath: parsed.fastMath ?? false,
+      threads: parsed.threads ?? 1,
     });
     if (!compileResult.ok) {
       sendEvent({ type: "compile_error", text: compileResult.stderr });

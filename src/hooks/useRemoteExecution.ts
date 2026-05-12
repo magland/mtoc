@@ -42,7 +42,11 @@ interface UseRemoteExecutionResult {
   run: (
     files: SourceFile[],
     activeName: string,
-    opts?: { enableTempInlining?: boolean; fastMath?: boolean }
+    opts?: {
+      enableTempInlining?: boolean;
+      fastMath?: boolean;
+      threads?: number | "auto";
+    }
   ) => Promise<void>;
   /** Abort the currently-running execution. */
   stop: () => void;
@@ -74,7 +78,11 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
     async (
       files: SourceFile[],
       activeName: string,
-      opts: { enableTempInlining?: boolean; fastMath?: boolean } = {}
+      opts: {
+        enableTempInlining?: boolean;
+        fastMath?: boolean;
+        threads?: number | "auto";
+      } = {}
     ) => {
       if (status === "running") return;
       const url = getRemoteServiceUrl();
@@ -111,6 +119,7 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
         {
           enableTempInlining: opts.enableTempInlining ?? false,
           fastMath: opts.fastMath ?? false,
+          threads: opts.threads ?? 1,
         }
       );
       abortRef.current = null;

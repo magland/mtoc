@@ -28,6 +28,7 @@ export function translate(
   opts: {
     includeRuntime?: boolean;
     enableTempInlining?: boolean;
+    threads?: number | "auto";
   } = {}
 ): string {
   const ast = parseMFile(source, "test.m");

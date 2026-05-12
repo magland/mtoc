@@ -159,7 +159,14 @@ Every manipulation copies. Specifically:
 - **Elementwise expressions** (`s = a + b;`) build a fresh tensor via
   `mtoc_tensor_alloc(...)`, fill its `.real` / `.imag` slots in a
   loop, then `mtoc_tensor_assign(&s, _mtoc_t)`. The check-shape
-  helper guards same-category mismatches just before the alloc.
+  helper guards same-category mismatches just before the alloc. When
+  the `threads` build option is non-serial, the loop is prefixed
+  with `#pragma omp parallel for if(_mtoc_n > 1024)` — both the
+  flat-iter path here and the broadcast emitter's outermost loop —
+  and the codegen pulls `<omp.h>` in plus, for a concrete N >= 2,
+  emits one `omp_set_num_threads(N)` call at the top of `main()`.
+  When `threads = 1` (the default) the C is bit-identical to the
+  serial form: no pragmas, no `<omp.h>`, no `-fopenmp` on the link.
 - **User-function calls** wrap every tensor argument in
   `mtoc_tensor_copy(...)` so the callee gets an owned tensor (which
   it may reassign or free at scope exit). Builtins like `disp`,

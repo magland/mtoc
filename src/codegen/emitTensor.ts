@@ -20,6 +20,26 @@ import { findInExpr, forEachSubExpr } from "../lowering/walk.js";
 import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 import { emitExpr, tensorColsField, tensorRowsField } from "./emitExpr.js";
 import { formatNumLit } from "./emitFormat.js";
+import { isParallelThreadsOption } from "../build.js";
+
+/** Minimum element count for OpenMP parallelization. Loops with fewer
+ *  elements stay serial regardless of the `threads` build option —
+ *  the OpenMP region setup overhead would dominate. Picked
+ *  conservatively so even very simple per-iter bodies (e.g. `a + b`)
+ *  amortize on the parallel side. Centralized so flat-iter and
+ *  broadcast emitters use the same threshold. */
+const PARALLEL_MIN_N = 1024;
+
+/** Return the `#pragma omp parallel for if(<sizeExpr> > K)` string the
+ *  current state's threads option calls for, or `null` when threads=1
+ *  (no pragma emitted; user-code C stays bit-identical to today's
+ *  serial output). Same predicate as `BuildOptions::threads` via
+ *  `isParallelThreadsOption`. */
+function parallelForPragma(state: EmitState, sizeExpr: string): string | null {
+  return isParallelThreadsOption(state.threads)
+    ? `#pragma omp parallel for if(${sizeExpr} > ${PARALLEL_MIN_N})`
+    : null;
+}
 
 /** Walk an IR expression and return the first multi-element `Var`
  *  encountered — the "shape source" for an elementwise assign whose
@@ -266,6 +286,8 @@ function emitFlatAssign(
     `mtoc_tensor_t ${stagingName} = ${allocHelper}(${shapeArgs});`
   );
   pushStmt(state, level + 1, `long _mtoc_n = ${numelExpr};`);
+  const pragma = parallelForPragma(state, "_mtoc_n");
+  if (pragma !== null) pushStmt(state, level + 1, pragma);
   pushStmt(
     state,
     level + 1,
@@ -387,9 +409,17 @@ function emitBroadcastAssign(
   );
 
   // Open nested loops, outermost first (highest axis → column-major
-  // fill, matching the existing flat-iter convention).
+  // fill, matching the existing flat-iter convention). The pragma —
+  // emitted only when the threads option is non-serial — parallelizes
+  // the outermost loop; its `if(...)` clause guards against fork
+  // overhead on tiny broadcasts by checking total element count.
+  const totalElems = outDimNames.join(" * ");
+  const broadcastPragma = parallelForPragma(state, totalElems);
   for (let i = outNdim - 1; i >= 0; i--) {
     const lvl = level + 1 + (outNdim - 1 - i);
+    if (i === outNdim - 1 && broadcastPragma !== null) {
+      pushStmt(state, lvl, broadcastPragma);
+    }
     pushStmt(
       state,
       lvl,
