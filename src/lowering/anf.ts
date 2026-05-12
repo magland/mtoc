@@ -33,7 +33,13 @@ import type {
   IndexSliceArg,
   VarBinding,
 } from "./ir.js";
-import { isMultiElement, isOwned, isString, type MType } from "./types.js";
+import {
+  isMultiElement,
+  isOwned,
+  isString,
+  isStruct,
+  type MType,
+} from "./types.js";
 import { isElementwiseBuiltin } from "./lowerFuncCall.js";
 
 /** Counter shared across the whole program so synthetic temp names
@@ -53,7 +59,8 @@ export type OwnedExprKind =
   | "index-slice"
   | "make-range"
   | "user-call"
-  | "builtin-call";
+  | "builtin-call"
+  | "struct-lit";
 
 /** Classify `e` as an "owned producer" — an expression that, when
  *  evaluated, returns a freshly-allocated heap-backed value (tensor /
@@ -67,6 +74,7 @@ export function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
   if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
   if (e.kind === "IndexSlice") return "index-slice";
   if (e.kind === "MakeRange") return "make-range";
+  if (e.kind === "StructLit") return "struct-lit";
   if (e.kind === "Call" && isOwned(e.ty)) {
     if (e.callee.kind === "userFunc") return "user-call";
     // Builtin calls flagged `producesOwnedDirectly` (e.g. `size(t)`,
@@ -141,6 +149,11 @@ export function ownedExprMessage(kind: OwnedExprKind): string {
       return (
         "internal: owned-returning builtin call still nested inside " +
         "another expression after ANF; ANF pass should have hoisted it"
+      );
+    case "struct-lit":
+      return (
+        "internal: struct literal still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
       );
   }
 }
@@ -281,6 +294,17 @@ function anfStmt(
       const newRhs = anfExpr(s.rhs, pre, av, c);
       return [...pre, { ...s, index: newIndex, rhs: newRhs }];
     }
+    case "MemberStore": {
+      // The RHS may be any owned producer — a struct literal, a
+      // tensor literal, a string concat, a user-func call returning
+      // an owned kind, etc. We treat MemberStore as a "consume site"
+      // for those: hoist any nested owned producer to a temp, then
+      // let codegen route the temp through `mtoc_<kind>_assign` (for
+      // owned fields) or a bare assignment (for scalar fields).
+      const pre: IRStmt[] = [];
+      const newRhs = anfRequireHandle(s.rhs, pre, av, c);
+      return [...pre, { ...s, rhs: newRhs }];
+    }
     case "MultiAssignCall": {
       // User-function multi-output call: every tensor arg lands in
       // the callee via copy-on-arg-pass, which requires a full
@@ -348,6 +372,21 @@ function anfExprChildren(
         step: anfExpr(e.step, pre, av, c),
         end: anfExpr(e.end, pre, av, c),
       };
+    case "StructLit":
+      // Each field value gets the standard ANF treatment — owned
+      // producers (tensor lits, nested struct lits, user-func calls
+      // returning an owned kind) get lifted to a temp; multi-element
+      // expressions that aren't owned producers get hoisted via the
+      // handle-lift path so codegen can consume an addressable Var.
+      return {
+        ...e,
+        fields: e.fields.map(f => ({
+          name: f.name,
+          value: anfRequireHandle(f.value, pre, av, c),
+        })),
+      };
+    case "MemberLoad":
+      return { ...e, base: anfExpr(e.base, pre, av, c) };
     case "NumLit":
     case "ImagLit":
     case "StringLit":
@@ -423,8 +462,20 @@ function anfRequireHandle(
 
 /** True when a fully-anf'd `IRExpr` still needs to be hoisted to a
  *  Var for its consumer. Multi-element non-Var non-handle shapes
- *  (Binary, Unary, elementwise-builtin Call) are the target. */
+ *  (Binary, Unary, elementwise-builtin Call) are the target.
+ *  Structs are always handle-like — non-Var struct expressions
+ *  (`MemberLoad`, `StructLit`) get hoisted at consume sites so
+ *  codegen always sees a Var or a direct-consume StructLit. */
 function needsHandleLift(e: IRExpr): boolean {
+  if (isStruct(e.ty)) {
+    // A bare Var of a struct type is already a handle — consume
+    // sites can read from it directly. StructLit is an owned producer
+    // and gets lifted by the owned-producer path. Anything else
+    // (MemberLoad on a struct field) needs hoisting because codegen
+    // can't pass a field-load expression by value through a
+    // copy-on-arg-pass wrapper.
+    return e.kind !== "Var" && e.kind !== "StructLit";
+  }
   if (!isMultiElement(e.ty)) return false;
   switch (e.kind) {
     case "Var":

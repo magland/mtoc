@@ -254,7 +254,7 @@ workaround or a roadmap note.
   - **Char function parameters and char return types.** User
     functions still require scalar-numeric returns.
   - **Most char builtins**: `upper`, `lower`, `num2str`, etc.
-- **No cell arrays, structs, classes.**
+- **No cell arrays or classes.**
 - **`fprintf` and `sprintf` partial**: the format engine
   (`runtime/format_engine.h`) mirrors numbl's `sprintfFormat`
   byte-for-byte (spec set `d i u f e E g s c x X o %`, flags
@@ -276,6 +276,59 @@ workaround or a roadmap note.
   the elapsed duration; print derived predicates (`disp(e >= 0)`)
   instead. The bare-statement `Elapsed time is X.XXXXXX seconds.`
   output is intentionally non-deterministic in both runtimes.
+
+## Structs
+
+- **Scalar structs only.** Field-name set is fixed for the lifetime of
+  a variable in its scope, inferred by a pre-pass that walks every
+  member assignment and `struct(...)` constructor call. Field types
+  fill in at the first assignment of each field. Both creation forms
+  work — dot-assign (`s.x = ...`) and the `struct('x', v, ...)`
+  constructor — and they can mix freely on the same variable.
+- **Nested structs work.** `outer.inner.x = ...` and
+  `outer.inner = struct('x', ...)` are both supported; the emitted C
+  uses one typedef per distinct (recursive) field-set shape, ordered
+  innermost-first so a parent typedef can refer to its inner field's
+  typedef by name.
+- **Copy-on-arg-pass.** Function parameters that take a struct get a
+  deep copy at the call site (recursively copying any owned-typed
+  fields), so a callee mutating its struct parameter doesn't affect
+  the caller's struct.
+- **`disp(s)` matches numbl byte-for-byte** for the simple cases
+  (`    <name>: <value>` per field, recursing for nested struct
+  fields). The struct field-disp does NOT add extra indentation to the
+  nested struct's lines beyond what numbl does — matching numbl's
+  somewhat-quirky inline-then-no-indent output exactly.
+- **Struct returns from user functions are supported** in the same
+  shape as tensor returns: 1-output by-value, N-output sret via
+  `mtoc_<typedef>_assign` writes through the out-pointer. The
+  generated `_copy` helper at the call site preserves value semantics.
+
+### Out of scope for v1 (documented gaps)
+
+- **Struct arrays.** `s(i).f`, `s(i) = struct(...)`, concatenation
+  `[s, t]` of structs, `RuntimeStructArray`-style indexing. v1 is
+  scalar-only.
+- **Dynamic field access:** `s.(name)`. Rejected at lowering with a
+  span — no static type for the access target.
+- **`[]`-to-struct promotion:** the numbl/MATLAB idiom `s = []; s.x = v`.
+  Deferred.
+- **Introspection builtins:** `isstruct`, `isfield`, `fieldnames`,
+  `class(s)`, `rmfield`. Will surface through the existing "unknown
+  builtin" error path.
+- **Branch-divergent field-set assignment:** an `if` that assigns
+  `s.x` in one arm and `s.y` in the other is rejected with a span.
+  Hoist the assignment outside the branch.
+- **Struct-shape change across reassignment** is rejected — once a
+  variable is bound to a struct of a given field-set, every later
+  assignment to that name (struct or non-struct) must agree on the
+  field-set. Rename or use a fresh variable for a different shape.
+- **Indexing into a struct field at expression position:**
+  `s.field(i)` where `field` is a tensor is allowed for scalar /
+  integer indices via the parser's `MethodCall` form, but range /
+  colon indexing (`s.field(a:b)`) and nested field-then-index chains
+  (`s.outer.field(i)`) currently require hoisting the field into a
+  local variable first.
 
 ## Codegen
 

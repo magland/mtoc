@@ -293,6 +293,25 @@ The subset is growing iteratively. Roughly:
   string, and mixed `+` concat with a string. Scalar chars are bare
   C `char`; char arrays use `mtoc_char_tensor_t`. 2D char matrices
   and char indexing are deferred.
+- Scalar structs (numbl `struct`): both creation forms work — dot-assign
+  (`s.x = 1; s.y = [1 2 3]`) and the `struct(...)` constructor
+  (`s = struct('x', 1, 'y', [1 2 3])`). Field names are gathered by a
+  pre-pass over the function/script body, so the struct's static
+  shape is fixed for the lifetime of the variable. Field types fill
+  in at the first assignment of each field and widen via `unify` on
+  subsequent assignments. Nested struct fields (`outer.inner.x = ...`,
+  `outer.inner = struct('x', ...)`) work in both forms; the emitted C
+  uses one typedef per distinct field-set shape, ordered
+  innermost-first. Function parameters get a deep copy of their
+  struct argument (recursively copying owned-typed fields), so a
+  callee can't mutate the caller's struct. Struct returns from
+  user functions (1-output by value, N-output via sret) ride the
+  same `mtoc_<typedef>_assign` consume-replace path tensors use.
+  Struct arrays, dynamic field access (`s.(name)`),
+  `isstruct`/`isfield`/`fieldnames`/`class()`/`rmfield`, the
+  `s = []; s.x = v` empty-promo idiom, and branch-divergent
+  field-set assignments are deferred — see
+  [docs/limitations.md](docs/limitations.md) for the full list.
 - Text view (`mtoc_text_view_t`): a non-owning `{data, len}` adapter
   every "accepts text" runtime helper consumes. `disp`, `error`,
   `assert(_, msg)`, `strcmp`, and `string_concat` each route through

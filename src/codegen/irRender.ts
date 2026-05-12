@@ -113,6 +113,14 @@ export function renderExpr(e: IRExpr, parentPrec = 0): string {
       }
       return `${start}:${renderExpr(e.step, 0)}:${end}`;
     }
+    case "MemberLoad":
+      return `${renderExpr(e.base, 0)}.${e.field}`;
+    case "StructLit": {
+      const pairs = e.fields
+        .map(f => `'${f.name}', ${renderExpr(f.value, 0)}`)
+        .join(", ");
+      return `struct(${pairs})`;
+    }
   }
 }
 
@@ -142,6 +150,8 @@ export function renderStmt(s: IRStmt): string | null {
     }
     case "IndexSliceStore":
       return `${s.base.name}(${s.index.map(renderSliceArg).join(", ")}) = ${renderExpr(s.rhs, 0)}`;
+    case "MemberStore":
+      return `${s.base.name}.${s.fieldPath.join(".")} = ${renderExpr(s.rhs, 0)}`;
     case "Disp":
       return `disp(${renderExpr(s.arg, 0)})`;
     case "Error":

@@ -12,6 +12,7 @@ The top-level type carrier:
 MType =
   | NumericType
   | StringType
+  | StructType
   | { kind: "Unknown" }
   | { kind: "Void" }
 ```
@@ -130,6 +131,51 @@ Two strings unify to a string; a string vs anything else collapses to
 clear error inside control flow). `canonicalizeType` produces
 `{ kind: "String" }`, so a function that takes a string parameter
 specializes on a single key.
+
+## StructType
+
+```
+StructType {
+  kind: "Struct"
+  fields: ReadonlyArray<{ name: string; type: MType }>   // sorted by name
+}
+```
+
+A scalar struct value carrying a fixed set of named fields, each with
+its own MType. Struct support is **scalar-only** in v1 — no struct
+arrays. The field-name set for a given local variable is determined
+by a pre-pass (`structPrePass.ts`) that walks the entire body before
+lowering, so the struct's C typedef is stable across the variable's
+lifetime. Field types fill in at the first assignment of each field
+and widen via `unify` on subsequent assignments — for example, two
+scalar-double assignments with different signs widen to `unknown`
+sign, like any other scalar reassignment.
+
+Two structs unify iff they have the same field-name set and every
+pairwise field type unifies; otherwise the result is `Unknown` and
+`recordAssignment` turns it into a clear conflict error. The
+`storageCategory` arm for structs is keyed on the field-NAME SET only
+(not field types), so a sign-only widening of a scalar field doesn't
+trigger a per-struct-shape split.
+
+`cTypeFor(structType)` returns a mangled `_mtoc_struct__<hash>`
+typedef name; the hash is FNV-1a 32 over the canonicalized
+`{fields: [[name, canonicalize(type)], ...]}` representation, so two
+identical struct shapes (same field-name list AND same canonical
+field types) share one typedef in the emitted C. The post-lowering
+`normalizeStructTypes` pass walks every IR node and rewrites
+struct-typed Var/MemberLoad/StructLit nodes to use the FINAL widened
+type from `assignedVars`, so the generated C emits exactly one
+typedef per logical variable. Without that pass, intermediate
+widening states would leak into the IR and cause duplicate typedefs.
+
+Codegen for structs lives in `src/codegen/emitStruct.ts`. Per unique
+struct shape the codegen emits a typedef plus five helpers
+(`<typedef>_empty`, `_free`, `_copy`, `_assign`, `_disp`); the
+`ownedKinds` and `dispKinds` registries route the relevant per-kind
+dispatch sites (declarations, scope-exit frees, the
+`mtoc_<kind>_assign` consume-replace pattern, `disp(s)`) through
+those generated helpers.
 
 Today only one binary op is defined for strings: `+` is concatenation
 (numbl's `"a" + "b" == "ab"`). Mixed string + numeric `+` is rejected with a

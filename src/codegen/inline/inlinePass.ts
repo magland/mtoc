@@ -536,6 +536,8 @@ function isPureElementwiseExpr(e: IRExpr): boolean {
     case "MakeRange":
     case "StringLit":
     case "CharLit":
+    case "MemberLoad":
+    case "StructLit":
       return false;
   }
 }
@@ -772,6 +774,20 @@ function appearsInNonSlotPosition(e: IRExpr, cName: string): boolean {
         appearsInNonSlotPosition(e.step, cName) ||
         appearsInNonSlotPosition(e.end, cName)
       );
+    case "MemberLoad":
+      // Member loads only target struct handles, never multi-element
+      // tensors. Any match inside the base counts as a non-slot use.
+      return appearsInNonSlotPosition(e.base, cName);
+    case "StructLit": {
+      // Struct literals don't feed elementwise iter loops; any inner
+      // reference is a non-slot use.
+      let found = false;
+      for (const f of e.fields) {
+        if (f.value.kind === "Var" && f.value.cName === cName) found = true;
+        if (appearsInNonSlotPosition(f.value, cName)) found = true;
+      }
+      return found;
+    }
   }
 }
 
@@ -794,6 +810,8 @@ function substituteVar(e: IRExpr, target: string, replacement: IRExpr): IRExpr {
     case "TensorLit":
     case "IndexSlice":
     case "MakeRange":
+    case "MemberLoad":
+    case "StructLit":
       return e;
     case "Binary": {
       const left = substituteVar(e.left, target, replacement);

@@ -178,20 +178,24 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // handle) and installs the new value in one step.
         //
         // The tensor case (multi-element double) splits on RHS kind:
-        // a non-Var, non-TensorLit, non-direct-Call RHS materializes
+        // a non-Var, non-MemberLoad, non-direct-Call RHS materializes
         // elementwise via a per-slot loop. A direct-Call RHS (user
         // function, or a non-elementwise builtin like `size` /
         // `reshape`) returns a fully-formed owned tensor by value —
         // the direct `mtoc_tensor_assign(&lhs, foo(args))` path
-        // consumes that handle without re-allocating. Strings and
-        // char arrays accept a Var (deep-copy) or any owned-producing
-        // expression directly (`StringLit`, `mtoc_string_concat(...)`,
-        // `mtoc_char_tensor_from_literal(...)`, user-function call).
+        // consumes that handle without re-allocating. A MemberLoad RHS
+        // reads a tensor handle from a struct field and is handled
+        // like Var-of-tensor: deep-copy via the kind's `copy` helper.
+        // Strings and char arrays accept a Var (deep-copy) or any
+        // owned-producing expression directly (`StringLit`,
+        // `mtoc_string_concat(...)`, `mtoc_char_tensor_from_literal(...)`,
+        // user-function call).
         if (
           isNumeric(s.ty) &&
           isMultiElement(s.ty) &&
           s.ty.elem === "double" &&
           s.rhs.kind !== "Var" &&
+          s.rhs.kind !== "MemberLoad" &&
           !isDirectOwnedCall(s.rhs)
         ) {
           emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
@@ -205,6 +209,12 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           const copyHelper = owned.copy(s.rhs.ty);
           useRuntimeByName(state, copyHelper);
           rhsExpr = `${copyHelper}(${s.rhs.cName})`;
+        } else if (s.rhs.kind === "MemberLoad") {
+          // Treat a struct-field read like a Var read: deep-copy so
+          // the assignment owns its own buffer.
+          const copyHelper = owned.copy(s.rhs.ty);
+          useRuntimeByName(state, copyHelper);
+          rhsExpr = `${copyHelper}(${emitExpr(state, s.rhs, 0)})`;
         } else {
           rhsExpr = emitExpr(state, s.rhs, 0);
         }
@@ -241,6 +251,37 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // slot (or stashed into a temp if it's complex / could
       // double-evaluate side effects).
       emitIndexSliceStore(state, level, s);
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
+    }
+
+    case "MemberStore": {
+      // Walk the fieldPath to build the C lvalue: `s.f1.f2....fn`.
+      const lhsAccess = `${s.base.cName}.${s.fieldPath.join(".")}`;
+      const owned = ownedOps(s.leafTy);
+      let rhsExpr: string;
+      if (owned !== null) {
+        // Owned leaf field: free the prior buffer / install the new
+        // value via the kind's `assign` helper. If the RHS is a `Var`
+        // of the same owned type, we deep-copy first so the field
+        // gets its own buffer (value semantics).
+        useRuntimeByName(state, owned.structSnippet);
+        useRuntimeByName(state, owned.assign);
+        if (s.rhs.kind === "Var") {
+          const copyHelper = owned.copy(s.rhs.ty);
+          useRuntimeByName(state, copyHelper);
+          rhsExpr = `${copyHelper}(${s.rhs.cName})`;
+        } else {
+          rhsExpr = emitExpr(state, s.rhs, 0);
+        }
+        pushStmt(state, level, `${owned.assign}(&${lhsAccess}, ${rhsExpr});`);
+      } else {
+        // Scalar leaf field: plain assignment. The RHS may also need
+        // a struct-typed write for a nested field path where the
+        // entire nested struct gets re-assigned (rare but legal).
+        rhsExpr = emitExpr(state, s.rhs, 0);
+        pushStmt(state, level, `${lhsAccess} = ${rhsExpr};`);
+      }
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
       break;
     }

@@ -21,6 +21,8 @@ import {
   isMultiElement,
   isNumeric,
   isString,
+  isStruct,
+  structMangledName,
   type MType,
 } from "../lowering/types.js";
 
@@ -102,6 +104,27 @@ export function ownedOps(ty: MType): OwnedKindOps | null {
   if (isCharArray(ty)) return CHAR_TENSOR_OPS;
   if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
     return DOUBLE_TENSOR_OPS;
+  }
+  if (isStruct(ty)) {
+    const name = structMangledName(ty);
+    // Helpers are emitted by `emitStruct.ts` directly into the output
+    // (one set per distinct struct shape). They're NOT registered in
+    // the runtime registry — no `useRuntimeByName` activation needed
+    // because the definitions are always present in the same C file
+    // when the typedef appears.
+    return {
+      cType: name,
+      // `structSnippet` is consumed by callers that try to activate
+      // the typedef via `useRuntimeByName`. Struct typedefs aren't in
+      // the runtime registry, so we set this to a sentinel name and
+      // intercept activation in callers that go through this path.
+      structSnippet: `__struct__:${name}`,
+      empty: `${name}_empty`,
+      free: `${name}_free`,
+      assign: `${name}_assign`,
+      copy: () => `${name}_copy`,
+      disp: () => `${name}_disp`,
+    };
   }
   return null;
 }

@@ -35,6 +35,7 @@ import { analyzeStmts } from "./emitAnalysis.js";
 import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
+import { emitStructBlocks } from "./emitStruct.js";
 import { inlinePass } from "./inline/inlinePass.js";
 import { isParallelThreadsOption } from "../build.js";
 
@@ -107,6 +108,11 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   for (const fn of prog.functions) analyzeStmts(state, fn.body);
   analyzeStmts(state, prog.stmts);
 
+  // Emit per-struct-type typedefs and helpers (empty/free/copy/assign/disp).
+  // These need to be above the user-function bodies and main, so users
+  // can declare struct-typed locals.
+  const structBlocks = emitStructBlocks(state, prog);
+
   // Emit user-function bodies first into separate buffers; we paste
   // them into the output below, before main.
   const functionBlocks: string[][] = prog.functions.map(fn =>
@@ -164,6 +170,9 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   const out: string[] = [...headers, ""];
   for (const block of runtimeBlocks) {
     out.push(block, "");
+  }
+  if (structBlocks.length > 0) {
+    out.push(...structBlocks);
   }
   for (const fnLines of functionBlocks) {
     out.push(...fnLines, "");

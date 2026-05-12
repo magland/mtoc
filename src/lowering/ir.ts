@@ -182,6 +182,32 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Struct constructor / aggregate literal. Produced by the
+       *  `struct('f1', v1, ...)` constructor and as the result of the
+       *  pre-pass-driven "fresh struct" assignment shape. Codegen
+       *  emits a C99 compound literal: `(<typedef>){.f1 = v1, ...}`.
+       *  Field-valued sub-expressions follow the same ANF rules as
+       *  TensorLit cells — multi-element / string / nested-struct
+       *  fields get hoisted to temps so each `value` is a scalar /
+       *  literal / Var. */
+      kind: "StructLit";
+      fields: Array<{ name: string; value: IRExpr }>;
+      ty: MType;
+      span: Span;
+    }
+  | {
+      /** Read a field of a scalar struct: `s.x`, or chains like
+       *  `s.inner.x`. `base` is itself an IRExpr (typically a `Var`
+       *  for the root struct read, or a nested `MemberLoad` for the
+       *  chained case). `ty` is the field's static type. Codegen
+       *  emits `<base>.<field>`. */
+      kind: "MemberLoad";
+      base: IRExpr;
+      field: string;
+      ty: MType;
+      span: Span;
+    }
+  | {
       /** Reference to the `end` keyword inside an index expression.
        *  Resolved at lowering time to the relevant axis size of the
        *  enclosing index's base. The result is a nonneg long-valued
@@ -257,6 +283,24 @@ export type IRStmt =
       cName: string;
       rhs: IRExpr;
       ty: MType;
+      span: Span;
+    }
+  | {
+      /** Field write into a scalar struct: `s.f = rhs`, possibly
+       *  through a chained path: `outer.inner.x = rhs`. `base` is the
+       *  root struct Var; `fieldPath` is the ordered list of field
+       *  names from outermost to innermost (`['inner', 'x']` in the
+       *  example). The leaf field's static type is `leafTy`; the RHS
+       *  must have that type. Codegen emits one of:
+       *    - scalar leaf:   `<base>.<f1>.<f2>...<fn> = rhs;`
+       *    - owned leaf:    `mtoc_<kind>_assign(&<base>.<f1>...<fn>, rhs);`
+       *  When the RHS is a `Var` of an owned type, codegen wraps in
+       *  the kind's `copy` helper to preserve value semantics. */
+      kind: "MemberStore";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      fieldPath: ReadonlyArray<string>;
+      leafTy: MType;
+      rhs: IRExpr;
       span: Span;
     }
   | {

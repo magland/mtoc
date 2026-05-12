@@ -36,9 +36,11 @@ import {
   absentDefaultFor,
   canShareStorage,
   isMultiElement,
+  isNumeric,
   isScalarComplex,
   isScalarReal,
   isString,
+  isStruct,
   MType,
   NumericType,
   charArrayType,
@@ -51,6 +53,14 @@ import {
   unify,
   type DimInfo,
 } from "./types.js";
+
+import { collectStructShapes, type StructShape } from "./structPrePass.js";
+import {
+  lookupStructTypeForRoot,
+  lowerMemberRead,
+  lowerMemberStore,
+  lowerStructConstructor,
+} from "./lowerStruct.js";
 
 import { lowerIf } from "./lowerIf.js";
 import { lowerFor } from "./lowerFor.js";
@@ -73,6 +83,7 @@ import {
   forEachTopLevelExpr,
 } from "./walk.js";
 import { anfNormalize, classifyOwnedExpr, ownedExprMessage } from "./anf.js";
+import { normalizeStructTypes } from "./normalizeStructTypes.js";
 
 // Reserved C identifiers that need mangling. Mirrors numbl's
 // cJit/codegen.ts list. Centralized here so emit.ts never has to
@@ -209,6 +220,22 @@ export class Lowerer {
     axis: number | "linear";
   }> = [];
 
+  /** Per-root struct shape map computed by `collectStructShapes`
+   *  before body lowering starts. Empty when no struct lvalues or
+   *  `struct(...)` constructors appear in the scope. The lowering
+   *  helpers in `lowerStruct.ts` read this to know the variable's
+   *  static field-set; the storage-category mismatch check in
+   *  `recordAssignment` then keeps the shape stable across the
+   *  variable's lifetime. */
+  structShapes: Map<string, StructShape> = new Map();
+
+  /** Per-root struct field-type tracking. Keyed by root var name,
+   *  each entry maps dotted field paths (`"x"`, `"inner.y"`) to the
+   *  current MType. Updated by `lowerMemberStore` and consulted by
+   *  `lookupStructTypeForRoot` to assemble the variable's current
+   *  `StructType`. */
+  structFieldTypes: Map<string, Map<string, MType>> = new Map();
+
   /** Function-specialization cache + workspace handle. Helpers in
    *  sibling files reach through this for user-call dispatch. */
   readonly shared: SharedSpecState;
@@ -236,6 +263,21 @@ export class Lowerer {
     this.outputVars = outputVars;
     this.isInsideFunction = isInsideFunction;
     this.currentFile = currentFile ?? shared.workspace.mainFile;
+  }
+
+  /** Populate `structShapes` for the body about to be lowered. Called
+   *  once before the body's stmts are visited. Subsequent calls for
+   *  the same Lowerer are no-ops — only the first scope-level body
+   *  should drive the pre-pass. */
+  primeStructShapes(body: ReadonlyArray<Stmt>): void {
+    this.structShapes = collectStructShapes(body);
+  }
+
+  /** Build a `StructType` for `rootName` reflecting the current
+   *  field-type tracking. Returns undefined if the variable is not in
+   *  the pre-pass shape map. */
+  currentStructTypeFor(rootName: string): MType | undefined {
+    return lookupStructTypeForRoot.call(this, rootName);
   }
 
   /** Run `fn` with `controlDepth` incremented; restored on exit. Used by
@@ -331,7 +373,7 @@ export class Lowerer {
     }
 
     const merged = unify(prevBinding.ty, ty);
-    if (canShareStorage(prevBinding.ty, ty)) {
+    if (canShareStorage(prevBinding.ty, ty) && merged.kind !== "Unknown") {
       // Compatible — widen the existing binding's type in place. The
       // merged type stays consistent with the predeclared C variable's
       // category (scalar/tensor, real/complex); shape-level coarsening
@@ -527,34 +569,66 @@ export class Lowerer {
 
       case "Assign": {
         const rhs = this.lowerExpr(s.expr);
-        const cName = this.recordAssignment(s.name, rhs.ty, s.span);
+        // If the RHS is a StructLit and the LHS is in the pre-pass
+        // struct-shape map, widen the RHS to the full struct shape
+        // for the variable (other fields stay as their previously-
+        // recorded types, or scalarDouble("zero") as the absent
+        // default). This way `s = struct('x', 1)` followed later by
+        // `s.y = 2` both reference the same `Struct{x,y}` typedef.
+        let rhsTy = rhs.ty;
+        let assignRhs = rhs;
+        if (rhs.kind === "StructLit" && this.structShapes.has(s.name)) {
+          // Refresh the per-field tracking with the constructor's fields.
+          let fieldTypes = this.structFieldTypes.get(s.name);
+          if (fieldTypes === undefined) {
+            fieldTypes = new Map();
+            this.structFieldTypes.set(s.name, fieldTypes);
+          }
+          for (const f of rhs.fields) {
+            fieldTypes.set(f.name, f.value.ty);
+          }
+          const fullTy = this.currentStructTypeFor(s.name);
+          if (fullTy !== undefined && isStruct(fullTy)) {
+            rhsTy = fullTy;
+            // Reshape the StructLit to match the full struct type —
+            // emit-time will translate it via a designated-init
+            // compound literal, so missing-field defaults are filled
+            // by C's `{}` zero rule.
+            assignRhs = {
+              ...rhs,
+              ty: fullTy,
+            };
+          }
+        }
+        const cName = this.recordAssignment(s.name, rhsTy, s.span);
         return {
           kind: "Assign",
           name: s.name,
           cName,
-          rhs,
-          ty: rhs.ty,
+          rhs: assignRhs,
+          ty: rhsTy,
           span: s.span,
         };
       }
 
       case "AssignLValue": {
         // The parser produces this for any non-bare-identifier LHS:
-        // `v(i) = x`, `obj.field = x`, `M(i,j) = x`, etc. We only
-        // handle the indexed-write form today; other lvalue kinds
-        // raise UnsupportedConstruct with a span.
-        if (s.lvalue.type !== "Index") {
-          throw new UnsupportedConstruct(
-            `assignment to a ${s.lvalue.type} lvalue is not yet supported`,
-            s.span
-          );
+        // `v(i) = x`, `obj.field = x`, `M(i,j) = x`, etc.
+        if (s.lvalue.type === "Index") {
+          // Range/colon slot routes to the slice-write path; otherwise
+          // it's a scalar IndexStore.
+          if (s.lvalue.indices.some(isSliceArg)) {
+            return lowerIndexSliceStore.call(this, s.lvalue, s.expr, s.span);
+          }
+          return lowerIndexStore.call(this, s.lvalue, s.expr, s.span);
         }
-        // Range/colon slot routes to the slice-write path; otherwise
-        // it's a scalar IndexStore.
-        if (s.lvalue.indices.some(isSliceArg)) {
-          return lowerIndexSliceStore.call(this, s.lvalue, s.expr, s.span);
+        if (s.lvalue.type === "Member") {
+          return lowerMemberStore.call(this, s.lvalue, s.expr, s.span);
         }
-        return lowerIndexStore.call(this, s.lvalue, s.expr, s.span);
+        throw new UnsupportedConstruct(
+          `assignment to a ${s.lvalue.type} lvalue is not yet supported`,
+          s.span
+        );
       }
 
       case "ExprStmt": {
@@ -869,7 +943,107 @@ export class Lowerer {
         return lowerTensorLiteral.call(this, e);
 
       case "FuncCall":
+        // Special-case the `struct(...)` constructor before generic
+        // function-call dispatch — it shouldn't go through the
+        // builtin/user-function resolver (no such function exists in
+        // the workspace).
+        if (e.name === "struct" && this.envLookup(e.name) === undefined) {
+          return lowerStructConstructor.call(this, e);
+        }
         return lowerFuncCall.call(this, e);
+
+      case "Member":
+        return lowerMemberRead.call(this, e);
+
+      case "MemberDynamic":
+        throw new UnsupportedConstruct(
+          `dynamic field access ('s.(name)') is not yet supported`,
+          e.span
+        );
+
+      case "MethodCall": {
+        // The parser produces `MethodCall { base, name, args }` for
+        // `obj.name(args)`. When the base resolves to a struct and
+        // `name` is one of its fields, this is `(obj.name)(args)` —
+        // an indexed read of the struct's field. mtoc supports that
+        // case as scalar / range index into a numeric-tensor field.
+        // True method dispatch (class-instance methods) is rejected.
+        const memberExpr: Expr = {
+          type: "Member",
+          base: e.base,
+          name: e.name,
+          span: e.span,
+        };
+        const memberIr = lowerMemberRead.call(
+          this,
+          memberExpr as Extract<Expr, { type: "Member" }>
+        );
+        if (e.args.length === 0) return memberIr;
+        if (!isNumeric(memberIr.ty) || !isMultiElement(memberIr.ty)) {
+          throw new UnsupportedConstruct(
+            `indexing into struct field '${e.name}' requires a tensor field (got ${typeToString(memberIr.ty)})`,
+            e.span
+          );
+        }
+        // Build a synthetic Var node whose `cName` is the C-side
+        // path expression `<base>.<field1>.<field2>...` — codegen
+        // emits `<cName>.real[<offset>]` for tensor indexing, which
+        // ends up as `s.vec.real[...]` (right C code).
+        // We walk the MemberLoad chain to gather the path.
+        const fieldPath: string[] = [];
+        let cur: IRExpr = memberIr;
+        while (cur.kind === "MemberLoad") {
+          fieldPath.unshift(cur.field);
+          cur = cur.base;
+        }
+        if (cur.kind !== "Var") {
+          throw new UnsupportedConstruct(
+            `indexing into a complex struct-field expression is not yet supported by mtoc`,
+            e.span
+          );
+        }
+        const syntheticBase: IRExpr = {
+          kind: "Var",
+          name: `${cur.name}.${fieldPath.join(".")}`,
+          cName: `${cur.cName}.${fieldPath.join(".")}`,
+          ty: memberIr.ty,
+          span: e.span,
+        };
+        // Now route the indices through `lowerIndexLoad` by manually
+        // building it: we already have a Var-shape base + the args.
+        // Delegate to lowerIndexLoad via a small shim. To avoid
+        // duplicating the bounds/arity checks, we inline the equivalent
+        // here for the scalar-index case. Range / colon slots aren't
+        // supported on struct fields in v1 — assign to a name first.
+        if (e.args.some(a => a.type === "Range" || a.type === "Colon")) {
+          throw new UnsupportedConstruct(
+            `range / colon indexing on a struct-field expression ('s.field(a:b)') is not yet supported; assign the field to a name first`,
+            e.span
+          );
+        }
+        const indices = e.args.map(a => this.lowerExpr(a));
+        for (let i = 0; i < indices.length; i++) {
+          if (!isScalarReal(indices[i].ty)) {
+            throw new TypeError(
+              `index ${i + 1} of 's.${e.name}(...)' must be a real scalar (got ${typeToString(indices[i].ty)})`,
+              e.args[i].span
+            );
+          }
+        }
+        const baseTy = memberIr.ty;
+        // Result is a scalar of the base's elem / complex.
+        const resultTy: MType =
+          isNumeric(baseTy) && baseTy.isComplex
+            ? scalarComplex()
+            : scalarDouble("unknown");
+        return {
+          kind: "IndexLoad",
+          base: syntheticBase as Extract<IRExpr, { kind: "Var" }>,
+          indices,
+          ty: resultTy,
+          span: e.span,
+        };
+      }
 
       case "Range":
         return this.lowerBareRange(e);
@@ -961,6 +1135,9 @@ function validateStmt(s: IRStmt): void {
     } else if (top === "user-call" || top === "builtin-call") {
       const call = s.rhs as Extract<IRExpr, { kind: "Call" }>;
       for (const a of call.args) rejectNestedOwnedExpr(a);
+    } else if (top === "struct-lit") {
+      const lit = s.rhs as Extract<IRExpr, { kind: "StructLit" }>;
+      for (const f of lit.fields) rejectNestedOwnedExpr(f.value);
     } else {
       rejectNestedOwnedExpr(s.rhs);
       if (isMultiElement(s.rhs.ty)) {
@@ -1044,6 +1221,7 @@ export function lower(
     inFlight: new Set(),
   };
   const top = new Lowerer(shared);
+  top.primeStructShapes(bodyToLower);
   const stmts = top.lowerStmts(bodyToLower);
   const prog: IRProgram = {
     assignedVars: top.getAssignedVars(),
@@ -1055,6 +1233,11 @@ export function lower(
   // `_mtoc_anf_<N> = <producer>;` Assign. After this pass the IR
   // satisfies the invariant `validateIR` enforces.
   anfNormalize(prog);
+  // Normalize struct-typed IR nodes so every reference to the same
+  // variable carries the final (post-widening) type. Without this,
+  // intermediate widening states leak into the IR and the codegen
+  // emits multiple distinct typedefs for the same logical variable.
+  normalizeStructTypes(prog);
   validateIR(prog);
   return prog;
 }

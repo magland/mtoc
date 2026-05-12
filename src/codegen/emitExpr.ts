@@ -20,9 +20,12 @@ import {
   isNumeric,
   isScalar,
   isString,
+  isStruct,
+  structMangledName,
   typeToString,
   type MType,
   type NumericType,
+  type StructType,
 } from "../lowering/types.js";
 import { forEachSubExpr } from "../lowering/walk.js";
 import { isDirectOwnedCall } from "../lowering/anf.js";
@@ -146,17 +149,18 @@ export function wrapTextView(
 
 /** Copy-on-arg-pass: wrap an owned-typed argument in its kind's `copy`
  *  helper so the callee gets a freshly-owned value to manage. Tensors
- *  (real / complex) and char arrays follow this protocol; strings
- *  don't — they're not yet accepted as user-function args. Returns
- *  `inner` unchanged for non-owned arg types. Activates the chosen
- *  copy helper as a side effect. */
+ *  (real / complex), char arrays, and structs follow this protocol;
+ *  strings don't — they're not yet accepted as user-function args.
+ *  Returns `inner` unchanged for non-owned arg types. Activates the
+ *  chosen copy helper as a side effect. */
 export function wrapOwnedArgCopy(
   state: EmitState,
   argTy: MType,
   inner: string
 ): string {
   const owned = ownedOps(argTy);
-  if (owned === null || !isMultiElement(argTy)) return inner;
+  if (owned === null) return inner;
+  if (!isMultiElement(argTy) && !isStruct(argTy)) return inner;
   const helper = owned.copy(argTy);
   useRuntimeByName(state, helper);
   return `${helper}(${inner})`;
@@ -186,6 +190,7 @@ export function emitExpr(
     e.kind !== "Var" &&
     e.kind !== "TensorLit" &&
     e.kind !== "CharLit" &&
+    e.kind !== "MemberLoad" &&
     !isDirectOwnedCall(e) &&
     isMultiElement(e.ty)
   ) {
@@ -446,6 +451,62 @@ export function emitExpr(
         );
       }
       return `${baseCName}.real[${offset}]`;
+    }
+
+    case "MemberLoad": {
+      // `<base>.<field>`. The base is rendered as a plain C expression
+      // (a Var, a nested MemberLoad, etc.). If we're inside an iter
+      // loop the base may be a multi-element Var that renders to
+      // `<cName>.real[<iter>]` — but MemberLoad only applies to struct
+      // values, which are never multi-element. So emit the base in
+      // expression context (no iter substitution).
+      const baseStr = emitExpr(state, e.base, parentPrec);
+      return `${baseStr}.${e.field}`;
+    }
+
+    case "StructLit": {
+      // C99 designated-initializer compound literal. For each field
+      // present in the struct's TY (which may include fields the
+      // user didn't initialize), we look up the matching value
+      // entry; missing fields default to `{0}` (and any owned-typed
+      // missing field stays zero-initialized — `mtoc_string_t {0}`
+      // is a valid empty handle, ditto tensors / nested structs).
+      if (!isStruct(e.ty)) {
+        throw new Error(
+          `codegen internal: StructLit with non-struct type ${typeToString(e.ty)}`
+        );
+      }
+      const sty: StructType = e.ty;
+      const name = structMangledName(sty);
+      const valueByName = new Map<string, IRExpr>();
+      for (const f of e.fields) valueByName.set(f.name, f.value);
+      const inits: string[] = [];
+      for (const field of sty.fields) {
+        const val = valueByName.get(field.name);
+        if (val === undefined) {
+          // Field present in shape but not specified in this literal.
+          // C99 zero-init via designated initializer requires us to
+          // omit the field — `{ .x = 1 }` zeros every unmentioned slot.
+          continue;
+        }
+        // Field-valued owned RHS gets a deep copy if it's a Var, so
+        // the struct gets its own copy of the buffer (matching the
+        // semantics user code expects from struct-by-value moves).
+        const owned = ownedOps(field.type);
+        let valStr = emitExpr(state, val, 0);
+        if (owned !== null && val.kind === "Var") {
+          const copyHelper = owned.copy(val.ty);
+          useRuntimeByName(state, copyHelper);
+          valStr = `${copyHelper}(${val.cName})`;
+        }
+        inits.push(`.${field.name} = ${valStr}`);
+      }
+      if (inits.length === 0) {
+        // Empty struct literal: `(typedef){0}`. C99 says `{0}` zeros
+        // every slot — same as `_empty()`.
+        return `(${name}){0}`;
+      }
+      return `(${name}){${inits.join(", ")}}`;
     }
 
     case "Unary": {

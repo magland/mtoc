@@ -171,8 +171,22 @@ export function useRuntime(
 
 /** Activate a snippet looked up from the registry by name. Throws if
  *  the name isn't registered — that means a codegen path is referring
- *  to a helper that doesn't exist. */
+ *  to a helper that doesn't exist.
+ *
+ *  Struct typedefs use the sentinel form `__struct__:<mangled>` (see
+ *  `ownedKinds.ts::ownedOps`). The definitions for those typedefs are
+ *  emitted directly by `emitStruct.ts` ahead of the user functions,
+ *  not registered in the runtime helper table — activation here is
+ *  a deliberate no-op so callers can uniformly call
+ *  `useRuntimeByName(state, owned.structSnippet)` regardless of kind. */
 export function useRuntimeByName(state: EmitState, name: string): void {
+  // Struct typedefs + their generated helpers (`<typedef>_empty`,
+  // `_free`, `_copy`, `_assign`, `_disp`) are emitted directly by
+  // `emitStruct.ts` ahead of every user function; they're not in the
+  // runtime registry, so activation here is a no-op so callers can
+  // uniformly call useRuntimeByName regardless of kind.
+  if (name.startsWith("__struct__:")) return;
+  if (name.startsWith("_mtoc_struct__")) return;
   const snippet = RUNTIME_HELPERS.get(name);
   if (!snippet) {
     throw new Error(`codegen: unknown runtime helper '${name}'`);

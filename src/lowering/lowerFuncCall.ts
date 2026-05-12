@@ -22,6 +22,7 @@ import {
   isOwned,
   isScalar,
   isScalarReal,
+  isStruct,
   isNumeric,
   isVector,
   scalarDouble,
@@ -590,9 +591,9 @@ export function specializeUserCall(
   }
   const args = argExprs.map(a => this.lowerExpr(a));
   for (const a of args) {
-    if (!isNumeric(a.ty)) {
+    if (!isNumeric(a.ty) && !isStruct(a.ty)) {
       throw new UnsupportedConstruct(
-        `function '${name}' only accepts numeric arguments ` +
+        `function '${name}' only accepts numeric or struct arguments ` +
           `(got ${typeToString(a.ty)})`,
         a.span
       );
@@ -611,6 +612,56 @@ export function specializeUserCall(
     spec = specialize.call(this, name, fnAst, fnFile, argTypes, mangledName);
   }
   return { args, mangledName, spec };
+}
+
+/** When a function parameter is a struct, seed the inner lowerer's
+ *  per-root field-type tracking so member reads on the param work
+ *  even before the body has assigned through it. Also augment the
+ *  pre-pass struct-shape map to reflect the param's call-site shape.
+ *  Recurses into nested-struct fields. */
+function seedStructParamFieldTypes(
+  inner: Lowerer,
+  rootName: string,
+  ty: MType
+): void {
+  if (!isStruct(ty)) return;
+  let shape = inner.structShapes.get(rootName);
+  if (shape === undefined) {
+    shape = { fields: new Map(), firstSpan: { file: "", start: 0, end: 0 } };
+    inner.structShapes.set(rootName, shape);
+  }
+  let fieldTypes = inner.structFieldTypes.get(rootName);
+  if (fieldTypes === undefined) {
+    fieldTypes = new Map();
+    inner.structFieldTypes.set(rootName, fieldTypes);
+  }
+  seedShape(shape, fieldTypes, ty, []);
+}
+
+function seedShape(
+  shape: import("./structPrePass.js").StructShape,
+  fieldTypes: Map<string, MType>,
+  ty: import("./types.js").StructType,
+  pathSoFar: string[]
+): void {
+  for (const f of ty.fields) {
+    const newPath = [...pathSoFar, f.name];
+    if (isStruct(f.type)) {
+      let nested = shape.fields.get(f.name);
+      if (nested === undefined || nested === null) {
+        nested = { fields: new Map(), firstSpan: shape.firstSpan };
+        shape.fields.set(f.name, nested);
+      }
+      seedShape(nested, fieldTypes, f.type, newPath);
+    } else {
+      if (!shape.fields.has(f.name)) {
+        shape.fields.set(f.name, null);
+      }
+      if (!fieldTypes.has(newPath.join("."))) {
+        fieldTypes.set(newPath.join("."), f.type);
+      }
+    }
+  }
 }
 
 /**
@@ -696,6 +747,23 @@ function specialize(
       true,
       fnFile
     );
+    // Pre-pass the function body to collect struct field-sets per
+    // root variable. Struct params are already in env with their
+    // call-site type — the pre-pass output ONLY adds shapes for
+    // variables that get a member assignment (or a `struct(...)`
+    // constructor) inside the body itself; param-name entries in
+    // the shape map only appear if the body assigns through that
+    // param. The first member assignment to a struct PARAM has a
+    // shape (from the call-site type) and a pre-pass shape — they
+    // must agree, which is checked in `lowerMemberStore`.
+    inner.primeStructShapes(fnAst.body);
+    // For struct params: seed the per-root field-type tracking with
+    // the call-site param types so a member-load on an unassigned
+    // field still works (you can read a struct field of a parameter
+    // without first assigning it).
+    for (const p of paramBindings) {
+      seedStructParamFieldTypes(inner, p.name, p.ty);
+    }
     const body = inner.lowerStmts(fnAst.body);
     // After body lowering: every declared output must have an assigned
     // type on every path, and must be a scalar (tensor returns aren't

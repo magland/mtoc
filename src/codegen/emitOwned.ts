@@ -21,6 +21,7 @@ import {
   isMultiElement,
   isScalarComplex,
   isScalarReal,
+  isStruct,
   typeToString,
 } from "../lowering/types.js";
 import { ownedOps } from "./ownedKinds.js";
@@ -120,7 +121,7 @@ export function functionFreeOnExitSet(
 ): ReadonlyMap<string, VarBinding> {
   const out = new Map<string, VarBinding>(fn.assignedVars);
   for (const p of fn.params) {
-    if (isMultiElement(p.ty)) {
+    if (isMultiElement(p.ty) || isStruct(p.ty)) {
       out.set(p.cName, { ty: p.ty, cName: p.cName });
     }
   }

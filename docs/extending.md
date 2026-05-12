@@ -92,11 +92,27 @@ change with predictable plug-in points. The pieces:
    `Disp` IRStmt arm in `emitStmt` is one lookup — no edit needed.
 5. Extend `cTypeFor` in `types.ts` so codegen knows the C type to
    declare.
-6. Drop the `.h` files for the C-side struct + helpers under
-   `src/codegen/runtime/` and register them in the runtime helpers
-   map.
+6. If the new kind has a per-shape typedef (one C type per distinct
+   instance, like struct's `_mtoc_struct__<hash>`), generate those
+   typedefs + their owned-kind helpers from codegen rather than
+   pre-writing them as `.h` files. `src/codegen/emitStruct.ts` is the
+   reference: walk the program, collect every distinct shape (keyed
+   by the kind's mangled name), topologically sort by nesting, and
+   render typedef + `<typedef>_empty` / `_free` / `_copy` / `_assign` /
+   `_disp` blocks ahead of the user-function bodies. `useRuntimeByName`
+   has prefix-based short-circuits so generated-helper names skip
+   runtime-registry activation. If, instead, the new kind has a
+   single fixed C representation (like `mtoc_string_t`), drop the
+   `.h` file under `src/codegen/runtime/` and register it in the
+   runtime helpers map.
 7. Lower a parser-side producer (`{a,b,c}` cell literal, `s.field`
    member access, …) to a new IR node or extend an existing one.
+8. If the kind has VARIABLE per-instance typedefs (struct's case),
+   add a post-lowering normalization pass that rewrites every IR
+   node's `.ty` to use the FINAL widened type from `assignedVars`.
+   Without this pass, intermediate widening states leak into the IR
+   and the codegen emits multiple typedefs for the same logical
+   variable. `src/lowering/normalizeStructTypes.ts` is the reference.
 
 The intent is that touching the per-kind registries is enough — the
 walkers, validators, and pass machinery should not learn the new
