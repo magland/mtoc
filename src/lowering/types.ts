@@ -684,53 +684,48 @@ function arithSign(op: ArithKind, a: Sign, b: Sign): Sign {
   }
 }
 
-/** Per-axis compatibility for tensor⊙tensor arithmetic. mtoc accepts
- *  elementwise ops only when both operands share the same shape at
- *  runtime — no implicit expansion. Statically that rules out any
- *  axis pair where one side is provably 1 and the other is provably
- *  larger (rowVec-vs-colVec) *or* unknown (where the unknown side
- *  might be larger and trigger broadcasting). Same-category pairs
- *  and (notOne, unknown) survive — the latter could still mismatch
- *  at runtime, where `mtoc_check_shape` traps it. */
-function dimAccept(a: DimInfo, b: DimInfo): boolean {
-  if (a.kind === "one" && b.kind !== "one") return false;
-  if (b.kind === "one" && a.kind !== "one") return false;
-  return true;
-}
-
-/** Result dim under the same-shape-required rule. Assumes
- *  `dimAccept(a, b)`, so the (one, ¬one) pair never reaches here.
- *  For surviving pairs the result is whichever side is more
- *  refined: a `notOne` wins over `unknown` because if both runtime
- *  sizes agree, the size is the `notOne` side's. */
-function dimJoin(a: DimInfo, b: DimInfo): DimInfo {
-  if (a.kind === b.kind) return a;
-  if (a.kind === "unknown") return b;
-  if (b.kind === "unknown") return a;
-  // Per dimAccept's contract, the (one, notOne) pair never gets here.
+/** Per-axis result under MATLAB's implicit-expansion (broadcasting)
+ *  rule: an axis of size 1 expands to match the other operand's size.
+ *  Combined statically over the DimInfo lattice:
+ *    (one, one)            → one
+ *    (one, notOne)         → notOne          (the `one` side expands)
+ *    (one, unknown)        → unknown         (other side might be 1 or not)
+ *    (notOne, notOne)      → notOne          (must match at runtime; both
+ *                                              not-1 ⇒ result not-1)
+ *    (notOne, unknown)     → notOne          (unknown is either 1 → notOne
+ *                                              expands, or matches → notOne)
+ *    (unknown, unknown)    → unknown
+ *    (symmetric closure)
+ *  Note: no static rejection — two `notOne` axes of different runtime
+ *  sizes are caught at runtime by `mtoc_broadcast_dim`. */
+function dimBroadcast(a: DimInfo, b: DimInfo): DimInfo {
+  if (a.kind === "one") return b;
+  if (b.kind === "one") return a;
+  // Both are notOne or unknown. `notOne` wins over `unknown` because
+  // either the unknown side is 1 (broadcasts to notOne) or it matches
+  // notOne at runtime — both yield a notOne result.
+  if (a.kind === "notOne" || b.kind === "notOne") return { kind: "notOne" };
   return { kind: "unknown" };
 }
 
-/** Combine two shape arrays under the same-shape-required elementwise
- *  rule. Pads the shorter with `{kind: "one"}` to
- *  `max(a.length, b.length, 2)`, then joins per-axis. Returns `null`
- *  when any axis fails `dimAccept` — the static "would-need-implicit-
- *  expansion" cases. Same-shape-but-different-sizes still slips
- *  through (runtime data); `mtoc_check_shape` covers it at runtime.
+/** Combine two shape arrays under the broadcasting rule. Pads the
+ *  shorter with `{kind: "one"}` to `max(a.length, b.length, 2)`, then
+ *  broadcasts per-axis. Never returns null — every pair is statically
+ *  compatible under broadcasting; runtime size mismatch (two non-1
+ *  axes that don't match) is trapped by `mtoc_broadcast_dim`.
  *
  *  Result is unnormalized — caller passes through `numericTypeND` /
  *  `normalizeDims` to strip trailing singletons. */
 export function broadcastShape(
   a: readonly DimInfo[],
   b: readonly DimInfo[]
-): readonly DimInfo[] | null {
+): readonly DimInfo[] {
   const len = Math.max(a.length, b.length, 2);
   const result: DimInfo[] = [];
   for (let i = 0; i < len; i++) {
     const ai = a[i] ?? DIM_ONE;
     const bi = b[i] ?? DIM_ONE;
-    if (!dimAccept(ai, bi)) return null;
-    result.push(dimJoin(ai, bi));
+    result.push(dimBroadcast(ai, bi));
   }
   return result;
 }
@@ -738,17 +733,15 @@ export function broadcastShape(
 /**
  * Result of an arithmetic binary op on two values.
  *
- * The shape rule:
+ * The shape rule (MATLAB implicit expansion / broadcasting):
  *  - scalar ⊙ scalar       → scalar
- *  - scalar ⊙ tensor       → tensor (same shape as the tensor)  — broadcast
- *  - tensor ⊙ scalar       → tensor (same shape as the tensor)  — broadcast
- *  - tensor ⊙ tensor       → if dims are pointwise compatible
- *                            (see `dimAccept`), the result takes the
- *                            most-refined dim per axis. Categorical
- *                            mismatches (rowVec + colVec, etc.) reject.
- *                            Specific size matching is runtime data —
- *                            not checked here; codegen will pick that
- *                            up in a follow-up stage.
+ *  - scalar ⊙ tensor       → tensor (same shape as the tensor)
+ *  - tensor ⊙ scalar       → tensor (same shape as the tensor)
+ *  - tensor ⊙ tensor       → per-axis broadcast (`broadcastShape`):
+ *                            an axis of size 1 expands to match the
+ *                            other operand. Runtime size mismatch
+ *                            between two non-1 axes is trapped by
+ *                            `mtoc_broadcast_dim`.
  *
  * For `Mul`/`Div`, tensor⊙tensor is *not* element-wise in MATLAB —
  * it's matrix multiply / matrix divide. We do not support those yet,
@@ -779,18 +772,14 @@ export function arithResult(op: ArithKind, a: MType, b: MType): MType {
     return numericTypeND([DIM_ONE, DIM_ONE], isComplex, sign, resultElem);
   }
   if (aSc || bSc) {
-    // Scalar broadcasts to the other operand's shape.
+    // Scalar broadcasts to the other operand's shape — fast-path so
+    // the legacy 2-D `scalar+tensor` emission stays byte-identical
+    // with the pre-broadcasting form.
     const tensor = aSc ? b : a;
     return numericTypeND(tensor.dims, isComplex, sign, resultElem);
   }
-  // Both are tensors — only elementwise (Add/Sub) is allowed today
-  // when we route here. Mul/Div on two tensors are matrix multiply /
-  // matrix divide (deferred), but the lowerer maps `.* ./` to
-  // `Mul`/`Div` in the abstract kind too, so we accept those here for
-  // same-shape and reject in the lowerer's path that distinguishes
-  // `Mul` from `ElemMul`.
+  // Both are tensors — per-axis broadcast.
   const broadcasted = broadcastShape(a.dims, b.dims);
-  if (broadcasted === null) return { kind: "Unknown" };
   return numericTypeND(broadcasted, isComplex, sign, resultElem);
 }
 

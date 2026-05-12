@@ -158,6 +158,12 @@ The subset is growing iteratively. Roughly:
   [docs/limitations.md](docs/limitations.md)
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum` / `min` / `max` reductions, `length`, `numel`
+- **Broadcasting (implicit expansion)** on elementwise arithmetic and
+  comparison ops: `row + col`, `M + r`, `A + M` (with `A` 3-D and `M`
+  2-D), `row .* col`, `a < b` on differently-shaped tensors. Same-shape
+  cases stay on the legacy flat-iter path; differing-shape cases route
+  through a runtime broadcast-dim check + per-operand stride table.
+  CharLit broadcasting is not yet wired.
 - Non-conjugate transpose `.'` on 2-D real / complex tensors. The imag
   lane is reordered but not negated (that's `'` — conjugate transpose,
   not yet wired). Char arrays and `ndim > 2` are rejected at lowering

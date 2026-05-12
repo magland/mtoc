@@ -99,6 +99,17 @@ Lowering does several jobs in one walk:
   renders the call once per element with each tensor arg collapsed to
   `<v>.real[<iter>]`. See `docs/builtins.md` for details. `.^` and
   comparison operators (`==`, `<`, etc.) ride the same path.
+- **Broadcasting (`emitBroadcastAssign`)**: when multi-element operands
+  have _differing_ static shapes (row vec + col vec, matrix +
+  column-broadcast, 3-D + 2-D), `emitTensorAssignFromExpr` dispatches
+  to a nested-loop emitter that computes the output shape via
+  `mtoc_broadcast_dim` chains and precomputes a per-operand linear
+  index inside the inner loop. A statically-`one` axis drops out of
+  the index expression (the operand reuses one element while the loop
+  advances on that axis); `unknown` axes take a runtime `?:` against
+  the operand's dim field. Same-shape operands still use the legacy
+  flat-iter path so the byte-for-byte form of all pre-existing tests
+  is preserved.
 - **ANF normalization (`src/lowering/anf.ts`)**: a post-lowering pass that
   hoists every owned-producing sub-expression (TensorLit, IndexSlice,
   string concat, user-function call returning an owned kind) out of

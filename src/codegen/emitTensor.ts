@@ -39,6 +39,20 @@ function findShapeSourceVar(
   );
 }
 
+/** True when two multi-element operand types have the same static
+ *  shape under the dim lattice. Used by the broadcast dispatcher to
+ *  decide between the flat-iter path (all operands same shape; one
+ *  shared loop variable suffices) and the broadcast path (per-axis
+ *  size-1 expansion required). Different ndim ⇒ different shape;
+ *  same ndim with any axis-kind mismatch ⇒ different shape. */
+function sameStaticShape(a: NumericType, b: NumericType): boolean {
+  if (a.dims.length !== b.dims.length) return false;
+  for (let i = 0; i < a.dims.length; i++) {
+    if (a.dims[i].kind !== b.dims[i].kind) return false;
+  }
+  return true;
+}
+
 /** Walk an IR expression and return the first multi-element CharLit
  *  encountered — the fallback shape-source for elementwise assigns
  *  where the RHS contains no multi-element Var (e.g. `'abc' + 1` or
@@ -83,6 +97,13 @@ function collectMultiElementVarsByCName(
  *  target. Wrapped in `{}` so the staging local is scoped per
  *  Assign.
  *
+ *  Two emission paths: when every multi-element operand has the same
+ *  static shape, a single flat iter loop walks the shared layout (the
+ *  byte-for-byte legacy form). When operands have differing static
+ *  shapes (e.g. row vec + col vec) we switch to a broadcast-aware
+ *  nested-loop path with per-operand stride tables — a size-1 axis
+ *  on one operand reads the same element while the others advance.
+ *
  *  Owned-producing sub-expressions (user-func tensor calls,
  *  TensorLit, IndexSlice, string concat) are already hoisted to
  *  their own `_mtoc_anf_<N>` synthetic Assigns by the lowering-pass
@@ -109,6 +130,52 @@ export function emitTensorAssignFromExpr(
         `RHS contains no multi-element variable or char literal to read shape from`
     );
   }
+
+  // Collect every distinct multi-element Var in the RHS, keyed by
+  // cName so duplicates like `v .* v` collapse.
+  const multiVars = new Map<string, Extract<IRExpr, { kind: "Var" }>>();
+  collectMultiElementVarsByCName(rhs, multiVars);
+
+  // Decide between the flat-iter and broadcast-aware paths. We take
+  // the broadcast path only when the static shapes of two multi-
+  // element Vars disagree — same-shape cases (including all the
+  // pre-existing 2-D and N-D tests) keep the flat-iter emission so
+  // their generated C stays byte-for-byte identical. CharLits stay
+  // on the flat path; mixing CharLits with a differently-shaped Var
+  // is rare enough to defer.
+  let needsBroadcast = false;
+  if (src !== null && multiVars.size > 1 && isNumeric(src.ty)) {
+    for (const v of multiVars.values()) {
+      if (v.cName === src.cName) continue;
+      if (!isNumeric(v.ty)) continue;
+      if (!sameStaticShape(src.ty, v.ty)) {
+        needsBroadcast = true;
+        break;
+      }
+    }
+  }
+
+  if (needsBroadcast) {
+    emitBroadcastAssign(state, level, cTarget, rhs, multiVars);
+    return;
+  }
+  emitFlatAssign(state, level, cTarget, rhs, src, charLitSrc, multiVars);
+}
+
+/** Same-shape (no implicit expansion) emission. Every multi-element
+ *  operand has identical static shape, so one shared iter variable
+ *  walks every operand's flat layout. Runtime mismatch between two
+ *  same-static-shape operands (e.g. both `[notOne, notOne]` but
+ *  different sizes) is caught by `mtoc_check_shape` before the loop. */
+function emitFlatAssign(
+  state: EmitState,
+  level: number,
+  cTarget: string,
+  rhs: IRExpr,
+  src: Extract<IRExpr, { kind: "Var" }> | null,
+  charLitSrc: Extract<IRExpr, { kind: "CharLit" }> | null,
+  multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>
+): void {
   useRuntimeByName(state, "mtoc_tensor_t");
   useRuntimeByName(state, "mtoc_tensor_assign");
 
@@ -135,17 +202,13 @@ export function emitTensorAssignFromExpr(
   // never appears in this function's emission.
   const stagingName = "_mtoc_t";
 
-  // Collect every distinct multi-element Var in the RHS, keyed by
-  // cName so duplicates like `v .* v` collapse. The shape source
-  // already picked by `findShapeSourceVar` is the first entry; for
-  // every other Var we emit one `mtoc_check_shape(<source>, <other>)`
-  // before the staging-buffer alloc. Same-Var and scalar-broadcast
-  // cases produce zero checks.
+  // The shape source already picked above is the first entry of
+  // multiVars; for every other Var we emit one
+  // `mtoc_check_shape(<source>, <other>)` before the staging-buffer
+  // alloc. Same-Var and scalar-broadcast cases produce zero checks.
   // When the shape source is a CharLit, no runtime shape checks are
   // emitted for other CharLit operands (their lengths are statically
   // known; the dim lattice already admitted them as compatible).
-  const multiVars = new Map<string, Extract<IRExpr, { kind: "Var" }>>();
-  collectMultiElementVarsByCName(rhs, multiVars);
   const checkPairs: Array<Extract<IRExpr, { kind: "Var" }>> = [];
   if (src !== null) {
     for (const [cName, v] of multiVars) {
@@ -208,7 +271,7 @@ export function emitTensorAssignFromExpr(
     level + 1,
     `for (long ${iterName} = 0; ${iterName} < _mtoc_n; ${iterName}++) {`
   );
-  state.iterStack.push(iterName);
+  state.iterStack.push({ kind: "flat", iter: iterName });
   const bodyStr = emitExpr(state, rhs, 0);
   state.iterStack.pop();
   if (isComplex) {
@@ -231,6 +294,186 @@ export function emitTensorAssignFromExpr(
     );
   }
   pushStmt(state, level + 1, `}`);
+  pushStmt(
+    state,
+    level + 1,
+    `mtoc_tensor_assign(&${cTarget}, ${stagingName});`
+  );
+  pushStmt(state, level, `}`);
+}
+
+/** Axis-i runtime size for operand `v`. Double tensors carry shape in
+ *  `dims[…]`; char tensors keep their legacy `.rows`/`.cols` fields
+ *  for axes 0/1. Operand axes past the operand's own ndim are
+ *  implicit-1 (the trailing-pad rule). */
+function operandAxisSize(
+  v: Extract<IRExpr, { kind: "Var" }>,
+  i: number
+): string {
+  const ndim = isNumeric(v.ty) ? v.ty.dims.length : 2;
+  if (i < ndim) {
+    if (i === 0) return `${v.cName}.${tensorRowsField(v.ty)}`;
+    if (i === 1) return `${v.cName}.${tensorColsField(v.ty)}`;
+    return `${v.cName}.dims[${i}]`;
+  }
+  return "1L";
+}
+
+/** Broadcast-aware (implicit-expansion) emission. Computes the output
+ *  shape at runtime from a per-axis `mtoc_broadcast_dim` chain across
+ *  every operand, allocates the output, opens nested column-major
+ *  loops, and precomputes a per-operand linear index inside the
+ *  innermost body — a size-1 operand axis contributes `0`, a
+ *  statically `notOne` axis uses the loop variable directly, and an
+ *  `unknown` axis takes a runtime `?:` against the operand's dim
+ *  field. The body re-uses `emitExpr` with a `broadcast` iter frame
+ *  that maps each operand's cName to its precomputed index. */
+function emitBroadcastAssign(
+  state: EmitState,
+  level: number,
+  cTarget: string,
+  rhs: IRExpr,
+  multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>
+): void {
+  useRuntimeByName(state, "mtoc_tensor_t");
+  useRuntimeByName(state, "mtoc_tensor_assign");
+  useRuntimeByName(state, "mtoc_broadcast_dim");
+
+  const operands = Array.from(multiVars.values());
+  const outNdim = operands.reduce(
+    (n, v) => Math.max(n, isNumeric(v.ty) ? v.ty.dims.length : 2),
+    2
+  );
+
+  const isComplex = isNumeric(rhs.ty) && rhs.ty.isComplex;
+  const isNd = outNdim > 2;
+  const allocHelper = isNd
+    ? isComplex
+      ? "mtoc_tensor_alloc_nd_complex"
+      : "mtoc_tensor_alloc_nd"
+    : isComplex
+      ? "mtoc_tensor_alloc_complex"
+      : "mtoc_tensor_alloc";
+  useRuntimeByName(state, allocHelper);
+
+  const stagingName = "_mtoc_t";
+  const outDimNames: string[] = [];
+  for (let i = 0; i < outNdim; i++) outDimNames.push(`_mtoc_d${i}`);
+  const loopVars: string[] = [];
+  for (let i = 0; i < outNdim; i++) loopVars.push(`_mtoc_k${i}`);
+
+  pushStmt(state, level, `{`);
+
+  // Per-axis broadcast result: chain mtoc_broadcast_dim across every
+  // operand. Validates compatibility at runtime and yields the
+  // axis-wise output size in one shot.
+  for (let i = 0; i < outNdim; i++) {
+    let expr = operandAxisSize(operands[0], i);
+    for (let k = 1; k < operands.length; k++) {
+      expr = `mtoc_broadcast_dim(${expr}, ${operandAxisSize(operands[k], i)})`;
+    }
+    pushStmt(state, level + 1, `long ${outDimNames[i]} = ${expr};`);
+  }
+
+  // Allocate the output. 2-D output keeps the `(rows, cols)` alloc
+  // shape; N-D uses the compound-literal dims vector.
+  const shapeArgs = isNd
+    ? `${outNdim}, (long[]){${outDimNames.join(", ")}}`
+    : `${outDimNames[0]}, ${outDimNames[1]}`;
+  pushStmt(
+    state,
+    level + 1,
+    `mtoc_tensor_t ${stagingName} = ${allocHelper}(${shapeArgs});`
+  );
+
+  // Open nested loops, outermost first (highest axis → column-major
+  // fill, matching the existing flat-iter convention).
+  for (let i = outNdim - 1; i >= 0; i--) {
+    const lvl = level + 1 + (outNdim - 1 - i);
+    pushStmt(
+      state,
+      lvl,
+      `for (long ${loopVars[i]} = 0; ${loopVars[i]} < ${outDimNames[i]}; ${loopVars[i]}++) {`
+    );
+  }
+  const bodyLevel = level + outNdim + 1;
+
+  // Output linear index: k0 + k1*d0 + k2*d0*d1 + …
+  const outIdxParts: string[] = [];
+  for (let i = 0; i < outNdim; i++) {
+    const strideParts = outDimNames.slice(0, i);
+    const term =
+      strideParts.length === 0
+        ? loopVars[i]
+        : `${loopVars[i]} * ${strideParts.join(" * ")}`;
+    outIdxParts.push(term);
+  }
+  pushStmt(state, bodyLevel, `long _mtoc_oi = ${outIdxParts.join(" + ")};`);
+
+  // Precompute each operand's linear index. Static `one` → drop the
+  // axis term (contributes 0); static `notOne` → loop var directly;
+  // static `unknown` or operand-padded axis → runtime `?:`. Stride
+  // for axis i is the product of the operand's lower-axis sizes
+  // (column-major), padded with `1L` for axes the operand doesn't
+  // carry.
+  const perVarIndex = new Map<string, string>();
+  for (const [cName, v] of multiVars) {
+    const ndim = isNumeric(v.ty) ? v.ty.dims.length : 2;
+    const idxName = `_mtoc_${cName}_idx`;
+    const parts: string[] = [];
+    const stridePieces: string[] = [];
+    for (let i = 0; i < outNdim; i++) {
+      const axis = operandAxisSize(v, i);
+      const staticDim =
+        i < ndim && isNumeric(v.ty) ? v.ty.dims[i] : { kind: "one" as const };
+      let term: string | null;
+      if (staticDim.kind === "one") {
+        term = null;
+      } else if (staticDim.kind === "notOne") {
+        term = loopVars[i];
+      } else {
+        term = `(${axis} == 1 ? 0 : ${loopVars[i]})`;
+      }
+      if (term !== null) {
+        const stride =
+          stridePieces.length === 0 ? "" : ` * ${stridePieces.join(" * ")}`;
+        parts.push(stride === "" ? term : `${term}${stride}`);
+      }
+      stridePieces.push(axis);
+    }
+    const idxExpr = parts.length === 0 ? "0L" : parts.join(" + ");
+    pushStmt(state, bodyLevel, `long ${idxName} = ${idxExpr};`);
+    perVarIndex.set(cName, idxName);
+  }
+
+  // Render the body with the broadcast iter frame so each operand
+  // Var read picks up its precomputed index.
+  state.iterStack.push({ kind: "broadcast", perVarIndex });
+  const bodyStr = emitExpr(state, rhs, 0);
+  state.iterStack.pop();
+
+  if (isComplex) {
+    pushStmt(state, bodyLevel, `double _Complex _mtoc_c = ${bodyStr};`);
+    pushStmt(
+      state,
+      bodyLevel,
+      `${stagingName}.real[_mtoc_oi] = creal(_mtoc_c);`
+    );
+    pushStmt(
+      state,
+      bodyLevel,
+      `${stagingName}.imag[_mtoc_oi] = cimag(_mtoc_c);`
+    );
+  } else {
+    pushStmt(state, bodyLevel, `${stagingName}.real[_mtoc_oi] = ${bodyStr};`);
+  }
+
+  // Close nested loops (innermost first).
+  for (let i = 0; i < outNdim; i++) {
+    const lvl = level + 1 + (outNdim - 1 - i);
+    pushStmt(state, lvl, `}`);
+  }
+
   pushStmt(
     state,
     level + 1,

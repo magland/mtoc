@@ -244,21 +244,32 @@ generated C stays deterministic. Predecls are unconditional, even
 when a variable's first source-level assignment is inside an `if`
 branch.
 
-**Shape-mismatch trap (`mtoc_check_shape`).** With the coarse dim lattice
-the type system no longer catches same-category shape mismatches like
-`[1 2 3] + [4 5]` at lowering. The codegen closes the gap at the
-elementwise-assign site: it picks the same shape source as
-`findShapeSourceVar` and emits one `mtoc_check_shape(<source>, <other>)`
-per distinct non-source multi-element Var on the RHS, just before the
-staging-buffer alloc. The helper compares `rows` and `cols`; on mismatch
-it prints `mtoc: shape mismatch in elementwise op - got (R x C) and
-(R' x C')` to stderr and `abort()`s. Same-Var cases (`v .* v`) and
-scalar-broadcast cases (`v .* 2`, `-v`) emit zero checks, since there
-is nothing to compare against. The check is once-per-assign — once the
-source agrees in shape with every other operand, every per-element read
-inside the loop is in-bounds. Lives at `runtime/check_shape.h`,
+**Same-shape trap (`mtoc_check_shape`).** When every multi-element
+operand on the RHS shares the same static shape, the codegen takes the
+flat-iter path and emits one `mtoc_check_shape(<source>, <other>)` per
+distinct non-source multi-element Var, just before the staging-buffer
+alloc. The helper compares dims across the operands' ndim; on mismatch
+it prints `mtoc: shape mismatch in elementwise op - got (...) and
+(...)` to stderr and `abort()`s. Same-Var cases (`v .* v`) and
+scalar-broadcast cases (`v .* 2`, `-v`) emit zero checks. Once the
+source agrees in shape with every other operand, every per-element
+read inside the loop is in-bounds. Lives at `runtime/check_shape.h`,
 registered as the `mtoc_check_shape` snippet, and depends on
 `mtoc_tensor_t`.
+
+**Per-axis broadcast helper (`mtoc_broadcast_dim`).** When operands
+have _differing_ static shapes (e.g. row vec + col vec, matrix +
+column vec, lower-rank operand vs higher-rank one), the codegen
+switches to the broadcast emitter. For each output axis it chains
+`mtoc_broadcast_dim(a, b)` across every operand: the helper returns
+`max(a, b)` when one side is `1` or both sides are equal, and aborts
+with `mtoc: shape mismatch in elementwise broadcast - axis sizes %ld
+and %ld are not broadcast-compatible` otherwise. Inside the body the
+emitter precomputes a per-operand linear index that drops the term
+contributed by any statically-`one` operand axis (those reuse one
+element while the loop advances). Lives at `runtime/broadcast_dim.h`,
+registered as the `mtoc_broadcast_dim` snippet — no struct dep, just
+`<stdio.h>` / `<stdlib.h>`.
 
 Scalars do **not** use the struct. Real scalars are bare `double`; complex
 scalars are `double _Complex` (C99).

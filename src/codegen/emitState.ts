@@ -19,6 +19,16 @@ import type { BuiltinEmitState } from "../workspace/builtins.js";
 import type { FutureTouchMap } from "./liveness.js";
 import { RUNTIME_HELPERS, type RuntimeSnippet } from "./runtime.js";
 
+/** A frame on the per-element-loop stack. `flat` is the same-shape
+ *  case where every multi-element operand has identical layout and
+ *  shares one iter variable. `broadcast` is the implicit-expansion
+ *  case where each multi-element operand has its own precomputed
+ *  linear index variable — keyed by C name — so a size-1 axis on one
+ *  operand reads the same element while the others advance. */
+export type IterFrame =
+  | { kind: "flat"; iter: string }
+  | { kind: "broadcast"; perVarIndex: ReadonlyMap<string, string> };
+
 export interface EmitState {
   /** Boxed so the `BuiltinSig.emit` closure (which receives a small
    *  facade view, not the whole EmitState) can flip it. */
@@ -49,14 +59,16 @@ export interface EmitState {
   /** Names of helpers already added to `runtime` (dedup). */
   runtimeNames: Set<string>;
   lines: string[];
-  /** Stack of synthetic per-element loop-index C names. emit pushes
-   *  one when it opens a per-element loop for a multi-element `Assign`
-   *  RHS; the top of the stack is the innermost iter name. When the
-   *  stack is non-empty, multi-element `Var`s render as
-   *  `<cName>.real[<top>]` instead of `<cName>` (scalar `Var`s and
-   *  `NumLit`s broadcast unchanged). Empty at the top level — scalar
-   *  codegen contexts reject multi-element sub-exprs as before. */
-  iterStack: string[];
+  /** Stack of per-element loop frames. emit pushes one when it opens a
+   *  per-element loop for a multi-element `Assign` RHS; the top of the
+   *  stack is the innermost frame. When the stack is non-empty,
+   *  multi-element `Var`s render as `<cName>.real[<idx>]` instead of
+   *  `<cName>` (scalar `Var`s and `NumLit`s broadcast unchanged). The
+   *  index expression comes from the frame: a single flat iter name
+   *  in the same-shape case, or a per-operand precomputed index in
+   *  the broadcasting case. Empty at the top level — scalar codegen
+   *  contexts reject multi-element sub-exprs as before. */
+  iterStack: IterFrame[];
   /** Counter for synthetic loop-index names so nested elementwise
    *  loops don't shadow each other. */
   elemwiseLoopCounter: number;

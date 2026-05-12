@@ -176,11 +176,12 @@ A handful of _structural_ refinements live alongside the lattice:
   location" error.
 - **`arithResult(op, a, b)`** — result of `+ - * /` (and elementwise
   variants). Handles scalar⊙scalar, scalar↔tensor broadcast, and tensor⊙tensor
-  with pointwise dim-compatible inputs. Categorical mismatches (e.g. rowVec +
-  colVec) are rejected at lowering; specific runtime sizes are NOT checked at
-  lowering — they're runtime data and a future stage will add an
-  `mtoc_check_shape` helper. Reserved for the future: tensor⊙tensor with `*` /
-  `/` (matrix multiply / divide) is an explicit unsupported case in lowering.
+  under MATLAB's implicit-expansion rule: per-axis, a `one` side expands to
+  the other side's category (`broadcastShape` walks the padded dims arrays).
+  No static rejections — two `notOne` axes of different sizes mismatch only
+  at runtime, where the broadcast codegen's `mtoc_broadcast_dim` chain traps
+  it. Reserved for the future: tensor⊙tensor with `*` / `/` (matrix
+  multiply / divide) is an explicit unsupported case in lowering.
 - **`mergeBranchEnvs(envs, span, construct)`** — joins multiple post-arm envs
   at an `if`/`while`/`for` exit. Variables present in only some arms unify
   against `scalarDouble("zero")` for the missing arms (matches the `0.0`

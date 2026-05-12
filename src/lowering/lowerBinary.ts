@@ -252,7 +252,7 @@ function lowerComparison(
       );
     }
     // Scalar broadcasts to the tensor's shape; for tensor vs. tensor,
-    // use broadcastShape (returns null on shape mismatch).
+    // broadcastShape handles per-axis size-1 expansion.
     const leftTy = left.ty as NumericType;
     const rightTy = right.ty as NumericType;
     const dims = isScalar(leftTy)
@@ -260,13 +260,6 @@ function lowerComparison(
       : isScalar(rightTy)
         ? leftTy.dims
         : broadcastShape(leftTy.dims, rightTy.dims);
-    if (dims === null) {
-      throw new UnsupportedConstruct(
-        `comparison ${e.op} on ${typeToString(left.ty)} and ` +
-          `${typeToString(right.ty)} produces an incompatible result type`,
-        e.span
-      );
-    }
     const resultTy: NumericType = numericTypeND(dims, false, "nonnegative");
     return {
       kind: "Binary",
@@ -468,7 +461,7 @@ function lowerPow(
     };
   }
   // Scalar broadcasts to the tensor's shape; for tensor vs. tensor,
-  // use broadcastShape (returns null on shape mismatch).
+  // broadcastShape handles per-axis size-1 expansion.
   const leftTy = left.ty as NumericType;
   const rightTy = right.ty as NumericType;
   const dims = isScalar(leftTy)
@@ -476,13 +469,6 @@ function lowerPow(
     : isScalar(rightTy)
       ? leftTy.dims
       : broadcastShape(leftTy.dims, rightTy.dims);
-  if (dims === null) {
-    throw new UnsupportedConstruct(
-      `binary .^ on ${typeToString(left.ty)} and ${typeToString(right.ty)} ` +
-        `produces an incompatible result type`,
-      e.span
-    );
-  }
   const resultTy: NumericType = numericTypeND(dims, false, resultSign);
   return {
     kind: "Binary",

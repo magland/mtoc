@@ -49,6 +49,28 @@ export function tensorRowsField(ty: MType): string {
   return isNumeric(ty) && ty.elem === "char" ? "rows" : "dims[0]";
 }
 
+/** Resolve the linear-index expression to use when rendering a
+ *  multi-element `Var` (or other per-operand source) inside a
+ *  per-element loop. In the flat-shape frame every operand shares the
+ *  same iter name; in the broadcast frame each operand's cName maps
+ *  to its own precomputed linear index. Callers that miss the map
+ *  hit an internal-error throw because the broadcast emitter should
+ *  have registered every multi-element operand. */
+function iterIndexFor(state: EmitState, varCName: string): string {
+  if (state.iterStack.length === 0) {
+    throw new Error("codegen internal: iterIndexFor called outside iter loop");
+  }
+  const frame = state.iterStack[state.iterStack.length - 1];
+  if (frame.kind === "flat") return frame.iter;
+  const idx = frame.perVarIndex.get(varCName);
+  if (idx === undefined) {
+    throw new Error(
+      `codegen internal: no broadcast iter index registered for '${varCName}'`
+    );
+  }
+  return idx;
+}
+
 /** C-side struct field name for the column count of a tensor handle. */
 export function tensorColsField(ty: MType): string {
   return isNumeric(ty) && ty.elem === "char" ? "cols" : "dims[1]";
@@ -170,7 +192,7 @@ export function emitExpr(
       // always produces double; the iter loop stores into a double
       // tensor staging buffer).
       if (state.iterStack.length > 0 && isMultiElement(e.ty)) {
-        const iter = state.iterStack[state.iterStack.length - 1];
+        const iter = iterIndexFor(state, e.cName);
         if (isNumeric(e.ty) && e.ty.elem === "char") {
           return `(double)(${e.cName}.data[${iter}])`;
         }
@@ -183,10 +205,18 @@ export function emitExpr(
 
     case "CharLit": {
       // Multi-element char in iter context: each iteration reads one
-      // byte and widens to double for arithmetic.
+      // byte and widens to double for arithmetic. CharLits only appear
+      // in the flat-iter (same-shape) emission path — the broadcast
+      // dispatcher rejects multi-element CharLit operands ahead of time.
       if (state.iterStack.length > 0 && isMultiElement(e.ty)) {
-        const iter = state.iterStack[state.iterStack.length - 1];
-        return `(double)(${formatStringLit(e.value)}[${iter}])`;
+        const frame = state.iterStack[state.iterStack.length - 1];
+        if (frame.kind !== "flat") {
+          throw new Error(
+            "codegen internal: multi-element CharLit in broadcast iter " +
+              "context; broadcast dispatcher should have routed elsewhere"
+          );
+        }
+        return `(double)(${formatStringLit(e.value)}[${frame.iter}])`;
       }
       // Scalar char literal: render as a C char literal.
       if (isScalar(e.ty)) {

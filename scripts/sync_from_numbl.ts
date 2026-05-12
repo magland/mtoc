@@ -129,6 +129,16 @@ const PATCHES: ReadonlyArray<(relPath: string, src: string) => string> = [
       'from "../../parser/index.js"'
     );
   },
+  // cli-scan.ts moves from `src/cli-scan.ts` (numbl) into
+  // `src/numbl-cli/cli-scan.ts` (mtoc), so its sibling-folder import
+  // of `./numbl-core/workspace/types.js` needs to walk up one level.
+  (rel, src) => {
+    if (rel !== "src/numbl-cli/cli-scan.ts") return src;
+    return src.replace(
+      'from "./numbl-core/workspace/types.js"',
+      'from "../numbl-core/workspace/types.js"'
+    );
+  },
 ];
 
 function applyPatches(relPath: string, src: string): string {

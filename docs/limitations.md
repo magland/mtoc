@@ -67,16 +67,19 @@ workaround or a roadmap note.
   `y = bump(helper(x), 7)` all compile cleanly. Auto-materialization of
   _non_-owned intermediate tensors (e.g. Binary on two tensors as a
   disp arg) is still a known TODO.
-- **No implicit expansion between tensors.** Tensor⊙tensor elementwise
-  ops (`+ - .* ./ .^`, comparisons) require operands with the same
-  runtime shape — colVec + rowVec, matrix + colVec, and other
-  outer-product / broadcast patterns are rejected at lowering with an
-  "incompatible result type" diagnostic. The rejection fires whenever
-  one operand has a statically-`one` axis where the other doesn't,
-  even if the other axis is `unknown`. Scalar⊙tensor broadcast is
-  unaffected (different code path); same-shape mismatches the lattice
-  can't see at compile time still trap at runtime via
-  `mtoc_check_shape`.
+- **Broadcasting (implicit expansion) between tensors.** Tensor⊙tensor
+  arithmetic and comparison ops (`+ - .* ./ .^`, `== ~= < <= > >=`)
+  follow MATLAB's implicit-expansion rule: an axis of size 1 expands
+  to match the other operand, and a shorter-rank operand is padded
+  with trailing 1s. Statically-known matching shapes stay on the
+  fast flat-iter path (with `mtoc_check_shape` catching dimension
+  mismatches the lattice can't see); differing static shapes route
+  through the broadcast emitter, which builds a runtime broadcast
+  shape via `mtoc_broadcast_dim` chains and walks the result with
+  per-operand stride tables. Runtime incompatibility (two non-1 axes
+  of unequal size) aborts with a clear diagnostic. CharLit broadcasting
+  (e.g. `'abc' + [1; 2]`) is not yet wired — multi-element char
+  operands stay on the flat path.
 - **No matrix multiply / divide / power yet.** `*`/`/`/`^` between two
   tensors is explicitly rejected at lowering with a message pointing the user
   at `.* ./ .^` for elementwise. Matrix ops will need a separate codegen path

@@ -183,24 +183,4 @@ describe("elementwise shape check", () => {
     // And the helper body is present.
     expect(c).toMatch(/static void mtoc_check_shape\(/);
   });
-
-  it("rejects elementwise op between operands that would need implicit expansion", () => {
-    // colvec minus rowvec (outer-product broadcast). The static shape
-    // pair (?, 1) vs (1, ?) — one axis is provably `one` while the
-    // other is `unknown` — is statically broadcast-requiring, so the
-    // lowering pass rejects with a clear UnsupportedConstruct rather
-    // than letting a wrong-shape result type slip into codegen.
-    const src =
-      "function lap_broadcast\n" +
-      "  a = zeros(4, 2);\n" +
-      "  b = zeros(4, 2);\n" +
-      "  r = mismatch(a, b);  %#ok<NASGU>\n" +
-      "end\n" +
-      "function r = mismatch(a, b)\n" +
-      "  r = a(:,1) - b(:,1).';\n" +
-      "end\n";
-    expect(() => translate(src)).toThrowError(
-      /binary Sub on Numeric<matrix\(\?x1\).*Numeric<matrix\(1x\?\)/
-    );
-  });
 });
