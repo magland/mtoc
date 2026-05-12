@@ -22,13 +22,24 @@ import { offsetToLine } from "./parser/sourceLoc.js";
 import { scanMFiles } from "./numbl-cli/cli-scan.js";
 import { startServer } from "../server/execution-service.js";
 import { buildCcArgs } from "./build.js";
+import {
+  DEFAULT_OPT_PROFILE,
+  isOptProfile,
+  OPT_PROFILES,
+  resolveOptSettings,
+  type OptProfile,
+  type OptSettings,
+} from "./optProfile.js";
 
 function usage(): never {
   process.stderr.write(
     [
       "Usage:",
-      "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir] [--inline-temps] [--threads N|auto]",
-      "  mtoc run <input.m> [--check-leaks] [--fast-math] [--inline-temps] [--threads N|auto]",
+      "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir]",
+      "    [--opt PROFILE] [--inline-temps|--no-inline-temps] [--threads N|auto]",
+      "  mtoc run <input.m> [--check-leaks]",
+      "    [--opt PROFILE] [--inline-temps|--no-inline-temps]",
+      "    [--fast-math|--no-fast-math] [--threads N|auto]",
       "  mtoc serve --passkey <key> [--port N] [--host HOST]",
       "",
       "Options:",
@@ -42,28 +53,42 @@ function usage(): never {
       "  --check-leaks   (run only) Build with -fsanitize=address so",
       "                  AddressSanitizer + LeakSanitizer flag any unfreed",
       "                  buffer at exit. ~2x slowdown; off by default.",
-      "  --fast-math     (run only) Add -ffast-math to the build. Lets the",
-      "                  C compiler reassociate floating-point ops so hot",
-      "                  loops vectorize more aggressively. NOT IEEE-754",
-      "                  strict; results may drift in the last few ulps.",
-      "                  Off by default to keep the CLI's default `run`",
-      "                  output bit-stable with the cross-runner oracle.",
-      "                  -O3 -march=native is always on regardless.",
-      "  --inline-temps  Enable tensor-expression inlining. Every",
-      "                  single-use multi-element tensor Assign has its",
-      "                  RHS substituted into its unique consumer and is",
-      "                  then deleted, eliminating large intermediates",
-      "                  that thrash cache between separate loops. Same",
-      "                  numerical results as the un-inlined build (cross-",
-      "                  runner is byte-for-byte parity-tested with the",
-      "                  flag on AND off).",
+      "",
+      "Optimization profile (sets defaults for the three flags below):",
+      "  --opt PROFILE   PROFILE is one of:",
+      "                    none       — inline-temps off, fast-math off, threads 1",
+      "                                  (baseline; bit-identical to the pre-",
+      "                                  optimization C output)",
+      "                    safe       — inline-temps on, fast-math off, threads auto",
+      "                    default    — same as `safe`; what you get when no",
+      "                                  --opt is given",
+      "                    aggressive — inline-temps on, fast-math on, threads auto",
+      "                                  (numerics may drift in the last few ulps",
+      "                                  due to -ffast-math)",
+      "                  The three flags below override individual profile",
+      "                  settings, so `--opt aggressive --no-fast-math` is",
+      "                  legal and means 'aggressive but keep IEEE-754'.",
+      "",
+      "Individual feature toggles (override the active profile):",
+      "  --inline-temps / --no-inline-temps",
+      "                  Tensor-expression inlining. Substitutes every",
+      "                  single-use multi-element Assign's RHS into its unique",
+      "                  consumer, eliminating intermediates that thrash cache",
+      "                  between separate loops. Numerically equivalent to the",
+      "                  un-inlined build (parity-tested with the flag both",
+      "                  ways).",
+      "  --fast-math / --no-fast-math",
+      "                  Add -ffast-math to the build (run only). Lets the C",
+      "                  compiler reassociate floating-point ops so hot loops",
+      "                  vectorize more aggressively. NOT IEEE-754 strict;",
+      "                  results may drift in the last few ulps. -O3",
+      "                  -march=native is always on regardless.",
       "  --threads N|auto",
       "                  Max threads for parallelizable elementwise loops.",
-      "                  N = a positive integer; `auto` = let OpenMP pick",
-      "                  (uses OMP_NUM_THREADS or # cores). Default 1",
-      "                  (pure serial — no #pragma omp lines emitted, no",
-      "                  -fopenmp on the link, binary bit-identical to",
-      "                  today's serial output).",
+      "                  N = a positive integer; `1` is pure serial (no",
+      "                  `#pragma omp` lines emitted, no `-fopenmp` on the",
+      "                  link). `auto` lets OpenMP pick (uses OMP_NUM_THREADS",
+      "                  or # cores).",
       "",
       "When <output.c> is omitted, the translated C is written to stdout.",
       "",
@@ -82,9 +107,9 @@ interface ParsedArgs {
   noRuntime: boolean;
   dumpIr: boolean;
   checkLeaks: boolean;
-  fastMath: boolean;
-  inlineTemps: boolean;
-  threads: number | "auto";
+  /** Resolved optimization settings — profile defaults with explicit
+   *  per-flag overrides applied. Always populated. */
+  opt: OptSettings;
 }
 
 function parseArgs(args: string[]): ParsedArgs {
@@ -92,9 +117,12 @@ function parseArgs(args: string[]): ParsedArgs {
   let noRuntime = false;
   let dumpIr = false;
   let checkLeaks = false;
-  let fastMath = false;
-  let inlineTemps = false;
-  let threads: number | "auto" = 1;
+  let profile: OptProfile = DEFAULT_OPT_PROFILE;
+  // Tristate overrides: `undefined` = "profile decides", `true` /
+  // `false` = explicit choice. Lets `--no-fast-math` cleanly cancel
+  // `--opt aggressive`'s fast-math default without us having to
+  // remember which flag came last.
+  const overrides: Partial<OptSettings> = {};
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === "--no-runtime") {
@@ -103,10 +131,23 @@ function parseArgs(args: string[]): ParsedArgs {
       dumpIr = true;
     } else if (a === "--check-leaks") {
       checkLeaks = true;
+    } else if (a === "--opt") {
+      const v = args[++i];
+      if (!isOptProfile(v)) {
+        process.stderr.write(
+          `mtoc: --opt requires one of ${OPT_PROFILES.join(", ")} (got '${v ?? ""}')\n`
+        );
+        usage();
+      }
+      profile = v;
     } else if (a === "--fast-math") {
-      fastMath = true;
+      overrides.fastMath = true;
+    } else if (a === "--no-fast-math") {
+      overrides.fastMath = false;
     } else if (a === "--inline-temps") {
-      inlineTemps = true;
+      overrides.enableTempInlining = true;
+    } else if (a === "--no-inline-temps") {
+      overrides.enableTempInlining = false;
     } else if (a === "--threads") {
       const v = args[++i];
       if (v === undefined) {
@@ -116,7 +157,7 @@ function parseArgs(args: string[]): ParsedArgs {
         usage();
       }
       if (v === "auto") {
-        threads = "auto";
+        overrides.threads = "auto";
       } else {
         const n = parseInt(v, 10);
         if (!Number.isFinite(n) || n < 1 || String(n) !== v) {
@@ -125,7 +166,7 @@ function parseArgs(args: string[]): ParsedArgs {
           );
           usage();
         }
-        threads = n;
+        overrides.threads = n;
       }
     } else if (a.startsWith("--")) {
       process.stderr.write(`mtoc: unknown option '${a}'\n`);
@@ -139,9 +180,7 @@ function parseArgs(args: string[]): ParsedArgs {
     noRuntime,
     dumpIr,
     checkLeaks,
-    fastMath,
-    inlineTemps,
-    threads,
+    opt: resolveOptSettings(profile, overrides),
   };
 }
 
@@ -203,8 +242,7 @@ function compile(
 }
 
 function cmdTranslate(args: string[]): void {
-  const { positional, noRuntime, dumpIr, inlineTemps, threads } =
-    parseArgs(args);
+  const { positional, noRuntime, dumpIr, opt } = parseArgs(args);
   if (positional.length < 1 || positional.length > 2) usage();
   const [inputPath, outputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
@@ -231,8 +269,8 @@ function cmdTranslate(args: string[]): void {
     absInputPath,
     !noRuntime,
     inputPath,
-    inlineTemps,
-    threads
+    opt.enableTempInlining,
+    opt.threads
   );
   if (outputPath === undefined) {
     process.stdout.write(cSource);
@@ -322,8 +360,7 @@ function dumpIrAsJson(
 }
 
 function cmdRun(args: string[]): void {
-  const { positional, noRuntime, checkLeaks, fastMath, inlineTemps, threads } =
-    parseArgs(args);
+  const { positional, noRuntime, checkLeaks, opt } = parseArgs(args);
   if (positional.length !== 1) usage();
   if (noRuntime) {
     process.stderr.write(
@@ -339,8 +376,8 @@ function cmdRun(args: string[]): void {
     absInputPath,
     true,
     inputPath,
-    inlineTemps,
-    threads
+    opt.enableTempInlining,
+    opt.threads
   );
 
   const dir = mkdtempSync(join(tmpdir(), "mtoc-"));
@@ -353,7 +390,11 @@ function cmdRun(args: string[]): void {
   // `src/build.ts::buildCcArgs` so a binary built by `mtoc run` is
   // bit-identical to one built by the remote `/run` endpoint for
   // the same toggles. See `BuildOptions` for what each flag does.
-  const ccArgs = buildCcArgs(cFile, exeFile, { checkLeaks, fastMath, threads });
+  const ccArgs = buildCcArgs(cFile, exeFile, {
+    checkLeaks,
+    fastMath: opt.fastMath,
+    threads: opt.threads,
+  });
   try {
     execFileSync(cc, ccArgs, { stdio: "inherit" });
   } catch {

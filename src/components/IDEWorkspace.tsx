@@ -29,6 +29,11 @@ import {
   createNumblTokensProvider,
 } from "../monaco/numblLanguage";
 import type { SourceFile } from "../translate";
+import {
+  DEFAULT_OPT_PROFILE,
+  profileSettings,
+  type OptProfile,
+} from "../optProfile";
 
 interface IDEWorkspaceProps {
   /** Returned by useProjectFiles or useShareProjectFiles. */
@@ -68,9 +73,27 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
   const loadedRef = useRef(new Set<string>());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [includeRuntime, setIncludeRuntime] = useState(false);
-  const [enableTempInlining, setEnableTempInlining] = useState(false);
-  const [fastMath, setFastMath] = useState(false);
-  const [threads, setThreads] = useState<number | "auto">(1);
+  // Initial trio = whatever `default` profile resolves to. The profile
+  // dropdown lets the user jump between presets; the three individual
+  // toggles override on top.
+  const initialOpt = profileSettings(DEFAULT_OPT_PROFILE);
+  const [profile, setProfile] = useState<OptProfile>(DEFAULT_OPT_PROFILE);
+  const [enableTempInlining, setEnableTempInlining] = useState(
+    initialOpt.enableTempInlining
+  );
+  const [fastMath, setFastMath] = useState(initialOpt.fastMath);
+  const [threads, setThreads] = useState<number | "auto">(initialOpt.threads);
+  /** Selecting a profile resets all three toggles to the profile's
+   *  defaults; the dropdown itself stays on the selected profile name
+   *  even after the user nudges an individual switch. That's a useful
+   *  display — "I was in `aggressive`, then turned fast-math off." */
+  const handleProfileChange = (p: OptProfile) => {
+    setProfile(p);
+    const s = profileSettings(p);
+    setEnableTempInlining(s.enableTempInlining);
+    setFastMath(s.fastMath);
+    setThreads(s.threads);
+  };
   const exec = useRemoteExecution();
 
   // Register the numbl Monaco language exactly once per Monaco instance.
@@ -247,6 +270,8 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
               activeName={active ?? ""}
               includeRuntime={includeRuntime}
               onIncludeRuntimeChange={setIncludeRuntime}
+              profile={profile}
+              onProfileChange={handleProfileChange}
               enableTempInlining={enableTempInlining}
               onEnableTempInliningChange={setEnableTempInlining}
               fastMath={fastMath}

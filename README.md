@@ -55,14 +55,32 @@ the process exits non-zero. Off by default because ASan adds ~2× runtime and
 memory overhead; the cross-runner (`scripts/run_test_scripts.ts`) passes the
 flag for every test so leaks fail CI.
 
-Add `--threads N` (or `--threads auto`) to enable OpenMP-parallelized
-elementwise loops; the default is single-threaded. `N=1` (the default) is
-"pure serial" — no `#pragma omp` lines emitted, no `-fopenmp` on the link, so
-the binary is bit-identical to today's serial output. `N >= 2` emits a
-startup `omp_set_num_threads(N)` call; `auto` skips that call and lets
-OpenMP pick (typically from `OMP_NUM_THREADS` or core count). Each emitted
-`#pragma omp parallel for` carries an `if(_mtoc_n > 1024)` guard so small
-tensors stay serial regardless of `N`. Reductions (`sum`, `min`, `max`,
+Performance toggles are grouped into four named profiles, picked with
+`--opt PROFILE`:
+
+| Profile                                         | inline-temps | fast-math | threads |
+| ----------------------------------------------- | :----------: | :-------: | :-----: |
+| `none`                                          |     off      |    off    |    1    |
+| `safe`                                          |      on      |    off    |  auto   |
+| `default` (the default when `--opt` is omitted) |      on      |    off    |  auto   |
+| `aggressive`                                    |      on      |    on     |  auto   |
+
+Each individual flag can override the profile's choice — positive
+(`--inline-temps`, `--fast-math`, `--threads N|auto`) or negative
+(`--no-inline-temps`, `--no-fast-math`, `--threads 1`). For example,
+`mtoc run f.m --opt aggressive --no-fast-math` is the right form for
+"max-parallel + inlining but keep IEEE-754 numerics."
+
+`--threads N` controls OpenMP parallelization of elementwise loops:
+`N=1` is pure serial (no `#pragma omp`, no `-fopenmp`), `N>=2` pins
+the count via `omp_set_num_threads(N)`, `auto` lets OpenMP pick
+(usually `OMP_NUM_THREADS` or core count). Each `#pragma omp parallel
+for` carries an `if(_mtoc_n > 1024)` guard so small tensors stay
+serial regardless. `--fast-math` adds `-ffast-math` to the build
+(not IEEE-754 strict; results may drift in the last few ulps).
+`--inline-temps` substitutes single-use multi-element tensor
+temporaries into their unique consumer, eliminating intermediates
+that thrash cache between loops. Reductions (`sum`, `min`, `max`,
 `prod`) stay serial for now.
 
 `--no-runtime` omits the inline runtime-helper bodies (`mtoc_format_double`,

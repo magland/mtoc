@@ -11,6 +11,7 @@ import {
 } from "@mui/material";
 import Editor from "@monaco-editor/react";
 import type { TranslateError, SourceFile } from "../translate";
+import { OPT_PROFILES, type OptProfile } from "../optProfile";
 
 interface CSourcePanelProps {
   c: string;
@@ -22,6 +23,12 @@ interface CSourcePanelProps {
   activeName: string;
   includeRuntime: boolean;
   onIncludeRuntimeChange: (value: boolean) => void;
+  /** Last-selected optimization profile. Changing this resets the three
+   *  toggles below to the profile's defaults via `onProfileChange`; the
+   *  user can then override individual toggles without the dropdown
+   *  "drifting." */
+  profile: OptProfile;
+  onProfileChange: (value: OptProfile) => void;
   enableTempInlining: boolean;
   onEnableTempInliningChange: (value: boolean) => void;
   /** `-ffast-math` toggle. Does NOT change the displayed C — only
@@ -45,7 +52,7 @@ interface CSourcePanelProps {
 const THREAD_PRESETS: ReadonlyArray<number | "auto"> = [1, 2, 4, 8, 16, "auto"];
 
 function threadValueToLabel(value: number | "auto"): string {
-  if (value === "auto") return "auto";
+  if (value === "auto") return "auto threads";
   return value === 1 ? "1 thread" : `${value} threads`;
 }
 
@@ -91,6 +98,8 @@ export function CSourcePanel({
   activeName,
   includeRuntime,
   onIncludeRuntimeChange,
+  profile,
+  onProfileChange,
   enableTempInlining,
   onEnableTempInliningChange,
   fastMath,
@@ -126,6 +135,26 @@ export function CSourcePanel({
           GENERATED C
         </Typography>
         <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <FormControl size="small" sx={{ m: 0 }}>
+            <Select
+              value={profile}
+              onChange={e => onProfileChange(e.target.value as OptProfile)}
+              variant="standard"
+              disableUnderline
+              renderValue={v => `opt: ${v}`}
+              sx={{
+                fontSize: 12,
+                color: "text.secondary",
+                "& .MuiSelect-select": { py: 0, pr: "18px !important" },
+              }}
+            >
+              {OPT_PROFILES.map(p => (
+                <MenuItem key={p} value={p} dense>
+                  <Typography variant="caption">opt: {p}</Typography>
+                </MenuItem>
+              ))}
+            </Select>
+          </FormControl>
           <Tooltip title="Inline single-use tensor temporaries.">
             <FormControlLabel
               sx={{ m: 0 }}
