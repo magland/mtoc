@@ -19,6 +19,8 @@ interface CSourcePanelProps {
   activeName: string;
   includeRuntime: boolean;
   onIncludeRuntimeChange: (value: boolean) => void;
+  enableTensorFusion: boolean;
+  onEnableTensorFusionChange: (value: boolean) => void;
 }
 
 const UNRESOLVED_PATTERN = /unresolved function or builtin '(\w+)'/;
@@ -63,6 +65,8 @@ export function CSourcePanel({
   activeName,
   includeRuntime,
   onIncludeRuntimeChange,
+  enableTensorFusion,
+  onEnableTensorFusionChange,
 }: CSourcePanelProps) {
   return (
     <Box
@@ -90,23 +94,42 @@ export function CSourcePanel({
         >
           GENERATED C
         </Typography>
-        <Tooltip title="Inline mtoc's C runtime helpers (mtoc_disp_double, mtoc_tensor_t, …) into the displayed source. The compile-and-run server always uses the full runtime regardless of this toggle.">
-          <FormControlLabel
-            sx={{ m: 0 }}
-            control={
-              <Switch
-                size="small"
-                checked={includeRuntime}
-                onChange={e => onIncludeRuntimeChange(e.target.checked)}
-              />
-            }
-            label={
-              <Typography variant="caption" color="text.secondary">
-                runtime helpers
-              </Typography>
-            }
-          />
-        </Tooltip>
+        <Box sx={{ display: "flex", alignItems: "center", gap: 1 }}>
+          <Tooltip title="Collapse chains of single-use elementwise tensor expressions into one fused C loop. Eliminates large intermediate tensors that thrash cache. Numerically identical to the unfused build. Affects both the displayed C and the compile-and-run output. MVP scope: same-shape chains only (broadcast / slice / transpose deferred).">
+            <FormControlLabel
+              sx={{ m: 0 }}
+              control={
+                <Switch
+                  size="small"
+                  checked={enableTensorFusion}
+                  onChange={e => onEnableTensorFusionChange(e.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="caption" color="text.secondary">
+                  fuse tensors
+                </Typography>
+              }
+            />
+          </Tooltip>
+          <Tooltip title="Inline mtoc's C runtime helpers (mtoc_disp_double, mtoc_tensor_t, …) into the displayed source. The compile-and-run server always uses the full runtime regardless of this toggle.">
+            <FormControlLabel
+              sx={{ m: 0 }}
+              control={
+                <Switch
+                  size="small"
+                  checked={includeRuntime}
+                  onChange={e => onIncludeRuntimeChange(e.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="caption" color="text.secondary">
+                  runtime helpers
+                </Typography>
+              }
+            />
+          </Tooltip>
+        </Box>
       </Box>
       {error && (
         <Alert

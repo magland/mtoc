@@ -39,7 +39,11 @@ interface UseRemoteExecutionResult {
    *  the user opens the settings dialog. */
   checkConnection: () => Promise<void>;
   /** Translate + compile + run the project on the remote server. */
-  run: (files: SourceFile[], activeName: string) => Promise<void>;
+  run: (
+    files: SourceFile[],
+    activeName: string,
+    opts?: { enableTensorFusion?: boolean }
+  ) => Promise<void>;
   /** Abort the currently-running execution. */
   stop: () => void;
 }
@@ -67,7 +71,11 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
   }, []);
 
   const run = useCallback(
-    async (files: SourceFile[], activeName: string) => {
+    async (
+      files: SourceFile[],
+      activeName: string,
+      opts: { enableTensorFusion?: boolean } = {}
+    ) => {
       if (status === "running") return;
       const url = getRemoteServiceUrl();
       const passkey = getPasskey();
@@ -99,7 +107,8 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
         { onEvent },
         url,
         passkey,
-        abort.signal
+        abort.signal,
+        { enableTensorFusion: opts.enableTensorFusion ?? false }
       );
       abortRef.current = null;
 

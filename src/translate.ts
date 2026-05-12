@@ -56,6 +56,12 @@ export interface TranslateOptions {
    *  derived from the basename. The web IDE leaves this undefined —
    *  flat file names are treated as already-relative. */
   searchPaths?: ReadonlyArray<string>;
+  /** Enable the tensor-expression fusion pass. Collapses chains of
+   *  single-use elementwise Assigns into one fused loop, eliminating
+   *  large intermediate tensors. Currently MVP (V2): same-shape
+   *  flat-iter chains only. Default false during rollout. See
+   *  `src/codegen/fuse/inlinePass.ts`. */
+  enableTensorFusion?: boolean;
 }
 
 /**
@@ -68,6 +74,7 @@ export function translateProject(
   opts: TranslateOptions = {}
 ): TranslateResult {
   const includeRuntime = opts.includeRuntime ?? true;
+  const enableTensorFusion = opts.enableTensorFusion ?? false;
   const active = files.find(f => f.name === activeName);
   if (!active) {
     return {
@@ -105,7 +112,7 @@ export function translateProject(
 
   try {
     const ir = lower(activeAst, workspace);
-    return { c: emitC(ir, { includeRuntime }) };
+    return { c: emitC(ir, { includeRuntime, enableTensorFusion }) };
   } catch (e) {
     if (e instanceof UnsupportedConstruct || e instanceof TypeError) {
       return {

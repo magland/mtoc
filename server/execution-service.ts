@@ -38,6 +38,9 @@ interface ServerOptions {
 interface RunRequest {
   files: SourceFile[];
   activeName: string;
+  /** When true, run the tensor-expression fusion pass during translation.
+   *  See `src/codegen/fuse/inlinePass.ts`. Optional, defaults to false. */
+  enableTensorFusion?: boolean;
 }
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // 8 MB
@@ -109,6 +112,15 @@ function validateRunRequest(
     return {
       ok: false,
       message: `'activeName' (${r.activeName}) must match one of the files.`,
+    };
+  }
+  if (
+    r.enableTensorFusion !== undefined &&
+    typeof r.enableTensorFusion !== "boolean"
+  ) {
+    return {
+      ok: false,
+      message: "'enableTensorFusion' must be a boolean if provided.",
     };
   }
   return { ok: true };
@@ -196,7 +208,9 @@ async function handleRun(
     };
 
     // Translate on the server using the same pipeline the IDE uses.
-    const translateResult = translateProject(parsed.files, parsed.activeName);
+    const translateResult = translateProject(parsed.files, parsed.activeName, {
+      enableTensorFusion: parsed.enableTensorFusion ?? false,
+    });
     if (translateResult.error) {
       sendEvent({
         type: "translate_error",

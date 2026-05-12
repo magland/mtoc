@@ -68,6 +68,7 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
   const loadedRef = useRef(new Set<string>());
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [includeRuntime, setIncludeRuntime] = useState(false);
+  const [enableTensorFusion, setEnableTensorFusion] = useState(false);
   const exec = useRemoteExecution();
 
   // Register the numbl Monaco language exactly once per Monaco instance.
@@ -128,7 +129,8 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
     sourceFiles,
     active ?? "",
     editorModel,
-    includeRuntime
+    includeRuntime,
+    enableTensorFusion
   );
 
   const handleEditorMount: OnMount = editorInstance => {
@@ -160,7 +162,7 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
       return;
     }
     if (!active) return;
-    exec.run(sourceFiles, active);
+    exec.run(sourceFiles, active, { enableTensorFusion });
   };
 
   return (
@@ -242,6 +244,8 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
               activeName={active ?? ""}
               includeRuntime={includeRuntime}
               onIncludeRuntimeChange={setIncludeRuntime}
+              enableTensorFusion={enableTensorFusion}
+              onEnableTensorFusionChange={setEnableTensorFusion}
             />
           </Splitter>
         </Splitter>

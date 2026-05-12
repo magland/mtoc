@@ -20,7 +20,8 @@ export function useTranslation(
   files: SourceFile[],
   activeName: string,
   editorModel: editor.ITextModel | null,
-  includeRuntime: boolean = false
+  includeRuntime: boolean = false,
+  enableTensorFusion: boolean = false
 ): UseTranslationResult {
   const [c, setC] = useState<string>("");
   const [error, setError] = useState<TranslateError | null>(null);
@@ -29,7 +30,10 @@ export function useTranslation(
 
   useEffect(() => {
     const handle = window.setTimeout(() => {
-      const result = translateProject(files, activeName, { includeRuntime });
+      const result = translateProject(files, activeName, {
+        includeRuntime,
+        enableTensorFusion,
+      });
       if (result.error) {
         setError(result.error);
         // Keep the previously-good C source so the user can still see
@@ -41,7 +45,7 @@ export function useTranslation(
       }
     }, DEBOUNCE_MS);
     return () => window.clearTimeout(handle);
-  }, [files, activeName, includeRuntime]);
+  }, [files, activeName, includeRuntime, enableTensorFusion]);
 
   // Drive Monaco markers off of (error, editorModel, monaco).
   useEffect(() => {

@@ -26,8 +26,8 @@ function usage(): never {
   process.stderr.write(
     [
       "Usage:",
-      "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir]",
-      "  mtoc run <input.m> [--check-leaks] [--fast-math]",
+      "  mtoc translate <input.m> [output.c] [--no-runtime] [--dump-ir] [--fuse-tensors]",
+      "  mtoc run <input.m> [--check-leaks] [--fast-math] [--fuse-tensors]",
       "  mtoc serve --passkey <key> [--port N] [--host HOST]",
       "",
       "Options:",
@@ -48,6 +48,14 @@ function usage(): never {
       "                  Off by default to keep the CLI's default `run`",
       "                  output bit-stable with the cross-runner oracle.",
       "                  -O3 -march=native is always on regardless.",
+      "  --fuse-tensors  Enable the tensor-expression fusion pass.",
+      "                  Collapses chains of single-use elementwise",
+      "                  Assigns into one fused C loop, eliminating",
+      "                  large intermediate tensors that thrash cache.",
+      "                  Same numerical results as the unfused build",
+      "                  (cross-runner is byte-for-byte parity-tested",
+      "                  with the flag on AND off). MVP scope: same-",
+      "                  shape flat-iter chains only.",
       "",
       "When <output.c> is omitted, the translated C is written to stdout.",
       "",
@@ -67,6 +75,7 @@ interface ParsedArgs {
   dumpIr: boolean;
   checkLeaks: boolean;
   fastMath: boolean;
+  fuseTensors: boolean;
 }
 
 function parseArgs(args: string[]): ParsedArgs {
@@ -75,6 +84,7 @@ function parseArgs(args: string[]): ParsedArgs {
   let dumpIr = false;
   let checkLeaks = false;
   let fastMath = false;
+  let fuseTensors = false;
   for (const a of args) {
     if (a === "--no-runtime") {
       noRuntime = true;
@@ -84,6 +94,8 @@ function parseArgs(args: string[]): ParsedArgs {
       checkLeaks = true;
     } else if (a === "--fast-math") {
       fastMath = true;
+    } else if (a === "--fuse-tensors") {
+      fuseTensors = true;
     } else if (a.startsWith("--")) {
       process.stderr.write(`mtoc: unknown option '${a}'\n`);
       usage();
@@ -91,7 +103,7 @@ function parseArgs(args: string[]): ParsedArgs {
       positional.push(a);
     }
   }
-  return { positional, noRuntime, dumpIr, checkLeaks, fastMath };
+  return { positional, noRuntime, dumpIr, checkLeaks, fastMath, fuseTensors };
 }
 
 function reportError(
@@ -136,19 +148,21 @@ function compile(
   source: string,
   absInputPath: string,
   includeRuntime: boolean,
-  inputPath: string
+  inputPath: string,
+  enableTensorFusion: boolean
 ): string {
   const { files, searchPaths } = buildProjectFiles(absInputPath, source);
   const result = translateProject(files, absInputPath, {
     includeRuntime,
     searchPaths,
+    enableTensorFusion,
   });
   if (result.error) reportError(result.error, inputPath, source);
   return result.c!;
 }
 
 function cmdTranslate(args: string[]): void {
-  const { positional, noRuntime, dumpIr } = parseArgs(args);
+  const { positional, noRuntime, dumpIr, fuseTensors } = parseArgs(args);
   if (positional.length < 1 || positional.length > 2) usage();
   const [inputPath, outputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
@@ -170,7 +184,13 @@ function cmdTranslate(args: string[]): void {
     writeFileSync(outputPath, out + "\n");
     return;
   }
-  const cSource = compile(source, absInputPath, !noRuntime, inputPath);
+  const cSource = compile(
+    source,
+    absInputPath,
+    !noRuntime,
+    inputPath,
+    fuseTensors
+  );
   if (outputPath === undefined) {
     process.stdout.write(cSource);
     return;
@@ -259,7 +279,8 @@ function dumpIrAsJson(
 }
 
 function cmdRun(args: string[]): void {
-  const { positional, noRuntime, checkLeaks, fastMath } = parseArgs(args);
+  const { positional, noRuntime, checkLeaks, fastMath, fuseTensors } =
+    parseArgs(args);
   if (positional.length !== 1) usage();
   if (noRuntime) {
     process.stderr.write(
@@ -270,7 +291,7 @@ function cmdRun(args: string[]): void {
   const [inputPath] = positional;
   const source = readFileSync(inputPath, "utf8");
   const absInputPath = resolve(inputPath);
-  const cSource = compile(source, absInputPath, true, inputPath);
+  const cSource = compile(source, absInputPath, true, inputPath, fuseTensors);
 
   const dir = mkdtempSync(join(tmpdir(), "mtoc-"));
   const cFile = join(dir, "out.c");

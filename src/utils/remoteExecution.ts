@@ -125,7 +125,8 @@ export async function executeRemoteRun(
   callbacks: { onEvent: (event: RunEvent) => void },
   serviceUrl: string,
   passkey: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  opts: { enableTensorFusion?: boolean } = {}
 ): Promise<RunResult> {
   let response: Response;
   try {
@@ -135,7 +136,11 @@ export async function executeRemoteRun(
         "Content-Type": "application/json",
         Authorization: `Bearer ${passkey}`,
       },
-      body: JSON.stringify({ files, activeName }),
+      body: JSON.stringify({
+        files,
+        activeName,
+        enableTensorFusion: opts.enableTensorFusion ?? false,
+      }),
       signal: abortSignal,
     });
   } catch (error) {
