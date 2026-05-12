@@ -22,6 +22,7 @@ import type { Expr, Span } from "../parser/index.js";
 import { UnsupportedConstruct } from "../lowering/errors.js";
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
+  arithResult,
   charArrayType,
   dimIsOne,
   isCharArray,
@@ -894,6 +895,27 @@ const BUILTINS: BuiltinSig[] = [
       state.useRuntime("mtoc_angle_real");
       return `mtoc_angle_real(${args[0]})`;
     },
+  },
+
+  // `complex(...)` — the only path in numbl from a real-typed value to
+  // a complex-typed one. 1-arg `complex(a)` promotes real → complex
+  // (imag plane = 0); a complex `a` passes through unchanged. 2-arg
+  // `complex(a, b)` builds `a + b*i`; numbl rejects a complex arg in
+  // the 2-arg form (its `apply` calls `isRuntimeNumber` which is
+  // false for complex), so we do too. Scalar and tensor inputs both
+  // work — tensor inputs ride the standard elementwise lift, with
+  // shape from `arithResult` broadcast. See `lowerComplexCtor` below.
+  {
+    name: "complex",
+    category: "expr",
+    params: [],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "internal: 'complex' must be lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: lowerComplexCtor,
   },
 
   // ── 1-arg runtime — `sign` propagates complexity ─────────────────────
@@ -1907,6 +1929,96 @@ function lowerVariadicTensorCtor(
     name,
     callee: { kind: "builtin", sig },
     args: [...dimArgs],
+    ty: resultTy,
+    span,
+  };
+}
+
+/** Expression-position lowering for `complex(...)`. 1-arg form
+ *  promotes a real value to complex (and passes a complex value
+ *  through unchanged); 2-arg form `complex(a, b)` builds `a + b*i`
+ *  and rejects complex args (numbl semantics). Tensor inputs ride
+ *  the standard elementwise lift via a synthesized scalar-emit
+ *  BuiltinSig: the codegen iter-loop allocates a complex result
+ *  tensor at the broadcast shape and stamps the per-slot expression
+ *  `(a + 0*I)` (1-arg) or `(a + b*I)` (2-arg) into each cell. */
+function lowerComplexCtor(
+  _ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  if (args.length < 1 || args.length > 2) {
+    throw new UnsupportedConstruct(
+      `'complex' takes 1 or 2 arguments (got ${args.length})`,
+      span
+    );
+  }
+  for (let i = 0; i < args.length; i++) {
+    if (!isNumeric(args[i].ty)) {
+      throw new UnsupportedConstruct(
+        `'complex' requires numeric arguments ` +
+          `(got ${typeToString(args[i].ty)})`,
+        args[i].span ?? span
+      );
+    }
+  }
+  // 1-arg passthrough: complex(z) where z is already complex returns z
+  // (assignment / disp do the deep copy where needed).
+  if (args.length === 1 && (args[0].ty as NumericType).isComplex) {
+    return args[0];
+  }
+  // 2-arg: numbl rejects a complex arg in either slot.
+  if (args.length === 2) {
+    for (let i = 0; i < 2; i++) {
+      if ((args[i].ty as NumericType).isComplex) {
+        throw new UnsupportedConstruct(
+          `'complex' requires real arguments in the 2-arg form ` +
+            `(got ${typeToString(args[i].ty)})`,
+          args[i].span ?? span
+        );
+      }
+    }
+  }
+  // Result type: complex with the broadcast shape of the args. Reuse
+  // `arithResult` for the 2-arg broadcast (Add is sign/elem-preserving
+  // so the dims it produces are what we want).
+  let resultTy: NumericType;
+  if (args.length === 1) {
+    const a = args[0].ty as NumericType;
+    resultTy = numericTypeND(a.dims, true, "unknown", a.elem);
+  } else {
+    const broadcasted = arithResult("Add", args[0].ty, args[1].ty);
+    if (!isNumeric(broadcasted)) {
+      throw new UnsupportedConstruct(
+        `'complex': cannot broadcast arguments with incompatible shapes ` +
+          `(${typeToString(args[0].ty)}, ${typeToString(args[1].ty)})`,
+        span
+      );
+    }
+    resultTy = numericTypeND(broadcasted.dims, true, "unknown", "double");
+  }
+  const params: ParamConstraint[] = args.map(() => ({
+    shape: "scalar" as const,
+    domain: null,
+    elem: "double" as const,
+    complexDomain: "real-only" as const,
+  }));
+  const emit: BuiltinEmit =
+    args.length === 1
+      ? argStrs => `((${argStrs[0]}) + 0.0 * I)`
+      : argStrs => `((${argStrs[0]}) + (${argStrs[1]}) * I)`;
+  const sig: BuiltinSig = {
+    name: "complex",
+    category: "expr",
+    params,
+    result: () => resultTy,
+    emit,
+  };
+  return {
+    kind: "Call",
+    name: "complex",
+    callee: { kind: "builtin", sig },
+    args: [...args],
     ty: resultTy,
     span,
   };

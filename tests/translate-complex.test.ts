@@ -277,3 +277,68 @@ describe("complex isnan / isinf / isfinite / logical", () => {
     expect(c).toContain("isnan(x)");
   });
 });
+
+describe("complex(...) builtin — the only path from real to complex", () => {
+  // Numbl's `complex(...)` is the only constructor surface that
+  // produces a complex-typed value from real arguments. Scalar
+  // and tensor cases both work; tensor cases ride the standard
+  // elementwise lift so the iter-loop allocates a complex result
+  // tensor and stamps `(a + 0*I)` or `(a + b*I)` per slot.
+
+  it("emits `(a + 0.0 * I)` for scalar 1-arg real", () => {
+    const c = translate("a = complex(3);\ndisp(a);\n");
+    expect(c).toContain("double _Complex a");
+    expect(c).toMatch(/a = \(\(3\.0\) \+ 0\.0 \* I\);/);
+  });
+
+  it("passes a scalar complex through unchanged (no extra C call)", () => {
+    const c = translate("z = 1 + 2i;\nw = complex(z);\ndisp(w);\n");
+    // `w` is just `z` — no `+ 0.0 * I` re-wrap.
+    expect(c).toMatch(/w = z;/);
+    expect(c).not.toContain("(z) + 0.0 * I");
+  });
+
+  it("emits `(a + b * I)` for scalar 2-arg form", () => {
+    const c = translate("a = complex(1.5, 2.5);\ndisp(a);\n");
+    expect(c).toMatch(/a = \(\(1\.5\) \+ \(2\.5\) \* I\);/);
+  });
+
+  it("lifts elementwise for `complex(real_tensor)`", () => {
+    const c = translate("a = complex([1 2 3]);\ndisp(a);\n");
+    // Complex result tensor allocated; per-slot stamp uses `+ 0.0 * I`.
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+    expect(c).toContain("+ 0.0 * I");
+  });
+
+  it("lifts elementwise for `complex(re, im)` over same-shape tensors", () => {
+    const c = translate("a = complex([1 2 3], [4 5 6]);\ndisp(a);\n");
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+    // Both lanes are inlined per slot — look for the body shape.
+    expect(c).toMatch(/\) \+ \(.*\) \* I/);
+  });
+
+  it("supports scalar-broadcast in the 2-arg tensor form", () => {
+    const c = translate("a = complex([1 2 3], 7);\ndisp(a);\n");
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+  });
+
+  it("composes with `zeros` for the canonical complex-tensor idiom", () => {
+    const c = translate("a = complex(zeros(2, 3));\ndisp(a);\n");
+    // `zeros` produces a real tensor; `complex(...)` lifts it.
+    expect(c).toContain("mtoc_zeros_nd");
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+  });
+
+  it("rejects a complex arg in the 2-arg form (matches numbl)", () => {
+    expect(() => translate("a = complex(1 + 2i, 3);\ndisp(a);\n")).toThrow(
+      /real arguments in the 2-arg form/
+    );
+  });
+
+  it("rejects 0 args and 3+ args", () => {
+    expect(() => translate("disp(complex());\n")).toThrow(/1 or 2 arguments/);
+    expect(() => translate("disp(complex(1, 2, 3));\n")).toThrow(
+      /1 or 2 arguments/
+    );
+  });
+});

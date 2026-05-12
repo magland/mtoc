@@ -304,6 +304,19 @@ Call that reads `.cols` from the `mtoc_char_tensor_t` struct — no
 runtime helper needed. Tensor / numeric arguments fall through to
 the default `reduceTensor` validate / build path.
 
+`complex(...)` is the only path from a real-typed value to a
+complex-typed one (numbl has no `'like'` or `'complex'` companion
+arg on `zeros` / `ones` / `eye` / `nan` / `inf` / `randn`). Its
+`lowerExpr` hook handles both the 1-arg form
+(`complex(x)` — promote real → complex with imag plane = 0; a
+complex `x` passes through unchanged) and the 2-arg form
+(`complex(re, im)` — build `re + im*i`, rejects complex args).
+Scalar inputs render as a direct `(arg + 0.0 * I)` / `(re + im * I)`
+C expression; tensor inputs ride the standard elementwise lift —
+the iter-loop codegen allocates a complex result tensor and stamps
+the per-slot expression into each cell, including the broadcast
+cases `complex(scalar, tensor)` and `complex(tensor, scalar)`.
+
 String concat (`+`) is handled in the binary lowering path, not as a
 builtin. Whenever at least one operand is a string and the other is
 text (string or char array), the lowerer produces a `Binary(Add, …)`

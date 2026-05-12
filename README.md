@@ -254,8 +254,15 @@ The subset is growing iteratively. Roughly:
   applies componentwise via small runtime helpers. Scalar and
   tensor-elementwise `^` / `.^` accept any combination of real and
   complex operands (routed through C99 `cpow`); matrix `^` on
-  tensors is still rejected at lowering. `mod`/`rem` stay
-  real-only by numbl semantics.
+  tensors is still rejected at lowering. The `complex(...)`
+  builtin is the constructor surface: `complex(x)` promotes real
+  → complex (and passes complex through), `complex(re, im)` builds
+  `re + im*i` (scalar or tensor pair with broadcast). The
+  conventional idiom for a complex-zero tensor is
+  `complex(zeros(M, N))` — numbl has no `'like'` / `'complex'`
+  companion arg on `zeros`/`ones`/`eye`/`nan`/`inf`/`randn`, so
+  mtoc doesn't either. `mod`/`rem` stay real-only by numbl
+  semantics.
 - Strings (numbl `string`, scalar only): double-quoted literals
   (`"hello"`), concatenation via `+` with another string or char
   array (`"a" + "b" == "ab"`, `"hi " + 'there' == "hi there"`),

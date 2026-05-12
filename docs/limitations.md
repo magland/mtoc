@@ -202,9 +202,9 @@ workaround or a roadmap note.
   complex-aware scalar builtins (`sqrt`, `exp`, `log`, `log2`, `log10`,
   `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`,
   `cosh`, `tanh`, `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`,
-  `angle`, `isnan`, `isinf`, `isfinite`), complex tensor literals,
-  complex tensor element-wise arithmetic with broadcast, complex
-  tensor reductions (`sum`, `min`, `max` over vectors and
+  `angle`, `isnan`, `isinf`, `isfinite`, `complex`), complex tensor
+  literals, complex tensor element-wise arithmetic with broadcast,
+  complex tensor reductions (`sum`, `min`, `max` over vectors and
   matrices), are byte-for-byte against numbl. Scalar complex
   conditions in `if` / `elseif` / `while` expand to numbl's toBool
   rule (`creal(z) != 0 || cimag(z) != 0`); `logical(x)` and
@@ -215,7 +215,15 @@ workaround or a roadmap note.
   operands and route through C99 `cpow`; matrix `^` on tensors is
   still rejected at lowering. `mod`/`rem` on complex are real-only
   by numbl semantics (their sign-of-divisor / truncate-to-zero
-  rules don't have a sensible complex extension).
+  rules don't have a sensible complex extension). Bare ranges
+  (`a:b` / `a:s:b`) and the array constructors
+  `zeros`/`ones`/`eye`/`nan`/`inf`/`rand`/`randn` produce real
+  tensors only — numbl has no `"like"` / `"complex"` companion-arg
+  surface on any of them. To get a complex tensor of a given shape,
+  wrap with `complex(...)`: e.g. `complex(zeros(M, N))` for a
+  complex zero matrix or `complex(randn(M, N), randn(M, N))` for
+  an i.i.d. unit-variance complex normal draw (no `1/sqrt(2)`
+  scaling — numbl doesn't apply one either).
 - **Strings are partial.** Double-quoted scalar strings (`"hello"`)
   work for `disp`, `error`, `assert(_, msg)`, `strcmp`, `+`
   concatenation with another string or char-array, and `length(s)` /
