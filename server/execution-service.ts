@@ -27,6 +27,7 @@ import { tmpdir } from "os";
 import { promisify } from "util";
 import { translateProject, type SourceFile } from "../src/translate.js";
 import { buildCcArgs } from "../src/build.js";
+import { handleBuildWasm, probeEmcc, resolveEmcc } from "./wasm-build.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -351,9 +352,29 @@ async function handleRun(
   }
 }
 
+/** Bridges the active-execution counter to the wasm-build handler so it
+ *  shares the same `MTOC_MAX_CONCURRENT` cap as `/run`. Compiling several
+ *  wasm modules in parallel can easily saturate a developer laptop. */
+function makeAcquireRelease(maxConcurrent: number): {
+  acquire: () => boolean;
+  release: () => void;
+} {
+  return {
+    acquire: () => {
+      if (activeExecutions >= maxConcurrent) return false;
+      activeExecutions++;
+      return true;
+    },
+    release: () => {
+      activeExecutions--;
+    },
+  };
+}
+
 export function startServer(options: ServerOptions): void {
   const { port, host, passkey } = options;
   const cc = process.env.CC || "cc";
+  const emcc = resolveEmcc();
 
   const server = createServer(async (req, res) => {
     setCorsHeaders(res);
@@ -373,12 +394,30 @@ export function startServer(options: ServerOptions): void {
     const url = new URL(req.url || "/", `http://${host}:${port}`);
 
     if (url.pathname === "/health" && req.method === "GET") {
-      sendJson(res, 200, { status: "ok", activeExecutions, cc });
+      // Probe emcc on every health check so the IDE picks up the
+      // operator installing emsdk mid-session without needing a server
+      // restart. The probe is short (5s) and cached at the OS level.
+      const emccVersion = await probeEmcc();
+      sendJson(res, 200, {
+        status: "ok",
+        activeExecutions,
+        cc,
+        emcc: emccVersion,
+      });
       return;
     }
 
     if (url.pathname === "/run" && req.method === "POST") {
       await handleRun(req, res);
+      return;
+    }
+
+    if (url.pathname === "/build-wasm" && req.method === "POST") {
+      const maxConcurrent =
+        parseInt(process.env.MTOC_MAX_CONCURRENT || "") ||
+        DEFAULT_MAX_CONCURRENT;
+      const ar = makeAcquireRelease(maxConcurrent);
+      await handleBuildWasm(req, res, ar);
       return;
     }
 
@@ -388,7 +427,7 @@ export function startServer(options: ServerOptions): void {
   server.listen(port, host, () => {
     const display = host === "0.0.0.0" ? "all interfaces" : host;
     console.log(
-      `mtoc execution server listening on http://${display}:${port} (CC=${cc})`
+      `mtoc execution server listening on http://${display}:${port} (CC=${cc}, EMCC=${emcc})`
     );
   });
 }

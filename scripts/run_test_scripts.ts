@@ -17,10 +17,18 @@
 
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join, resolve } from "node:path";
-import { existsSync, readdirSync, statSync } from "node:fs";
-import { cpus } from "node:os";
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { cpus, tmpdir } from "node:os";
 
 const execFileAsync = promisify(execFile);
 
@@ -123,7 +131,98 @@ interface Result {
   detail: string | null;
 }
 
-async function runOne(scriptPath: string): Promise<Result> {
+type Target = "native" | "wasm";
+
+/** Resolve the emcc executable for the wasm target. Priority:
+ *  `MTOC_EMCC` env (absolute path); then bare `emcc` from PATH. */
+function resolveEmcc(): string {
+  return process.env.MTOC_EMCC || "emcc";
+}
+
+/** Translate the script with mtoc, compile to wasm with emcc, run the
+ *  resulting module in this Node process via the Emscripten ES-module
+ *  factory, and return its stdout. Threads/OpenMP are forced off (emsdk
+ *  doesn't ship libomp); the cross-runner's purpose is parity verification,
+ *  not parallel performance. */
+async function runWasm(scriptPath: string): Promise<string> {
+  const emcc = resolveEmcc();
+  const tempDir = mkdtempSync(join(tmpdir(), "mtoc-wasm-test-"));
+  try {
+    const cFile = join(tempDir, "out.c");
+    const outBase = join(tempDir, "out");
+
+    // Translate with mtoc (force threads=1 so no `<omp.h>` include).
+    const { stdout: cSource } = await execFileAsync(
+      "npx",
+      ["tsx", cliPath, "translate", "--threads", "1", scriptPath],
+      { maxBuffer: 16 * 1024 * 1024, timeout: TIMEOUT_MS }
+    );
+    writeFileSync(cFile, cSource);
+
+    // Compile with emcc. Flags mirror `buildEmccArgs` in src/build.ts
+    // for parity with the server.
+    await execFileAsync(
+      emcc,
+      [
+        cFile,
+        "-o",
+        `${outBase}.mjs`,
+        "-lm",
+        "-O2",
+        "-sMODULARIZE=1",
+        "-sEXPORT_ES6=1",
+        "-sEXPORT_NAME=createMtocModule",
+        "-sENVIRONMENT=web,worker,node",
+        "-sINITIAL_MEMORY=16777216",
+        "-sALLOW_MEMORY_GROWTH=1",
+        "-sEXIT_RUNTIME=1",
+        "-sINVOKE_RUN=1",
+        "-sFILESYSTEM=0",
+      ],
+      { maxBuffer: 16 * 1024 * 1024, timeout: TIMEOUT_MS }
+    );
+
+    // Instantiate and capture stdout. We import the .mjs glue dynamically;
+    // `wasmBinary` lets the glue skip its URL-based wasm fetch entirely.
+    const glueUrl = pathToFileURL(`${outBase}.mjs`).href;
+    const wasmBinary = readFileSync(`${outBase}.wasm`);
+    const mod: { default: (o: Record<string, unknown>) => Promise<unknown> } =
+      await import(glueUrl);
+    const chunks: string[] = [];
+    let exitCode = 0;
+    let exited = false;
+    try {
+      await mod.default({
+        wasmBinary,
+        print: (t: string) => chunks.push(t + "\n"),
+        printErr: () => {
+          /* parity is on stdout; stderr is ignored. */
+        },
+        noExitRuntime: false,
+        onExit: (code: number) => {
+          exitCode = code;
+          exited = true;
+        },
+      });
+    } catch (e) {
+      // Emscripten's `exit(N)` throws an ExitStatus; if onExit fired we
+      // have the code already and the run succeeded normally.
+      if (!exited) throw e;
+    }
+    if (exitCode !== 0) {
+      throw new Error(`wasm exited ${exitCode}`);
+    }
+    return chunks.join("");
+  } finally {
+    try {
+      rmSync(tempDir, { recursive: true, force: true });
+    } catch {
+      /* best-effort cleanup */
+    }
+  }
+}
+
+async function runOne(scriptPath: string, target: Target): Promise<Result> {
   const name = scriptPath.startsWith(repoRoot)
     ? scriptPath.slice(repoRoot.length + 1)
     : scriptPath;
@@ -139,6 +238,23 @@ async function runOne(scriptPath: string): Promise<Result> {
   } catch (e) {
     const msg = (e as Error).message.split("\n")[0];
     return { name, status: "FAIL", detail: `numbl errored: ${msg}` };
+  }
+
+  if (target === "wasm") {
+    let actual: string;
+    try {
+      actual = await runWasm(scriptPath);
+    } catch (e) {
+      const err = e as Error & { stderr?: string };
+      const tail = (err.stderr ?? "").trim();
+      const head = err.message.split("\n")[0];
+      const detail = tail
+        ? `wasm errored: ${head}\n${tail}`
+        : `wasm errored: ${head}`;
+      return { name, status: "FAIL", detail };
+    }
+    if (actual === expected) return { name, status: "PASS", detail: null };
+    return { name, status: "FAIL", detail: diff(expected, actual) };
   }
 
   let actual: string;
@@ -225,7 +341,40 @@ async function main(): Promise<void> {
     process.exit(2);
   }
 
-  const argv = process.argv.slice(2);
+  // Pull `--target native|wasm` out of argv up front; everything else
+  // is a positional script path.
+  const argvRaw = process.argv.slice(2);
+  let target: Target = "native";
+  const argv: string[] = [];
+  for (let i = 0; i < argvRaw.length; i++) {
+    const a = argvRaw[i];
+    if (a === "--target") {
+      const v = argvRaw[++i];
+      if (v !== "native" && v !== "wasm") {
+        console.error(
+          `run_test_scripts: --target must be 'native' or 'wasm' (got '${v ?? ""}')`
+        );
+        process.exit(2);
+      }
+      target = v;
+    } else {
+      argv.push(a);
+    }
+  }
+
+  if (target === "wasm") {
+    const emcc = resolveEmcc();
+    try {
+      await execFileAsync(emcc, ["--version"], { timeout: 5_000 });
+    } catch {
+      console.error(
+        `--target wasm needs 'emcc' available on PATH (or via MTOC_EMCC).\n` +
+          `Install emsdk and activate it, or set MTOC_EMCC=/path/to/emcc.`
+      );
+      process.exit(2);
+    }
+  }
+
   const scripts =
     argv.length > 0 ? argv.map(a => resolve(a)) : discoverScripts();
 
@@ -235,20 +384,25 @@ async function main(): Promise<void> {
   let fail = 0;
   const failedNames: string[] = [];
 
-  await runPool(scripts, concurrency, runOne, (_, r) => {
-    if (r.status === "PASS") {
-      pass++;
-      console.log(`PASS ${r.name}`);
-    } else {
-      fail++;
-      failedNames.push(r.name);
-      console.log(`FAIL ${r.name}`);
-      if (r.detail) console.log(r.detail);
+  await runPool(
+    scripts,
+    concurrency,
+    s => runOne(s, target),
+    (_, r) => {
+      if (r.status === "PASS") {
+        pass++;
+        console.log(`PASS ${r.name}`);
+      } else {
+        fail++;
+        failedNames.push(r.name);
+        console.log(`FAIL ${r.name}`);
+        if (r.detail) console.log(r.detail);
+      }
     }
-  });
+  );
 
   console.log(
-    `\n${pass} passed, ${fail} failed (${scripts.length} total, concurrency=${concurrency})`
+    `\n${pass} passed, ${fail} failed (${scripts.length} total, target=${target}, concurrency=${concurrency})`
   );
   if (failedNames.length > 0) {
     console.log(`failed: ${failedNames.join(" ")}`);

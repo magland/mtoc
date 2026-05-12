@@ -12,6 +12,10 @@ import {
 import Editor from "@monaco-editor/react";
 import type { TranslateError, SourceFile } from "../translate";
 import { OPT_PROFILES, type OptProfile } from "../optProfile";
+import type { ExecutionMode } from "../hooks/useRemoteExecution";
+import type { WasmOptLevel } from "../utils/wasmExecution";
+
+const WASM_OPT_LEVELS: ReadonlyArray<WasmOptLevel> = ["O0", "O2", "O3"];
 
 interface CSourcePanelProps {
   c: string;
@@ -43,6 +47,17 @@ interface CSourcePanelProps {
    *  displayed C and the compile-and-run output. */
   threads: number | "auto";
   onThreadsChange: (value: number | "auto") => void;
+  /** Current execution mode. In `wasm` the threads dropdown is replaced
+   *  with WASM-only knobs (optLevel, SIMD) since emsdk doesn't yet ship
+   *  libomp — see `docs/web.md`. */
+  mode: ExecutionMode;
+  /** Optimization level for the WASM build (`emcc -O{0,2,3}`). Native
+   *  mode unconditionally uses `-O3 -march=native`. */
+  wasmOptLevel: WasmOptLevel;
+  onWasmOptLevelChange: (value: WasmOptLevel) => void;
+  /** Whether to pass `-msimd128` to emcc. WASM-mode only. */
+  wasmSimd: boolean;
+  onWasmSimdChange: (value: boolean) => void;
   /** True while a remote run is in flight — toggling fast-math
    *  mid-run wouldn't take effect until the next run. We disable
    *  the switch to make that obvious. */
@@ -106,6 +121,11 @@ export function CSourcePanel({
   onFastMathChange,
   threads,
   onThreadsChange,
+  mode,
+  wasmOptLevel,
+  onWasmOptLevelChange,
+  wasmSimd,
+  onWasmSimdChange,
   isRunning,
 }: CSourcePanelProps) {
   return (
@@ -190,34 +210,80 @@ export function CSourcePanel({
               }
             />
           </Tooltip>
-          <FormControl size="small" sx={{ m: 0 }}>
-            <Select
-              value={String(threads)}
-              onChange={e => {
-                const v = e.target.value;
-                onThreadsChange(v === "auto" ? "auto" : Number(v));
-              }}
-              variant="standard"
-              disableUnderline
-              renderValue={v =>
-                threadValueToLabel(v === "auto" ? "auto" : Number(v))
-              }
-              sx={{
-                fontSize: 12,
-                color: "text.secondary",
-                "& .MuiSelect-select": { py: 0, pr: "18px !important" },
-              }}
-            >
-              {THREAD_PRESETS.map(p => (
-                <MenuItem key={String(p)} value={String(p)} dense>
-                  <Typography variant="caption">
-                    {threadValueToLabel(p)}
-                    {p === 1 ? " (serial)" : ""}
-                  </Typography>
-                </MenuItem>
-              ))}
-            </Select>
-          </FormControl>
+          {mode === "native" ? (
+            <FormControl size="small" sx={{ m: 0 }}>
+              <Select
+                value={String(threads)}
+                onChange={e => {
+                  const v = e.target.value;
+                  onThreadsChange(v === "auto" ? "auto" : Number(v));
+                }}
+                variant="standard"
+                disableUnderline
+                renderValue={v =>
+                  threadValueToLabel(v === "auto" ? "auto" : Number(v))
+                }
+                sx={{
+                  fontSize: 12,
+                  color: "text.secondary",
+                  "& .MuiSelect-select": { py: 0, pr: "18px !important" },
+                }}
+              >
+                {THREAD_PRESETS.map(p => (
+                  <MenuItem key={String(p)} value={String(p)} dense>
+                    <Typography variant="caption">
+                      {threadValueToLabel(p)}
+                      {p === 1 ? " (serial)" : ""}
+                    </Typography>
+                  </MenuItem>
+                ))}
+              </Select>
+            </FormControl>
+          ) : (
+            <>
+              <FormControl size="small" sx={{ m: 0 }}>
+                <Select
+                  value={wasmOptLevel}
+                  onChange={e =>
+                    onWasmOptLevelChange(e.target.value as WasmOptLevel)
+                  }
+                  variant="standard"
+                  disableUnderline
+                  renderValue={v => `-${v}`}
+                  disabled={isRunning}
+                  sx={{
+                    fontSize: 12,
+                    color: "text.secondary",
+                    "& .MuiSelect-select": { py: 0, pr: "18px !important" },
+                  }}
+                >
+                  {WASM_OPT_LEVELS.map(p => (
+                    <MenuItem key={p} value={p} dense>
+                      <Typography variant="caption">-{p}</Typography>
+                    </MenuItem>
+                  ))}
+                </Select>
+              </FormControl>
+              <Tooltip title="Compile WASM with -msimd128 for vectorized loops.">
+                <FormControlLabel
+                  sx={{ m: 0 }}
+                  control={
+                    <Switch
+                      size="small"
+                      checked={wasmSimd}
+                      onChange={e => onWasmSimdChange(e.target.checked)}
+                      disabled={isRunning}
+                    />
+                  }
+                  label={
+                    <Typography variant="caption" color="text.secondary">
+                      simd
+                    </Typography>
+                  }
+                />
+              </Tooltip>
+            </>
+          )}
           <Tooltip title="Show runtime helpers inline.">
             <FormControlLabel
               sx={{ m: 0 }}

@@ -87,11 +87,14 @@ right file.
 ## Local execution server
 
 `server/execution-service.ts` is a tiny Node HTTP server, started from the
-mtoc CLI (`mtoc serve --passkey <key>`). It exposes two endpoints, both
+mtoc CLI (`mtoc serve --passkey <key>`). It exposes three endpoints, all
 authenticated via `Authorization: Bearer <passkey>`:
 
-- `GET /health` — `{status, activeExecutions, cc}`. Used by the IDE's
-  connection-status icon.
+- `GET /health` — `{status, activeExecutions, cc, emcc}`. Used by the IDE's
+  connection-status icon. `emcc` is the first line of `emcc --version` when
+  Emscripten is available on the server (probed on every health check), or
+  `null` when it isn't — the IDE greys out the wasm-mode toggle in the
+  latter case.
 - `POST /run` — body `{files: SourceFile[], activeName: string}`. The
   server runs the same `translateProject` the IDE uses, writes the
   resulting C to a `mkdtemp` directory, invokes `cc -o a.out out.c -lm`
@@ -105,11 +108,26 @@ authenticated via `Authorization: Bearer <passkey>`:
   - `{type: "stderr", text}` — chunked stderr.
   - `{type: "done", phase: "translate"|"compile"|"run", exitCode, signal?}`
     — terminal event; the SSE stream closes immediately after.
+- `POST /build-wasm` — body `{files, activeName, optLevel?, simd?,
+fastMath?, enableTempInlining?}`. The server translates with the same
+  pipeline, then shells out to `emcc` (override via `MTOC_EMCC`) to
+  produce a WebAssembly module. Returns a single JSON reply:
+  - success: `{ok: true, wasm: <base64>, glue: <text>, meta: {...}}` —
+    `wasm` is the raw `.wasm` bytes, `glue` is Emscripten's ES-module
+    glue (a `.mjs` blob).
+  - translate failure: `{ok: false, phase: "translate", error: {kind,
+message, fileName?}}`.
+  - compile failure: `{ok: false, phase: "compile", stderr}`.
+
+  Builds are cached on disk in `$TMPDIR/mtoc-wasm-cache/` keyed by
+  SHA-256 of `(cSource, options)`. Cold emcc builds take a few seconds;
+  warm cache hits are <50 ms. `MTOC_BUILD_TIMEOUT_MS` (default 60 s)
+  caps a single cold build.
 
 Sending source rather than C is deliberate: the only C that ever reaches
-`cc` is what mtoc itself emits, so the server's effective attack surface
-is the constrained subset of C that mtoc generates, not arbitrary C the
-client could craft.
+`cc` or `emcc` is what mtoc itself emits, so the server's effective attack
+surface is the constrained subset of C that mtoc generates, not arbitrary
+C the client could craft.
 
 Defaults bind to `127.0.0.1` and use port `3002`. Override via flags
 (`--host`, `--port`) or env (`MTOC_SERVE_HOST`, `MTOC_SERVE_PORT`). Per-run
@@ -126,9 +144,81 @@ the user the full `mtoc serve --passkey …` command to paste into a terminal.
 key for the IDE to reconnect.
 
 `src/hooks/useRemoteExecution.ts` is the React-side state machine: holds
-`{status, connection, lines}`, exposes `run(c)`, `stop()`, and a
-`checkConnection()` that re-pings `/health`. `ConsolePanel` renders the
-`lines` array color-coded by channel.
+`{status, connection, health, lines}`, exposes `run(files, name, mode,
+opts)`, `stop()`, and a `checkConnection()` that re-pings `/health`.
+`ConsolePanel` renders the `lines` array color-coded by channel. The
+`mode` argument switches between the native SSE path
+(`utils/remoteExecution.ts`) and the WASM build-then-run path
+(`utils/wasmExecution.ts`); both produce the same `RunEvent` stream so
+the console UI is mode-agnostic.
+
+## WASM execution mode
+
+In wasm mode the server only compiles — execution happens in the browser.
+The flow is:
+
+1. Browser POSTs to `/build-wasm`. Server translates → `emcc` → returns
+   `{wasm, glue}`.
+2. Browser turns the glue into a Blob URL and dynamically imports it,
+   getting Emscripten's `createMtocModule` factory.
+3. Browser calls the factory with `{wasmBinary, print, printErr,
+noExitRuntime: false, onExit, onAbort}`. `print` / `printErr` route
+   into the same `ConsoleLine[]` the SSE path feeds. `_main` runs at
+   instantiation time (Emscripten's `-sINVOKE_RUN=1` default) and the
+   factory resolves once it exits.
+
+The toolbar `native | wasm` toggle is persisted in `localStorage`
+(`mtoc_execution_mode`). The wasm-mode-only knobs `optLevel` and `simd`
+are persisted under `mtoc_wasm_opt_level` / `mtoc_wasm_simd`. The native
+trio (`enableTempInlining`, `fastMath`, `threads`) is shared between
+modes but in wasm mode `threads` is forced to 1 — see "Threads" below.
+
+### Threads / OpenMP
+
+Threads are NOT yet supported on the wasm path. mtoc's parallel-loop
+codegen uses OpenMP (`#pragma omp parallel for`, `#include <omp.h>`,
+`omp_set_num_threads`), and the current bundled `emsdk` does not ship
+`omp.h` or a libomp port that emcc can link against. The wasm build
+path forces `threads = 1` at translation time so no `<omp.h>` include
+is emitted, and the IDE hides the threads dropdown in wasm mode to
+match. The native path still supports threads as before.
+
+When the upstream `emsdk` ships a libomp port, the plan is to:
+
+1. Drop the `threads = 1` override at translate time for the wasm path.
+2. Pass `-pthread -fopenmp -sPTHREAD_POOL_SIZE=<N>` to `emcc` in
+   `buildEmccArgs`.
+3. Add the COOP/COEP headers to Vite's dev/preview server so the page
+   has `crossOriginIsolated === true` (required for `SharedArrayBuffer`,
+   which Emscripten threads need). On GitHub Pages, ship
+   `coi-serviceworker` to add the headers via a service-worker shim,
+   since Pages can't set response headers directly.
+4. Bundle the Emscripten `.worker.js` companion file alongside the
+   `.wasm` + `.mjs` in the `/build-wasm` response.
+
+### SIMD
+
+`-msimd128` is supported and exposed as the wasm-mode "simd" toggle. It
+lets emcc lower hot loops to WebAssembly SIMD128 opcodes. Stdout is
+expected to match the non-SIMD native build byte-for-byte for the
+operations mtoc emits; if SIMD ever causes a divergence, that's a libc
+or compiler bug worth filing upstream.
+
+### Cross-runner
+
+`scripts/run_test_scripts.ts` accepts `--target wasm` to run every `.m`
+script through the wasm path instead of the native path. The wasm cross-
+runner translates, compiles with `emcc`, and instantiates the resulting
+module in the Node process via the same ES-module factory the browser
+uses (Node 18+'s `WebAssembly` and `Blob` are sufficient). Stdout is
+compared against numbl byte-for-byte, same oracle as the native runner.
+
+Run it as `MTOC_EMCC=/path/to/emcc npx tsx scripts/run_test_scripts.ts
+--target wasm` (or just `--target wasm` if `emcc` is already on PATH).
+Note that complex-pow edge cases like `(-1)^0.5` differ between glibc
+and emscripten's wasm-libc by 1 ULP and currently cause one expected
+mismatch (`test_scripts/complex/negative_base_power.m`); the native
+runner is byte-clean.
 
 ## Translator runtime in the browser
 

@@ -4,6 +4,8 @@ import {
   Button,
   IconButton,
   Stack,
+  ToggleButton,
+  ToggleButtonGroup,
   Tooltip,
   Typography,
 } from "@mui/material";
@@ -18,7 +20,10 @@ import { CSourcePanel } from "./CSourcePanel";
 import { ConsolePanel } from "./ConsolePanel";
 import { ExecutionSettingsDialog } from "./ExecutionSettingsDialog";
 import { useTranslation } from "../hooks/useTranslation";
-import { useRemoteExecution } from "../hooks/useRemoteExecution";
+import {
+  useRemoteExecution,
+  type ExecutionMode,
+} from "../hooks/useRemoteExecution";
 import {
   fileText,
   type UseProjectFilesResult,
@@ -34,6 +39,7 @@ import {
   profileSettings,
   type OptProfile,
 } from "../optProfile";
+import type { WasmOptLevel } from "../utils/wasmExecution";
 
 interface IDEWorkspaceProps {
   /** Returned by useProjectFiles or useShareProjectFiles. */
@@ -43,6 +49,25 @@ interface IDEWorkspaceProps {
 }
 
 const textEncoder = new TextEncoder();
+
+const EXECUTION_MODE_KEY = "mtoc_execution_mode";
+const WASM_OPT_LEVEL_KEY = "mtoc_wasm_opt_level";
+const WASM_SIMD_KEY = "mtoc_wasm_simd";
+
+function readExecutionMode(): ExecutionMode {
+  const v = localStorage.getItem(EXECUTION_MODE_KEY);
+  return v === "wasm" ? "wasm" : "native";
+}
+
+function readWasmOptLevel(): WasmOptLevel {
+  const v = localStorage.getItem(WASM_OPT_LEVEL_KEY);
+  if (v === "O0" || v === "O2" || v === "O3") return v;
+  return "O2";
+}
+
+function readWasmSimd(): boolean {
+  return localStorage.getItem(WASM_SIMD_KEY) === "true";
+}
 
 function activeName(
   files: WorkspaceFile[],
@@ -83,6 +108,23 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
   );
   const [fastMath, setFastMath] = useState(initialOpt.fastMath);
   const [threads, setThreads] = useState<number | "auto">(initialOpt.threads);
+  const [mode, setMode] = useState<ExecutionMode>(() => readExecutionMode());
+  const [wasmOptLevel, setWasmOptLevel] = useState<WasmOptLevel>(() =>
+    readWasmOptLevel()
+  );
+  const [wasmSimd, setWasmSimd] = useState<boolean>(() => readWasmSimd());
+  const handleModeChange = (next: ExecutionMode) => {
+    setMode(next);
+    localStorage.setItem(EXECUTION_MODE_KEY, next);
+  };
+  const handleWasmOptLevelChange = (next: WasmOptLevel) => {
+    setWasmOptLevel(next);
+    localStorage.setItem(WASM_OPT_LEVEL_KEY, next);
+  };
+  const handleWasmSimdChange = (next: boolean) => {
+    setWasmSimd(next);
+    localStorage.setItem(WASM_SIMD_KEY, String(next));
+  };
   /** Selecting a profile resets all three toggles to the profile's
    *  defaults; the dropdown itself stays on the selected profile name
    *  even after the user nudges an individual switch. That's a useful
@@ -150,13 +192,19 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
     [sourceFiles, active]
   );
 
+  // In wasm mode we force single-thread translation: emcc doesn't ship
+  // libomp, so any `#include <omp.h>` in the generated C breaks the build.
+  // This also matches the server's defense-in-depth: it forces threads=1
+  // at translate time regardless. We keep `threads` as user state so a
+  // round-trip into wasm-mode-and-back preserves the dropdown setting.
+  const effectiveThreads = mode === "wasm" ? 1 : threads;
   const { c, error } = useTranslation(
     sourceFiles,
     active ?? "",
     editorModel,
     includeRuntime,
     enableTempInlining,
-    threads
+    effectiveThreads
   );
 
   const handleEditorMount: OnMount = editorInstance => {
@@ -182,13 +230,25 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
       ? "Fix translation errors before running."
       : null;
 
+  const wasmAvailable = exec.health?.emcc != null;
+
   const handleRun = () => {
     if (exec.connection !== "connected") {
       setSettingsOpen(true);
       return;
     }
+    if (mode === "wasm" && !wasmAvailable) {
+      setSettingsOpen(true);
+      return;
+    }
     if (!active) return;
-    exec.run(sourceFiles, active, { enableTempInlining, fastMath, threads });
+    exec.run(sourceFiles, active, mode, {
+      enableTempInlining,
+      fastMath,
+      threads,
+      simd: wasmSimd,
+      optLevel: wasmOptLevel,
+    });
   };
 
   return (
@@ -217,6 +277,9 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
         canRun={canRun}
         runDisabledReason={runDisabledReason}
         connection={exec.connection}
+        mode={mode}
+        onModeChange={handleModeChange}
+        wasmAvailable={wasmAvailable}
         onRun={handleRun}
         onStop={exec.stop}
         onOpenSettings={() => setSettingsOpen(true)}
@@ -278,6 +341,11 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
               onFastMathChange={setFastMath}
               threads={threads}
               onThreadsChange={setThreads}
+              mode={mode}
+              wasmOptLevel={wasmOptLevel}
+              onWasmOptLevelChange={handleWasmOptLevelChange}
+              wasmSimd={wasmSimd}
+              onWasmSimdChange={handleWasmSimdChange}
               isRunning={isRunning}
             />
           </Splitter>
@@ -297,6 +365,11 @@ interface ToolbarProps {
   canRun: boolean;
   runDisabledReason: string | null;
   connection: ReturnType<typeof useRemoteExecution>["connection"];
+  mode: ExecutionMode;
+  onModeChange: (mode: ExecutionMode) => void;
+  /** False when the server is reachable but lacks `emcc`. Used to grey
+   *  out the wasm-mode toggle button. */
+  wasmAvailable: boolean;
   onRun: () => void;
   onStop: () => void;
   onOpenSettings: () => void;
@@ -307,6 +380,9 @@ function Toolbar({
   canRun,
   runDisabledReason,
   connection,
+  mode,
+  onModeChange,
+  wasmAvailable,
   onRun,
   onStop,
   onOpenSettings,
@@ -346,6 +422,35 @@ function Toolbar({
       ) : (
         runButton
       )}
+      <Tooltip
+        title={
+          wasmAvailable
+            ? "Where the program runs. Native: server compiles + runs locally. WASM: server compiles to WebAssembly, browser runs it."
+            : "WASM mode needs emcc on the server (install emsdk and activate it in the shell where you run `mtoc serve`)."
+        }
+      >
+        <span>
+          <ToggleButtonGroup
+            size="small"
+            value={mode}
+            exclusive
+            onChange={(_, v) => v && onModeChange(v as ExecutionMode)}
+            disabled={isRunning}
+            sx={{ height: 28 }}
+          >
+            <ToggleButton value="native" sx={{ py: 0, px: 1.5, fontSize: 12 }}>
+              native
+            </ToggleButton>
+            <ToggleButton
+              value="wasm"
+              disabled={!wasmAvailable}
+              sx={{ py: 0, px: 1.5, fontSize: 12 }}
+            >
+              wasm
+            </ToggleButton>
+          </ToggleButtonGroup>
+        </span>
+      </Tooltip>
       <Stack direction="row" alignItems="center" spacing={0.5}>
         <Tooltip title="Execution settings">
           <IconButton size="small" onClick={onOpenSettings} sx={{ color }}>

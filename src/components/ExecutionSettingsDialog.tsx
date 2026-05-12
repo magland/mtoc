@@ -35,7 +35,7 @@ interface ExecutionSettingsDialogProps {
 type ProbeStatus =
   | { state: "idle" }
   | { state: "checking" }
-  | { state: "ok"; cc: string }
+  | { state: "ok"; cc: string; emcc: string | null }
   | { state: "fail"; message: string };
 
 export function ExecutionSettingsDialog({
@@ -62,7 +62,7 @@ export function ExecutionSettingsDialog({
     setProbe({ state: "checking" });
     const health = await checkRemoteServiceHealth(url, passkey);
     if (health) {
-      setProbe({ state: "ok", cc: health.cc });
+      setProbe({ state: "ok", cc: health.cc, emcc: health.emcc ?? null });
     } else {
       setProbe({
         state: "fail",
@@ -149,9 +149,28 @@ export function ExecutionSettingsDialog({
           </Stack>
 
           {probe.state === "ok" && (
-            <Typography variant="body2" color="success.main">
-              Connected. Compiler: <code>{probe.cc}</code>
-            </Typography>
+            <Stack spacing={0.5}>
+              <Typography variant="body2" color="success.main">
+                Connected. Compiler: <code>{probe.cc}</code>
+              </Typography>
+              <Typography
+                variant="body2"
+                color={probe.emcc ? "success.main" : "text.secondary"}
+              >
+                WASM mode:{" "}
+                {probe.emcc ? (
+                  <>
+                    available (<code>{probe.emcc}</code>)
+                  </>
+                ) : (
+                  <>
+                    unavailable — install <code>emsdk</code> and activate it in
+                    the same shell where you run <code>mtoc serve</code>, or set{" "}
+                    <code>MTOC_EMCC</code>.
+                  </>
+                )}
+              </Typography>
+            </Stack>
           )}
           {probe.state === "fail" && (
             <Typography variant="body2" color="warning.main">

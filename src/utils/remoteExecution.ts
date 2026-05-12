@@ -66,6 +66,10 @@ export interface RemoteServiceHealth {
   status: string;
   activeExecutions: number;
   cc: string;
+  /** First line of `emcc --version`, or `null` when the server can't find
+   *  emcc on `PATH` (or `MTOC_EMCC` env). The IDE uses this to grey out the
+   *  WASM execution-mode toggle when the server can't compile to wasm. */
+  emcc?: string | null;
 }
 
 export async function checkRemoteServiceHealth(
