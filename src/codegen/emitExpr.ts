@@ -100,6 +100,53 @@ function inlinedSliceRead(
   return `${info.baseCName}.real[${info.fixedIndexCName} + ${rangingIter} * ${info.baseCName}.dims[0]]`;
 }
 
+/** Compute the C read expression for an inlined 2-D transpose
+ *  inside a broadcast iter loop. The transpose handle is never
+ *  populated; we read directly from the base with axes swapped:
+ *
+ *      output (t0, t1)  =  base (t1, t0)
+ *      base offset       = t1 + t0 * base.dims[0]
+ *
+ *  Each `tI` is derived from the corresponding output axis using
+ *  the transpose's static dim lattice (`outputAxisKinds`), exactly
+ *  mirroring what the broadcast emitter would have computed for a
+ *  materialized transpose: `one` contributes 0; `notOne` uses the
+ *  loop var; `unknown` guards on the runtime axis-1 check.
+ *
+ *  Transpose inlining only fires in broadcast frames; flat-iter
+ *  would need a div/mod to deconstruct the iter and is out of
+ *  scope for this MVP. */
+function inlinedTransposeRead(
+  frame: import("./emitState.js").IterFrame,
+  info: import("./emitState.js").InlinedTransposeFrameInfo
+): string {
+  if (frame.kind !== "broadcast") {
+    throw new Error(
+      "codegen internal: transpose inlining requires a broadcast iter frame"
+    );
+  }
+  const term = (i: 0 | 1): string => {
+    const kind = info.outputAxisKinds[i].kind;
+    if (kind === "one") return "0L";
+    if (kind === "notOne") return frame.loopVars[i];
+    // Unknown: read the corresponding base axis (axes are swapped:
+    // transpose output axis 0 corresponds to base axis 1).
+    const baseAxis = i === 0 ? 1 : 0;
+    return `(${info.baseCName}.dims[${baseAxis}] == 1 ? 0 : ${frame.loopVars[i]})`;
+  };
+  const t0 = term(0);
+  const t1 = term(1);
+  // Common cases simplify: t0 == "0L" → drop the column-stride
+  // multiply; t1 == "0L" → drop the row term.
+  if (t0 === "0L") {
+    return `${info.baseCName}.real[${t1}]`;
+  }
+  if (t1 === "0L") {
+    return `${info.baseCName}.real[${t0} * ${info.baseCName}.dims[0]]`;
+  }
+  return `${info.baseCName}.real[${t1} + ${t0} * ${info.baseCName}.dims[0]]`;
+}
+
 /** C-side struct field name for the column count of a tensor handle. */
 export function tensorColsField(ty: MType): string {
   return isNumeric(ty) && ty.elem === "char" ? "cols" : "dims[1]";
@@ -231,6 +278,10 @@ export function emitExpr(
         const slice = frame.inlinedSlices?.get(e.cName);
         if (slice !== undefined) {
           return inlinedSliceRead(frame, slice);
+        }
+        const transpose = frame.inlinedTransposes?.get(e.cName);
+        if (transpose !== undefined) {
+          return inlinedTransposeRead(frame, transpose);
         }
         const iter = iterIndexFor(state, e.cName);
         if (isNumeric(e.ty) && e.ty.elem === "char") {

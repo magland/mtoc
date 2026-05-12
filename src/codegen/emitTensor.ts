@@ -22,10 +22,12 @@ import {
   useRuntimeByName,
   type EmitState,
   type InlinedSliceFrameInfo,
+  type InlinedTransposeFrameInfo,
 } from "./emitState.js";
 import { emitExpr, tensorColsField, tensorRowsField } from "./emitExpr.js";
 import { formatNumLit } from "./emitFormat.js";
 import type { ColumnSliceInline } from "./opt/inlineColumnSlice.js";
+import type { TransposeInline } from "./opt/inlineTranspose.js";
 
 /** Walk an IR expression and return the first multi-element `Var`
  *  encountered — the "shape source" for an elementwise assign whose
@@ -130,7 +132,14 @@ export function emitTensorAssignFromExpr(
    *  iter frame so the Var-read substitution at `emitExpr` can
    *  rewrite the read into a direct base-buffer load. See
    *  `src/codegen/opt/inlineColumnSlice.ts`. */
-  sliceInlines?: ReadonlyMap<string, ColumnSliceInline>
+  sliceInlines?: ReadonlyMap<string, ColumnSliceInline>,
+  /** Per-consumer transpose inline map. Same protocol as
+   *  `sliceInlines`: emitter resolves axis sizes by swapping the
+   *  base's dims, skips per-operand precompute, attaches inline
+   *  info to the iter frame, and `emitExpr` substitutes the Var
+   *  read with a swapped-offset base load. See
+   *  `src/codegen/opt/inlineTranspose.ts`. */
+  transposeInlines?: ReadonlyMap<string, TransposeInline>
 ): void {
   const src = findShapeSourceVar(rhs);
   // When there is no multi-element Var in the RHS (e.g. `'abc' + 1`
@@ -171,7 +180,15 @@ export function emitTensorAssignFromExpr(
   }
 
   if (needsBroadcast) {
-    emitBroadcastAssign(state, level, cTarget, rhs, multiVars, sliceInlines);
+    emitBroadcastAssign(
+      state,
+      level,
+      cTarget,
+      rhs,
+      multiVars,
+      sliceInlines,
+      transposeInlines
+    );
     return;
   }
   emitFlatAssign(
@@ -414,24 +431,37 @@ function emitFlatAssign(
  *  for axes 0/1. Operand axes past the operand's own ndim are
  *  implicit-1 (the trailing-pad rule).
  *
- *  For an inlined column/row slice, the slice handle is never
- *  populated, so the axis-size lookup is redirected to the
- *  underlying base — column slice axis 0 reads `<base>.dims[0]`
- *  and axis 1 is literal `1L`; row slice flips them. The slice's
- *  static dim lattice in `v.ty` is unchanged, so the broadcast
- *  emitter's "is this axis `one`?" classification still picks the
- *  correct per-axis index-math template. */
+ *  For an inlined column/row slice or transpose, the operand's
+ *  runtime handle is never populated, so the axis-size lookup is
+ *  redirected to the underlying base:
+ *
+ *    - Column slice (`axis === 0`): axis 0 → `base.dims[0]`, axis 1 → `1L`.
+ *    - Row slice (`axis === 1`): axis 0 → `1L`, axis 1 → `base.dims[1]`.
+ *    - Transpose: axes swap — axis 0 → `base.dims[1]`, axis 1 →
+ *      `base.dims[0]`.
+ *
+ *  The operand's static dim lattice in `v.ty` is unchanged in each
+ *  case, so the broadcast emitter's per-axis index-math template
+ *  ("one" drops; "notOne" uses the loop var; "unknown" guards at
+ *  runtime) still picks the right shape. */
 function operandAxisSize(
   v: Extract<IRExpr, { kind: "Var" }>,
   i: number,
-  sliceInlines?: ReadonlyMap<string, ColumnSliceInline>
+  sliceInlines?: ReadonlyMap<string, ColumnSliceInline>,
+  transposeInlines?: ReadonlyMap<string, TransposeInline>
 ): string {
-  const inline = sliceInlines?.get(v.cName);
-  if (inline !== undefined) {
-    if (inline.axis === 0) {
-      return i === 0 ? `${inline.baseVar.cName}.dims[0]` : "1L";
+  const sliceInline = sliceInlines?.get(v.cName);
+  if (sliceInline !== undefined) {
+    if (sliceInline.axis === 0) {
+      return i === 0 ? `${sliceInline.baseVar.cName}.dims[0]` : "1L";
     }
-    return i === 0 ? "1L" : `${inline.baseVar.cName}.dims[1]`;
+    return i === 0 ? "1L" : `${sliceInline.baseVar.cName}.dims[1]`;
+  }
+  const transposeInline = transposeInlines?.get(v.cName);
+  if (transposeInline !== undefined) {
+    if (i === 0) return `${transposeInline.baseVar.cName}.dims[1]`;
+    if (i === 1) return `${transposeInline.baseVar.cName}.dims[0]`;
+    return "1L";
   }
   const ndim = isNumeric(v.ty) ? v.ty.dims.length : 2;
   if (i < ndim) {
@@ -457,7 +487,8 @@ function emitBroadcastAssign(
   cTarget: string,
   rhs: IRExpr,
   multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>,
-  sliceInlines: ReadonlyMap<string, ColumnSliceInline> | undefined
+  sliceInlines: ReadonlyMap<string, ColumnSliceInline> | undefined,
+  transposeInlines: ReadonlyMap<string, TransposeInline> | undefined
 ): void {
   useRuntimeByName(state, "mtoc_tensor_t");
   useRuntimeByName(state, "mtoc_tensor_assign");
@@ -501,12 +532,12 @@ function emitBroadcastAssign(
   // Per-axis broadcast result: chain mtoc_broadcast_dim across every
   // operand. Validates compatibility at runtime and yields the
   // axis-wise output size in one shot. `operandAxisSize` returns
-  // the base's dims (with the slice's fixed-axis size folded to
-  // `1L`) when the operand is an inlined slice.
+  // the base's dims (with the appropriate axis-1 fold) when the
+  // operand is an inlined slice or transpose.
   for (let i = 0; i < outNdim; i++) {
-    let expr = operandAxisSize(operands[0], i, sliceInlines);
+    let expr = operandAxisSize(operands[0], i, sliceInlines, transposeInlines);
     for (let k = 1; k < operands.length; k++) {
-      expr = `mtoc_broadcast_dim(${expr}, ${operandAxisSize(operands[k], i, sliceInlines)})`;
+      expr = `mtoc_broadcast_dim(${expr}, ${operandAxisSize(operands[k], i, sliceInlines, transposeInlines)})`;
     }
     pushStmt(state, level + 1, `long ${outDimNames[i]} = ${expr};`);
   }
@@ -553,21 +584,22 @@ function emitBroadcastAssign(
   // (column-major), padded with `1L` for axes the operand doesn't
   // carry.
   //
-  // Inlined slices are skipped here: the slice's runtime handle is
-  // never populated, so there's nothing to index into via the slice.
-  // The Var-read substitution at `emitExpr` rewrites the slice read
-  // to a direct base-buffer load using the broadcast frame's
-  // `loopVars` for the ranging axis and the precomputed
-  // `_mtoc_inline_<...>_fixed` local for the fixed axis.
+  // Inlined slices and transposes are skipped here: their runtime
+  // handles are never populated, so there's nothing to index into.
+  // The Var-read substitution at `emitExpr` rewrites their reads
+  // to direct base-buffer loads using the broadcast frame's
+  // `loopVars` (and the precomputed `_mtoc_inline_<...>_fixed`
+  // local for slices).
   const perVarIndex = new Map<string, string>();
   for (const [cName, v] of multiVars) {
     if (sliceInlines !== undefined && sliceInlines.has(cName)) continue;
+    if (transposeInlines !== undefined && transposeInlines.has(cName)) continue;
     const ndim = isNumeric(v.ty) ? v.ty.dims.length : 2;
     const idxName = `_mtoc_${cName}_idx`;
     const parts: string[] = [];
     const stridePieces: string[] = [];
     for (let i = 0; i < outNdim; i++) {
-      const axis = operandAxisSize(v, i, sliceInlines);
+      const axis = operandAxisSize(v, i, sliceInlines, transposeInlines);
       const staticDim =
         i < ndim && isNumeric(v.ty) ? v.ty.dims[i] : { kind: "one" as const };
       let term: string | null;
@@ -590,15 +622,30 @@ function emitBroadcastAssign(
     perVarIndex.set(cName, idxName);
   }
 
+  // Build the iter-frame transpose info map: just the producer
+  // info, no per-loop hoisted locals (transpose substitution
+  // computes its offset directly from the frame's loopVars).
+  const inlinedTransposeInfo = new Map<string, InlinedTransposeFrameInfo>();
+  if (transposeInlines !== undefined) {
+    for (const [cName, info] of transposeInlines) {
+      inlinedTransposeInfo.set(cName, {
+        baseCName: info.baseVar.cName,
+        outputAxisKinds: info.outputAxisKinds,
+      });
+    }
+  }
+
   // Render the body with the broadcast iter frame so each operand
   // Var read picks up its precomputed index. `loopVars` rides
-  // along on the frame so the inlined-slice Var-read substitution
-  // can pick the correct ranging-axis loop variable.
+  // along on the frame so the inlined slice/transpose Var-read
+  // substitutions can pick the correct ranging-axis loop variable.
   state.iterStack.push({
     kind: "broadcast",
     perVarIndex,
     loopVars,
     inlinedSlices: inlinedFrameInfo.size === 0 ? undefined : inlinedFrameInfo,
+    inlinedTransposes:
+      inlinedTransposeInfo.size === 0 ? undefined : inlinedTransposeInfo,
   });
   const bodyStr = emitExpr(state, rhs, 0);
   state.iterStack.pop();

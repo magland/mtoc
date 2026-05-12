@@ -40,6 +40,10 @@ import {
   buildColumnSlicePlan,
   EMPTY_COLUMN_SLICE_PLAN,
 } from "./opt/inlineColumnSlice.js";
+import {
+  buildTransposePlan,
+  EMPTY_TRANSPOSE_PLAN,
+} from "./opt/inlineTranspose.js";
 
 /** Options for `emitC`. */
 export interface EmitOptions {
@@ -83,6 +87,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     multiAssignCallCounter: 0,
     fusionPlan: null,
     columnSlicePlan: null,
+    transposePlan: null,
     disableOptimizations,
   };
 
@@ -115,6 +120,9 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   state.columnSlicePlan = disableOptimizations
     ? EMPTY_COLUMN_SLICE_PLAN
     : buildColumnSlicePlan(prog.stmts, state.futureTouches);
+  state.transposePlan = disableOptimizations
+    ? EMPTY_TRANSPOSE_PLAN
+    : buildTransposePlan(prog.stmts, state.futureTouches);
   emitDeclarations(state, 1, prog.assignedVars);
   for (const s of prog.stmts) emitStmt(state, 1, s);
   // Free every tensor backing allocated for top-level vars not
@@ -126,6 +134,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   state.futureTouches = null;
   state.fusionPlan = null;
   state.columnSlicePlan = null;
+  state.transposePlan = null;
 
   // Headers: explicit needs from user code, plus runtime-snippet
   // headers when those snippets are part of the output. With

@@ -79,6 +79,12 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   ) {
     return;
   }
+  if (
+    state.transposePlan !== null &&
+    state.transposePlan.skipProducers.has(s)
+  ) {
+    return;
+  }
   switch (s.kind) {
     case "Assign": {
       // `state.needMath` and runtime activations were set up by the
@@ -153,18 +159,21 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           // expression instead of `s.rhs`. The producer's own Assign
           // is in `state.fusionPlan.skipProducers` and emits no loop.
           const effectiveRhs = state.fusionPlan?.consumerRhs.get(s) ?? s.rhs;
-          // Column-slice inlining hook: pass the consumer's
-          // slice-inline map through so the emitter can resolve
-          // axis sizes from the base, skip per-operand precompute
-          // for inlined slices, and attach inline info to the iter
-          // frame (consumed at the `Var`-read site in `emitExpr`).
+          // Column-slice / transpose inlining hooks: pass the
+          // consumer's inline maps through so the emitter can
+          // resolve axis sizes from each producer's base, skip
+          // per-operand precompute for inlined producers, and
+          // attach inline info to the iter frame (consumed at the
+          // `Var`-read site in `emitExpr`).
           const sliceInlines = state.columnSlicePlan?.consumerInlines.get(s);
+          const transposeInlines = state.transposePlan?.consumerInlines.get(s);
           emitTensorAssignFromExpr(
             state,
             level,
             s.cName,
             effectiveRhs,
-            sliceInlines
+            sliceInlines,
+            transposeInlines
           );
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
           break;

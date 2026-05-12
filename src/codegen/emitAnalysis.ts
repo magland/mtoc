@@ -23,6 +23,7 @@ import { forEachStmtInTree, forEachTopLevelExpr } from "../lowering/walk.js";
 import { topLevelOwnedDefs, topLevelOwnedUses } from "./liveness.js";
 import { fusedOwnedUses } from "./opt/fuseSameShape.js";
 import { columnSliceInlinedOwnedUses } from "./opt/inlineColumnSlice.js";
+import { transposeInlinedOwnedUses } from "./opt/inlineTranspose.js";
 import { ownedOps } from "./ownedKinds.js";
 import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 import { analyzeExpr, emitExpr, wrapTextView } from "./emitExpr.js";
@@ -80,6 +81,17 @@ export function deadAfterStmt(state: EmitState, s: IRStmt): string[] {
     const augmented = columnSliceInlinedOwnedUses(
       s,
       state.columnSlicePlan,
+      touched
+    );
+    if (augmented !== null) touched = augmented;
+  }
+  // Transpose inlining: same shape — the consumer effectively reads
+  // each inlined transpose's base, so the base counts as a touch at
+  // this stmt for the early-free decision.
+  if (state.transposePlan !== null) {
+    const augmented = transposeInlinedOwnedUses(
+      s,
+      state.transposePlan,
       touched
     );
     if (augmented !== null) touched = augmented;

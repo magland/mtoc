@@ -19,6 +19,7 @@ import type { BuiltinEmitState } from "../workspace/builtins.js";
 import type { FutureTouchMap } from "./liveness.js";
 import type { FusionPlan } from "./opt/fuseSameShape.js";
 import type { ColumnSlicePlan } from "./opt/inlineColumnSlice.js";
+import type { TransposePlan } from "./opt/inlineTranspose.js";
 import { RUNTIME_HELPERS, type RuntimeSnippet } from "./runtime.js";
 
 /** Per-slice emit-time info for a slice that has been inlined into
@@ -37,6 +38,26 @@ export interface InlinedSliceFrameInfo {
   baseCName: string;
   axis: 0 | 1;
   fixedIndexCName: string;
+}
+
+/** Per-transpose emit-time info for a transpose that has been
+ *  inlined into the consumer currently in this iter frame. The
+ *  Var-read for the transpose's cName at `emitExpr` consults this
+ *  map and substitutes a direct read into the base tensor with
+ *  swapped axes; the transpose handle itself is never populated.
+ *
+ *   - `baseCName`: C identifier for the base tensor struct.
+ *   - `outputAxisKinds`: static dim lattice of the transpose's
+ *             OUTPUT (axes already swapped relative to the base).
+ *             Drives per-axis term selection at the substitution
+ *             site, exactly mirroring what the broadcast emitter
+ *             would have done for a materialized transpose. */
+export interface InlinedTransposeFrameInfo {
+  baseCName: string;
+  outputAxisKinds: readonly [
+    import("../lowering/types.js").DimInfo,
+    import("../lowering/types.js").DimInfo,
+  ];
 }
 
 /** A frame on the per-element-loop stack. `flat` is the same-shape
@@ -58,12 +79,14 @@ export type IterFrame =
       kind: "flat";
       iter: string;
       inlinedSlices?: ReadonlyMap<string, InlinedSliceFrameInfo>;
+      inlinedTransposes?: ReadonlyMap<string, InlinedTransposeFrameInfo>;
     }
   | {
       kind: "broadcast";
       perVarIndex: ReadonlyMap<string, string>;
       loopVars: ReadonlyArray<string>;
       inlinedSlices?: ReadonlyMap<string, InlinedSliceFrameInfo>;
+      inlinedTransposes?: ReadonlyMap<string, InlinedTransposeFrameInfo>;
     };
 
 export interface EmitState {
@@ -175,6 +198,14 @@ export interface EmitState {
    *  (substitute slice Var reads) consult this field. See
    *  `src/codegen/opt/inlineColumnSlice.ts`. */
   columnSlicePlan: ColumnSlicePlan | null;
+  /** Transpose inlining plan for the scope currently being emitted,
+   *  or `null` when disabled or no scope is active. Same hook
+   *  structure as the column-slice plan: skip producers, override
+   *  per-operand axis sizes (swap base dims), skip per-operand
+   *  precompute, attach inline info to the iter frame, substitute
+   *  the Var read at emitExpr. See
+   *  `src/codegen/opt/inlineTranspose.ts`. */
+  transposePlan: TransposePlan | null;
   /** When true, every per-scope plan-build site substitutes the
    *  empty plan (no fusion). Mirrors the
    *  `EmitOptions.disableOptimizations` knob; carried on the state

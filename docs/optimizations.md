@@ -180,6 +180,80 @@ m.dims[0]]` for `row` directly.
 - Composition with same-shape fusion when the chain crosses
   shapes (e.g. slice → flat-iter → broadcast).
 
+### Transpose inlining (`inlineTranspose.ts`)
+
+Recognizes producers of the form `_anf = base.'` (a direct
+`mtoc_tensor_transpose` / `_complex` `Call` whose single argument is
+a `Var`) whose result is consumed exactly once by a downstream
+BROADCAST elementwise `Assign`, and rewrites the read of the
+transpose at the consumer's loop body to read directly from the
+base with axes swapped — skipping the transpose's allocation and
+copy loop entirely.
+
+For example,
+
+```matlab
+function r = f(col)
+  t = col.';
+  r = col + t;
+end
+```
+
+emits a `mtoc_tensor_transpose(col)` alloc + loop plus the broadcast
+loop for `r` by default. With transpose inlining the transpose loop
+disappears; the broadcast loop reads `col.real[k1]` directly for
+each `(k0, k1)` of the output.
+
+**Index math.** For a 2-D transpose `t = base.'`, output element
+`(t0, t1)` corresponds to base element `(t1, t0)`. In column-major,
+the base offset is `t1 + t0 * base.dims[0]`. Each `tI` derives from
+the transpose's static dim lattice exactly the way the broadcast
+emitter would compute it: `one` contributes 0, `notOne` uses
+`loopVars[i]`, `unknown` guards on a runtime axis-1 check. Common
+cases simplify to either `base.real[k1]` (column → row transpose)
+or `base.real[k0 * base.dims[0]]` (row → column transpose).
+
+**Preconditions (all must hold).**
+
+- Producer is `Assign(prodCName, Call(builtin "transpose", [Var]))`
+  with the base a 2-D multi-element real-double `Var`.
+- Consumer is a broadcast elementwise `Assign` — i.e. at least two
+  multi-element operands of differing static shape. Flat-iter
+  consumers would need div/mod inside the loop body to deconstruct
+  the iter into (k0, k1) coords; deferred.
+- The producer's cName has exactly one use, at this consumer.
+- Only iter-slot positions (no `IndexLoad.base` etc.).
+- No intervening writes to the base or to the producer's cName.
+- Same body, no cross-CF.
+
+**Hook sites:**
+
+- `emit.ts` / `emitFunction.ts` — build the plan after liveness;
+  stash on `EmitState.transposePlan`.
+- `emitStmt.ts` — early-return on `plan.skipProducers`; pass
+  `plan.consumerInlines.get(s)` down to `emitTensorAssignFromExpr`.
+- `emitTensor.ts` — `operandAxisSize` swaps the base's dims for
+  inlined transposes; per-operand index precompute is skipped; iter
+  frame carries the inline info.
+- `emitExpr.ts` — Var-read substitution via `inlinedTransposeRead`.
+- `emitAnalysis.ts::deadAfterStmt` — augment the consumer's owned-
+  use set with each inlined transpose's base.
+
+**Composition note.** This peephole pairs naturally with column-
+slice inlining when a slice's consumer is a transpose whose consumer
+is a broadcast. Today, the slice in `slice → transpose → broadcast`
+still materializes — the slice's direct consumer (the transpose)
+isn't an elementwise Assign, so `inlineColumnSlice.ts` declines.
+Closing that last gap is a follow-up "chained slice+transpose"
+peephole.
+
+**Out of scope (deferred):**
+
+- Complex transposes (the `mtoc_tensor_transpose_complex` path).
+- Flat-iter consumers.
+- Transposes of N-D tensors (`> 2-D` is rejected at lowering today).
+- Conjugate transpose `'` (also rejected at lowering today).
+
 ## Adding an optimization
 
 1. Drop a new file under `src/codegen/opt/<name>.ts`. Export:
