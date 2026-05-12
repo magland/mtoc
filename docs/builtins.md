@@ -282,11 +282,18 @@ The text-view-aware builtins:
   `mtoc_text_from_*` adapter and emits a single `mtoc_strcmp_text(va,
 vb)` call returning a real scalar (1.0 / 0.0).
 
-Numeric predicates `isnan(x)` / `isinf(x)` / `isfinite(x)` and the
-`logical(x)` coercion are inlined as expression-level emits — no
-runtime helper, just a `(double)isnan(x)` / `(x != 0.0 ? 1.0 : 0.0)`
-shape. They follow numbl's logical-as-double convention so the
-result threads cleanly into arithmetic / `assert` / `disp`.
+Numeric predicates `isnan(x)` / `isinf(x)` / `isfinite(x)` accept
+both real and complex scalars. Real inputs render inline
+(`(double)isnan(x)`); complex inputs route through a small runtime
+helper (`mtoc_isnan_complex` / `mtoc_isinf_complex` /
+`mtoc_isfinite_complex`) that binds the argument to a local so a
+caller-side Call expression — e.g. `isnan(csqrt(z))` — is
+evaluated exactly once. The helpers expand componentwise per
+numbl: EITHER-lane for `isnan` / `isinf`, BOTH-lanes for
+`isfinite`. `logical(x)` is real-only (numbl rejects a complex
+argument) and renders inline as `(x != 0.0 ? 1.0 : 0.0)`. All
+four follow numbl's logical-as-double convention so the result
+threads cleanly into arithmetic / `assert` / `disp`.
 
 `length(s)` and `numel(s)` use their `lowerExpr` hook to handle
 non-tensor arguments. When the argument is a string, both fold to a

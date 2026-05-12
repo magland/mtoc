@@ -82,8 +82,8 @@ workaround or a roadmap note.
   tensors is explicitly rejected at lowering with a message pointing the user
   at `.* ./ .^` for elementwise. Matrix ops will need a separate codegen path
   (likely calling into a BLAS-shaped helper). `.^` itself works on tensors
-  (real-elem, scalar↔tensor broadcast or same-shape tensor↔tensor); complex
-  `.^` is deferred.
+  for real OR complex operands (scalar↔tensor broadcast or same-shape
+  tensor↔tensor); complex `.^` routes through C99 `cpow` per element.
 - **Both transposes are wired.** `.'` (non-conjugate) and `'`
   (conjugate) work on 2-D real and complex tensors and on scalars
   — real / char scalars are identity for both; a scalar complex
@@ -202,12 +202,20 @@ workaround or a roadmap note.
   complex-aware scalar builtins (`sqrt`, `exp`, `log`, `log2`, `log10`,
   `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`,
   `cosh`, `tanh`, `abs`, `sign`, `min`, `max`, `real`, `imag`, `conj`,
-  `angle`), complex tensor literals, complex tensor element-wise
-  arithmetic with broadcast, complex tensor reductions (`sum`, `min`,
-  `max` over vectors and matrices), are byte-for-byte against numbl.
-  `^` (complex pow), the rounding family (`floor`/`ceil`/`round`/`fix`)
-  on complex, and `mod`/`rem` on complex are not yet supported. `floor`/`ceil`/`round`/`fix` would need a componentwise
-  runtime helper; `mod`/`rem` are real-only by numbl semantics.
+  `angle`, `isnan`, `isinf`, `isfinite`), complex tensor literals,
+  complex tensor element-wise arithmetic with broadcast, complex
+  tensor reductions (`sum`, `min`, `max` over vectors and
+  matrices), are byte-for-byte against numbl. Scalar complex
+  conditions in `if` / `elseif` / `while` expand to numbl's toBool
+  rule (`creal(z) != 0 || cimag(z) != 0`); `logical(x)` and
+  `assert(cond)` remain real-only because numbl rejects a complex
+  argument in both. The complex rounding family
+  (`floor`/`ceil`/`round`/`fix`) is componentwise via small
+  runtime helpers. Scalar `^` / `.^` and tensor `.^` admit complex
+  operands and route through C99 `cpow`; matrix `^` on tensors is
+  still rejected at lowering. `mod`/`rem` on complex are real-only
+  by numbl semantics (their sign-of-divisor / truncate-to-zero
+  rules don't have a sensible complex extension).
 - **Strings are partial.** Double-quoted scalar strings (`"hello"`)
   work for `disp`, `error`, `assert(_, msg)`, `strcmp`, `+`
   concatenation with another string or char-array, and `length(s)` /

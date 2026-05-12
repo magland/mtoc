@@ -16,7 +16,8 @@ export function lowerWhile(
   return this.withControlDepth(() => {
     const envBefore = new Map(this.env);
     const cond = this.lowerExpr(s.cond);
-    this.requireScalarReal(cond.ty, "while condition", s.span);
+    // Complex conds follow the same toBool rule as `if` — see lowerIf.
+    this.requireScalarCond(cond.ty, "while condition", s.span);
     const body = this.lowerStmts(s.body);
     this.env = this.mergeBranchEnvs(
       [envBefore, new Map(this.env)],

@@ -110,8 +110,10 @@ The subset is growing iteratively. Roughly:
   `expm1`, `log1p`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`,
   `cosh`, `tanh`, `floor`, `ceil`, `round`, `fix`, `rem`, `min`, `max`,
   `atan2`, `hypot`, `power`
-- Numeric predicates: `isnan`, `isinf`, `isfinite`, `logical` (all
-  scalar; return 0.0/1.0 to match numbl's logical-as-double convention)
+- Numeric predicates: `isnan`, `isinf`, `isfinite` (real or complex —
+  EITHER-lane for `isnan`/`isinf`, BOTH-lanes for `isfinite`),
+  `logical` (real only, per numbl); all scalar, all return 0.0/1.0
+  to match numbl's logical-as-double convention
 - Runtime helpers: `sign`, `mod`, `length`, `numel`, `strcmp`
   (char-array, string, or any mix; scalar 0/1 result)
 - Reductions: `sum(t)`, `min(t)`, `max(t)` — single-arg, over any
@@ -248,8 +250,12 @@ The subset is growing iteratively. Roughly:
   tensor-aware reductions `sum`, `min`, `max` (single-arg form over
   vectors and matrices, including complex). `length`/`numel` accept
   any tensor.
-  `floor`/`ceil`/`round`/`fix`, `mod`/`rem`, and `^` stay real-only
-  for now (numbl-semantics or pending implementation work).
+  The complex rounding family — `floor`, `ceil`, `round`, `fix` —
+  applies componentwise via small runtime helpers. Scalar and
+  tensor-elementwise `^` / `.^` accept any combination of real and
+  complex operands (routed through C99 `cpow`); matrix `^` on
+  tensors is still rejected at lowering. `mod`/`rem` stay
+  real-only by numbl semantics.
 - Strings (numbl `string`, scalar only): double-quoted literals
   (`"hello"`), concatenation via `+` with another string or char
   array (`"a" + "b" == "ab"`, `"hi " + 'there' == "hi there"`),
