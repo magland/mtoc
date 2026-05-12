@@ -219,18 +219,14 @@ describe("translate scalar example", () => {
     expect(frees.length).toBeGreaterThanOrEqual(2);
   });
 
-  it("rejects disp of a non-Var tensor expression at lowering", () => {
-    let err: unknown;
-    try {
-      translate("v = [1 2 3];\ndisp(v + 1);\n");
-    } catch (e) {
-      err = e;
-    }
-    expect(err).toBeInstanceOf(Error);
-    const e = err as { name: string; message: string; span: unknown };
-    expect(e.name).toBe("UnsupportedConstruct");
-    expect(e.span).toBeTruthy();
-    expect(e.message).toMatch(/disp/i);
+  it("auto-materializes a non-Var tensor expression at a disp site via ANF", () => {
+    // `disp(v + 1)` lowers cleanly: ANF hoists the multi-element
+    // Binary into a synthetic `_mtoc_anf_<N> = v + 1;` Assign, then
+    // disp consumes the named handle.
+    const c = translate("v = [1 2 3];\ndisp(v + 1);\n");
+    expect(c).toMatch(/_mtoc_anf_\d+/);
+    // The disp call reads the synthetic temp, not a bare expression.
+    expect(c).toMatch(/mtoc_disp_tensor\(_mtoc_anf_\d+\)/);
   });
 
   it("emits `mtoc_tensor_t v` for a tensor function parameter", () => {

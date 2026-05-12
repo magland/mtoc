@@ -130,15 +130,20 @@ if(_mtoc_n > 1024)` above the outermost loop of both the flat-iter
   larger expressions into its own synthetic
   `_mtoc_anf_<N> = <producer>;` Assign, registered in the enclosing
   scope's `assignedVars`. After ANF, owned producers appear at exactly
-  one position: the full RHS of an owned-LHS Assign. That tight
+  one position: the full RHS of an owned-LHS Assign. The same pass
+  also hoists multi-element _non_-owned expressions (Binary, Unary,
+  elementwise-builtin Call on tensors) at every "consume-as-struct"
+  site — `disp` / `error` / `assert` msg / `fprintf` args, reduction
+  builtins like `sum` / `min` / `max`, user-function args — so codegen
+  always sees a `Var` (or scalar / literal) there. That tight
   invariant collapses what used to be a patchwork of context-sensitive
   consume-site rules into a single `mtoc_<kind>_assign(&lhs, producer)`
   path, with the existing liveness / scope-exit free walks managing
   every temp's lifetime uniformly. Arbitrary nesting like
   `helper(helper(x))`, `bump(helper(x), 7)`, `sum(helper(x))`,
-  `disp(helper(x))`, `[1 2] + 1`, `v(1:3) + 1`, `(a + b) + c`
-  (strings), etc. all decompose into a sequence of well-formed
-  Assigns automatically.
+  `disp(a + b)`, `sum(sqrt(a + b))`, `[1 2] + 1`, `v(1:3) + 1`,
+  `(a + b) + c` (strings), etc. all decompose into a sequence of
+  well-formed Assigns automatically.
 - **Function-file entry**: when the source has no top-level script
   statements but at least one function definition, `lower()` adopts
   the first function's body as the script body. The function still

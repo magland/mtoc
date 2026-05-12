@@ -50,23 +50,21 @@ workaround or a roadmap note.
   deferred.** The infrastructure for runtime-shape allocation is in
   place (see the tensor-constructor builtins above) — adding these
   is mechanical work matching numbl's exact formulas.
-- **Tensor sub-expressions only at `Assign` RHS — for _non_-owned
-  expressions.** `disp(a + b)` and `sum(a .* a)` still fail with a
-  "assign to a temp first" message: a Binary on two tensors produces a
-  multi-element value with no surrounding consume site. Element-wise
-  scalar builtins (`sqrt`, `sin`, `cos`, `abs`, `atan2`, `hypot`,
-  `power`, `min`, `max`, `mod`, `rem`, `floor`, `ceil`, `round`, `fix`,
+- **Tensor sub-expressions compose freely.** Element-wise scalar
+  builtins (`sqrt`, `sin`, `cos`, `abs`, `atan2`, `hypot`, `power`,
+  `min`, `max`, `mod`, `rem`, `floor`, `ceil`, `round`, `fix`,
   `isnan`, `isinf`, `isfinite`, `logical`, `real`, `imag`, `conj`,
-  `angle`, `sign`) DO lift over tensor arguments automatically at the
+  `angle`, `sign`) lift over tensor arguments automatically at the
   top level of an `Assign` — `y = sqrt(x)` materializes the same
   per-slot loop as `y = x .* x`. Owned-producing sub-expressions
-  (TensorLit, IndexSlice, string concat, tensor-returning user-function
-  calls) are automatically hoisted by the ANF pass, so
-  `disp(helper(x))`, `sum(helper(x))`, `y = [1 2] + 1`,
-  `y = v(1:3) + 1`, `s = (a + b) + c`, `y = helper(helper(x))`, and
-  `y = bump(helper(x), 7)` all compile cleanly. Auto-materialization of
-  _non_-owned intermediate tensors (e.g. Binary on two tensors as a
-  disp arg) is still a known TODO.
+  (TensorLit, IndexSlice, MakeRange, string concat, tensor-returning
+  user-function calls) are hoisted by the ANF pass, and the same pass
+  also hoists _non_-owned multi-element expressions (Binary, Unary,
+  elementwise-builtin Call on tensors) at every consume-as-struct
+  site — `disp`, `error`, `assert` msg, `fprintf` args, reduction-
+  builtin args, user-function args. So `disp(a + b)`,
+  `sum(a .* a)`, `fprintf('%d ', a + b)`, `sq(a + b)`, and the
+  nested `disp(sqrt(a + b))` all compile cleanly.
 - **Broadcasting (implicit expansion) between tensors.** Tensor⊙tensor
   arithmetic and comparison ops (`+ - .* ./ .^`, `== ~= < <= > >=`)
   follow MATLAB's implicit-expansion rule: an axis of size 1 expands

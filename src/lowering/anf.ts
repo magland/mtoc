@@ -33,7 +33,8 @@ import type {
   IndexSliceArg,
   VarBinding,
 } from "./ir.js";
-import { isOwned, isString, type MType } from "./types.js";
+import { isMultiElement, isOwned, isString, type MType } from "./types.js";
+import { isElementwiseBuiltin } from "./lowerFuncCall.js";
 
 /** Counter shared across the whole program so synthetic temp names
  *  stay deterministic and unique. Boxed in an object so passes can
@@ -122,24 +123,25 @@ function anfStmt(
     }
     case "Disp": {
       const pre: IRStmt[] = [];
-      const newArg = anfExpr(s.arg, pre, av, c);
+      const newArg = anfRequireHandle(s.arg, pre, av, c);
       return [...pre, { ...s, arg: newArg }];
     }
     case "Error": {
       const pre: IRStmt[] = [];
-      const newArg = anfExpr(s.arg, pre, av, c);
+      const newArg = anfRequireHandle(s.arg, pre, av, c);
       return [...pre, { ...s, arg: newArg }];
     }
     case "Assert": {
       const pre: IRStmt[] = [];
       const newCond = anfExpr(s.cond, pre, av, c);
-      const newMsg = s.msg === null ? null : anfExpr(s.msg, pre, av, c);
+      const newMsg =
+        s.msg === null ? null : anfRequireHandle(s.msg, pre, av, c);
       return [...pre, { ...s, cond: newCond, msg: newMsg }];
     }
     case "Fprintf": {
       const pre: IRStmt[] = [];
-      const newFmt = anfExpr(s.fmt, pre, av, c);
-      const newArgs = s.args.map(a => anfExpr(a, pre, av, c));
+      const newFmt = anfRequireHandle(s.fmt, pre, av, c);
+      const newArgs = s.args.map(a => anfRequireHandle(a, pre, av, c));
       return [...pre, { ...s, fmt: newFmt, args: newArgs }];
     }
     case "If": {
@@ -205,8 +207,11 @@ function anfStmt(
       return [...pre, { ...s, index: newIndex, rhs: newRhs }];
     }
     case "MultiAssignCall": {
+      // User-function multi-output call: every tensor arg lands in
+      // the callee via copy-on-arg-pass, which requires a full
+      // struct handle. Multi-element non-Var args must be hoisted.
       const pre: IRStmt[] = [];
-      const newArgs = s.args.map(a => anfExpr(a, pre, av, c));
+      const newArgs = s.args.map(a => anfRequireHandle(a, pre, av, c));
       return [...pre, { ...s, args: newArgs }];
     }
     case "Break":
@@ -235,8 +240,18 @@ function anfExprChildren(
       };
     case "Unary":
       return { ...e, operand: anfExpr(e.operand, pre, av, c) };
-    case "Call":
-      return { ...e, args: e.args.map(a => anfExpr(a, pre, av, c)) };
+    case "Call": {
+      // Elementwise builtins lift their args slot-by-slot inside the
+      // surrounding iter loop, so multi-element Binary/Unary/Call
+      // args are fine as-is. Every other Call (reductions, user-
+      // functions, direct-owned builtins like size/reshape) consumes
+      // its args as full struct handles — multi-element non-Var args
+      // must be hoisted to a temp.
+      const isElementwise =
+        e.callee.kind === "builtin" && isElementwiseBuiltin(e.callee.sig);
+      const liftArg = isElementwise ? anfExpr : anfRequireHandle;
+      return { ...e, args: e.args.map(a => liftArg(a, pre, av, c)) };
+    }
     case "TensorLit":
       return {
         ...e,
@@ -301,6 +316,55 @@ function anfExpr(
   const recursed = anfExprChildren(e, pre, av, c);
   if (!isOwnedProducer(recursed)) return recursed;
   return liftToTemp(recursed, pre, av, c);
+}
+
+/** Rewrite an expression and additionally hoist any resulting multi-
+ *  element value that codegen needs as an addressable struct handle
+ *  (`Var`). Use this at consume sites — `disp(arg)`, `error(arg)`,
+ *  `assert(_, msg)`, `Fprintf` args, and `Call` args to anything
+ *  except an elementwise-lifting builtin — where codegen can't walk
+ *  the value slot-by-slot. After this pass returns, the input either
+ *  has a scalar type or sits at one of the handle-shapes codegen
+ *  accepts directly (`Var`, `CharLit`, `StringLit`, `NumLit`-on-scalar,
+ *  `TensorLit`/`IndexSlice`/`MakeRange` already hoisted by the owned-
+ *  producer rule).
+ *
+ *  The lift target is the entire `recursed` expression — a synthetic
+ *  `_mtoc_anf_<N> = <expr>;` Assign is appended to `pre`, and a `Var`
+ *  reading that temp replaces the original use. Codegen then handles
+ *  the synthetic Assign via the standard elementwise-loop emit path
+ *  (the temp's type is multi-element, so `emitTensorAssignFromExpr`
+ *  iterates slot-by-slot, reading any inner Vars per-slot). */
+function anfRequireHandle(
+  e: IRExpr,
+  pre: IRStmt[],
+  av: Map<string, VarBinding>,
+  c: AnfCounter
+): IRExpr {
+  const recursed = anfExpr(e, pre, av, c);
+  if (!needsHandleLift(recursed)) return recursed;
+  return liftToTemp(recursed, pre, av, c);
+}
+
+/** True when a fully-anf'd `IRExpr` still needs to be hoisted to a
+ *  Var for its consumer. Multi-element non-Var non-handle shapes
+ *  (Binary, Unary, elementwise-builtin Call) are the target. */
+function needsHandleLift(e: IRExpr): boolean {
+  if (!isMultiElement(e.ty)) return false;
+  switch (e.kind) {
+    case "Var":
+    case "CharLit":
+    case "TensorLit":
+    case "IndexSlice":
+    case "MakeRange":
+      // Either already a handle, or an owned producer that the
+      // standard anfExpr path has already hoisted to a Var by this
+      // point (so we never see these post-anfExpr — but keep them
+      // here for clarity / belt-and-suspenders).
+      return false;
+    default:
+      return true;
+  }
 }
 
 /** Emit a synthetic `Assign` of `producer` to a fresh `_mtoc_anf_<N>`

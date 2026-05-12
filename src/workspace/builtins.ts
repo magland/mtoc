@@ -45,7 +45,6 @@ import {
   type NumericType,
   type Sign,
 } from "../lowering/types.js";
-import { isOwnedProducer } from "../lowering/anf.js";
 
 /** Sign-domain constraint on an argument. `null` means no constraint. */
 export type Domain = "nonnegative" | "positive" | null;
@@ -483,39 +482,10 @@ const BUILTINS: BuiltinSig[] = [
     lowerStmt: (ctx, args, span) => {
       if (args.length !== 1) return null;
       const arg = ctx.lowerExpr(args[0]);
-      // Codegen needs a named addressable handle (`Var`) or a non-owning
-      // literal (`CharLit` / `StringLit`) to pass to the runtime disp
-      // helper. Owned-producing expressions (TensorLit / IndexSlice /
-      // user-func owned Call / string concat) are accepted here because
-      // the post-lowering ANF pass hoists each one into its own
-      // `_mtoc_anf_<N>` Assign, so codegen ultimately sees a `Var`.
-      // Other multi-element expressions (Binary / Unary / elementwise
-      // builtin Call on tensors) still reject — auto-materializing
-      // those would need a separate pass.
-      if (
-        isMultiElement(arg.ty) &&
-        arg.kind !== "Var" &&
-        arg.kind !== "CharLit" &&
-        !isOwnedProducer(arg)
-      ) {
-        throw new UnsupportedConstruct(
-          `'disp' of a tensor expression is only supported for ` +
-            `variable references; assign the value to a name first`,
-          args[0].span
-        );
-      }
-      if (
-        isString(arg.ty) &&
-        arg.kind !== "Var" &&
-        arg.kind !== "StringLit" &&
-        !isOwnedProducer(arg)
-      ) {
-        throw new UnsupportedConstruct(
-          `'disp' of a string expression is only supported for string ` +
-            `literals or variables; assign the value to a name first`,
-          args[0].span
-        );
-      }
+      // The post-lowering ANF pass hoists any multi-element non-Var
+      // expression at this consume site into a synthetic
+      // `_mtoc_anf_<N>` Assign, so codegen ultimately sees a Var or
+      // literal regardless of what shape the user wrote here.
       return { kind: "Disp", arg, span };
     },
   },
@@ -570,21 +540,9 @@ const BUILTINS: BuiltinSig[] = [
           );
         }
         // Codegen wraps `msg` in a text view (`mtoc_text_from_string`
-        // / `mtoc_text_from_char_tensor`), so a single helper accepts
-        // either source kind. The msg expression itself needs to be a
-        // named handle: a literal (`StringLit` / `CharLit`), a `Var`,
-        // or an owned-producing expression that ANF hoists into a
-        // `_mtoc_anf_<N>` Assign before codegen sees it.
-        const isLiteralKind =
-          (isString(msg.ty) && msg.kind === "StringLit") ||
-          (isCharArray(msg.ty) && msg.kind === "CharLit");
-        if (msg.kind !== "Var" && !isLiteralKind && !isOwnedProducer(msg)) {
-          throw new UnsupportedConstruct(
-            `'assert' message must be a literal or variable; ` +
-              `assign the value to a name first`,
-            args[1].span
-          );
-        }
+        // / `mtoc_text_from_char_tensor`). The ANF pass hoists any
+        // non-Var multi-element / owned-producer msg into a synthetic
+        // Assign so codegen sees a Var or literal.
       }
       return { kind: "Assert", cond, msg, span };
     },
@@ -621,20 +579,9 @@ const BUILTINS: BuiltinSig[] = [
           args[0].span
         );
       }
-      // Codegen needs a named addressable handle (`Var`), a non-owning
-      // literal (`StringLit` / `CharLit`), or an owned-producing
-      // expression that ANF hoists into a `_mtoc_anf_<N>` Assign
-      // before codegen sees it.
-      const isLiteralKind =
-        (isString(arg.ty) && arg.kind === "StringLit") ||
-        (isCharArray(arg.ty) && arg.kind === "CharLit");
-      if (arg.kind !== "Var" && !isLiteralKind && !isOwnedProducer(arg)) {
-        throw new UnsupportedConstruct(
-          `'error' of a text expression is only supported for ` +
-            `literals or variables; assign the value to a name first`,
-          args[0].span
-        );
-      }
+      // The ANF pass hoists any non-Var multi-element / owned-
+      // producer arg into a synthetic Assign so codegen sees a Var
+      // or literal at the call site.
       return { kind: "Error", arg, span };
     },
   },
@@ -2201,27 +2148,17 @@ function sprintfLowerExpr(
   };
 }
 
-/** Reject ill-typed / non-addressable format-string args. The format
- *  must be text (string or char array) OR a scalar char (we route
- *  the latter through a synthetic 1-byte text view at codegen time).
- *  Owned-producing text expressions are allowed — ANF hoists them
- *  to a Var before codegen — but other complex sub-expressions must
- *  already be a Var or literal. */
+/** Reject ill-typed format-string args. The format must be text
+ *  (string or char array) OR a scalar char (we route the latter
+ *  through a synthetic 1-byte text view at codegen time). The ANF
+ *  pass hoists any non-Var multi-element / owned-producer format
+ *  expression into a synthetic Assign so codegen sees a Var or
+ *  literal. */
 function validateFormatArg(name: string, fmt: IRExpr, span: Span): void {
   if (!isText(fmt.ty) && !isCharScalar(fmt.ty)) {
     throw new UnsupportedConstruct(
       `'${name}' format must be a string or char value ` +
         `(got ${typeToString(fmt.ty)})`,
-      span
-    );
-  }
-  const isLiteralKind =
-    (isString(fmt.ty) && fmt.kind === "StringLit") ||
-    ((isCharArray(fmt.ty) || isCharScalar(fmt.ty)) && fmt.kind === "CharLit");
-  if (fmt.kind !== "Var" && !isLiteralKind && !isOwnedProducer(fmt)) {
-    throw new UnsupportedConstruct(
-      `'${name}' format must be a literal or variable; ` +
-        `assign the value to a name first`,
       span
     );
   }
@@ -2257,26 +2194,11 @@ function validateFprintfValueArg(
     // for the flatten count); the lowering accepts them too.
     void position;
   }
-  // Owned producers (TensorLit, IndexSlice, user-call returning an
-  // owned value, string concat) at non-top-level positions are
-  // accepted here because the post-lowering ANF pass hoists each
-  // one into its own `_mtoc_anf_<N>` Assign so codegen ultimately
-  // sees a `Var`. Other multi-element shapes (Binary / Unary /
-  // elementwise builtin Call on tensors) without a name to be
-  // released through still reject — mirrors the `disp` rule.
-  if (
-    isOwned(ty) &&
-    e.kind !== "Var" &&
-    e.kind !== "StringLit" &&
-    e.kind !== "CharLit" &&
-    !isOwnedProducer(e)
-  ) {
-    throw new UnsupportedConstruct(
-      `'${name}' argument ${position} of type ${typeToString(ty)} must be ` +
-        `a literal or variable; assign the value to a name first`,
-      span
-    );
-  }
+  // The ANF pass hoists any non-Var multi-element / owned-producer
+  // value arg into a synthetic Assign so codegen sees a Var or
+  // literal at the call site.
+  void e;
+  void name;
 }
 
 /** Render a single `sprintf` value arg as a `mtoc_fprintf_arg_t`
@@ -2312,13 +2234,6 @@ function renderSprintfArgInit(
     `codegen internal: sprintf arg with unsupported type ${typeToString(ty)} ` +
       `reached renderSprintfArgInit (should have been rejected at lowering)`
   );
-}
-
-/** True when `t` is heap-owned (tensor / string / char tensor) — local
- *  shim to avoid pulling another import. Mirrors `isOwned` from
- *  types.ts; kept inline because the lookup is one place. */
-function isOwned(t: MType): boolean {
-  return isMultiElement(t) || isString(t);
 }
 
 const BY_NAME = new Map<string, BuiltinSig>(BUILTINS.map(b => [b.name, b]));

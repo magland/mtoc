@@ -185,6 +185,54 @@ describe("elementwise shape check", () => {
   });
 });
 
+describe("auto-materialized non-owned tensor temps", () => {
+  // A multi-element non-Var expression at a consume-as-struct site
+  // (disp, error, assert msg, fprintf args, sum/min/max/user-func
+  // args) is hoisted by the ANF pass into a synthetic Assign so
+  // codegen ultimately sees a Var.
+
+  it("lifts `disp(a + b)` into a synthetic anf temp", () => {
+    const c = translate("a = [1 2 3];\nb = [4 5 6];\ndisp(a + b);\n");
+    // The synthetic temp holds the Binary result; disp reads it.
+    expect(c).toMatch(/_mtoc_anf_\d+/);
+    expect(c).toMatch(/mtoc_disp_tensor\(_mtoc_anf_\d+\)/);
+    // The synthetic Assign goes through the standard elementwise
+    // loop path — a per-slot body adds the two operands. The
+    // staging local lands in the anf temp via mtoc_tensor_assign.
+    expect(c).toMatch(/a\.real\[[^\]]+\] \+ b\.real\[[^\]]+\]/);
+    expect(c).toMatch(/mtoc_tensor_assign\(&_mtoc_anf_\d+,/);
+  });
+
+  it("lifts the tensor arg of a reduction Call", () => {
+    const c = translate("a = [1 2 3];\nb = [4 5 6];\ndisp(sum(a + b));\n");
+    // `sum`'s arg is the lifted temp Var, not the Binary itself.
+    expect(c).toMatch(/mtoc_sum\(_mtoc_anf_\d+\)/);
+  });
+
+  it("lifts a tensor arg passed into a user function", () => {
+    const c = translate(
+      "function y = doubled(t)\n  y = t .* 2;\nend\n" +
+        "a = [1 2 3];\nz = doubled(a + 1);\ndisp(z);\n"
+    );
+    expect(c).toMatch(/_mtoc_anf_\d+/);
+    expect(c).toMatch(/doubled__[0-9a-f]+\(.*_mtoc_anf_\d+/);
+  });
+
+  it("does NOT lift Binary RHS at the top of an elementwise Assign", () => {
+    // The Assign-RHS path drives the iter loop directly; no anf
+    // temp is needed for `y = a + b`.
+    const c = translate("a = [1 2 3];\nb = [4 5 6];\ny = a + b;\n");
+    expect(c).not.toMatch(/_mtoc_anf_/);
+  });
+
+  it("does NOT lift the tensor arg of an elementwise builtin in an Assign RHS", () => {
+    // `sqrt(a + b)` at the top of an Assign goes slot-by-slot via
+    // the iter loop — no temp.
+    const c = translate("a = [1 2 3];\nb = [4 5 6];\ny = sqrt(a + b);\n");
+    expect(c).not.toMatch(/_mtoc_anf_/);
+  });
+});
+
 describe("range expressions", () => {
   // Bare `a:b` / `a:s:b` lowers to a `MakeRange` IR node that
   // materializes a 1×n row vector through the `mtoc_make_range`
