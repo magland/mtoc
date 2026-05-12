@@ -35,6 +35,7 @@ import { analyzeStmts } from "./emitAnalysis.js";
 import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
+import { inlinePass } from "./fuse/inlinePass.js";
 
 /** Options for `emitC`. */
 export interface EmitOptions {
@@ -48,10 +49,26 @@ export interface EmitOptions {
    *  mtoc output into a project that supplies its own runtime.
    *  Default: true (full self-contained translation unit). */
   includeRuntime?: boolean;
+  /** When true, run the tensor-expression inlining pass before
+   *  codegen. Collapses chains of single-use elementwise Assigns
+   *  into one fat Assign whose RHS gets emitted as one fused loop,
+   *  eliminating large intermediates that thrash the cache. MVP
+   *  scope: same-shape flat-iter chains only (V2). Off by default
+   *  during rollout; flip on per-call once the cross-runner has
+   *  stabilized. See `src/codegen/fuse/inlinePass.ts`. */
+  enableTensorFusion?: boolean;
 }
 
 export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   const includeRuntime = opts.includeRuntime ?? true;
+  const enableTensorFusion = opts.enableTensorFusion ?? false;
+
+  // Pass 1: tensor-expression inlining. Pure IR-to-IR rewrite.
+  // Runs before any codegen analysis so liveness, runtime-helper
+  // activation, and emission all see the post-fusion shape. With
+  // the flag off this is a no-op call (compiler should inline it
+  // away after the early return).
+  if (enableTensorFusion) inlinePass(prog);
 
   const state: EmitState = {
     needMath: { value: false },
