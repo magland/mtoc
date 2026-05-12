@@ -184,8 +184,25 @@ A handful of _structural_ refinements live alongside the lattice:
   multiply / divide) is an explicit unsupported case in lowering.
 - **`mergeBranchEnvs(envs, span, construct)`** — joins multiple post-arm envs
   at an `if`/`while`/`for` exit. Variables present in only some arms unify
-  against `scalarDouble("zero")` for the missing arms (matches the `0.0`
-  predeclaration default).
+  against an "absent default" picked by `absentDefaultFor(present)` so the
+  merge stays well-typed for non-numeric kinds: string → `STRING`, char
+  array → empty `mtoc_char_tensor_t`, scalar char → `'\0'`, mixed /
+  numeric → `scalarDouble("zero")`.
+
+## Storage categories
+
+Two helper functions in `types.ts` keep the "what shares a C variable?"
+decisions in one place — both `recordAssignment` and `mergeBranchEnvs`
+dispatch through them:
+
+- **`storageCategory(t)`** → a stable identifier for the C slot a value
+  of type `t` occupies: `"string"`, `"scalar-char"`, `"char-array"`,
+  `"scalar-real"`, `"scalar-complex"`, `"tensor-real"`, or `"tensor-complex"`
+  (or `null` for `Unknown` / `Void` / a numeric with `unknown` dims).
+- **`canShareStorage(prev, next)`** = `storageCategory(prev) !== null &&
+storageCategory(prev) === storageCategory(next)`. New owned kinds
+  (cells, structs, classes) plug in by adding a category arm here;
+  every per-category dispatch site picks it up automatically.
 
 ## Canonicalization
 

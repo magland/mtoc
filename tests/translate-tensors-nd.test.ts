@@ -59,4 +59,13 @@ describe("N-D elementwise codegen", () => {
     expect(c).toContain("mtoc_tensor_alloc(M.dims[0], M.dims[1])");
     expect(c).not.toContain("mtoc_tensor_alloc_nd(");
   });
+
+  it("rejects reshape requests above MTOC_MAX_NDIM with a span", () => {
+    // The runtime caps inline dims at 8 (MTOC_MAX_NDIM); rejecting at
+    // lowering surfaces the limit to the user as a clear error tied to
+    // the call site instead of an abort() at runtime.
+    expect(() =>
+      translate("v = 1:512;\n" + "A = reshape(v, 2, 2, 2, 2, 2, 2, 2, 2, 2);\n")
+    ).toThrow(/limited to 8/);
+  });
 });

@@ -18,6 +18,7 @@
  */
 
 import type { IRStmt } from "../lowering/ir.js";
+import { isDirectOwnedCall } from "../lowering/anf.js";
 import {
   cTypeFor,
   isCharScalar,
@@ -26,14 +27,19 @@ import {
   isOwned,
   isScalarComplex,
   isScalarReal,
-  isText,
   typeToString,
   type NumericType,
 } from "../lowering/types.js";
+import { dispEmitterFor } from "./dispKinds.js";
 import { ownedOps } from "./ownedKinds.js";
 import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 import { emitScopeExitFrees } from "./emitOwned.js";
-import { emitExpr, wrapOwnedArgCopy, wrapTextView } from "./emitExpr.js";
+import {
+  emitExpr,
+  emitNdScalarOffset,
+  wrapOwnedArgCopy,
+  wrapTextView,
+} from "./emitExpr.js";
 import { formatNumLit } from "./emitFormat.js";
 import { renderStmt, sanitizeForBlockComment } from "./irRender.js";
 import {
@@ -42,11 +48,7 @@ import {
   formatArgInit,
 } from "./emitAnalysis.js";
 import { emitTensorAssignFromExpr, emitTensorLitAssign } from "./emitTensor.js";
-import {
-  emitIndexSliceAssign,
-  emitIndexSliceStore,
-  emitNdScalarOffset,
-} from "./emitSlice.js";
+import { emitIndexSliceAssign, emitIndexSliceStore } from "./emitSlice.js";
 import { emitMakeRangeAssign } from "./emitRange.js";
 
 export { analyzeStmts } from "./emitAnalysis.js";
@@ -145,17 +147,12 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // char arrays accept a Var (deep-copy) or any owned-producing
         // expression directly (`StringLit`, `mtoc_string_concat(...)`,
         // `mtoc_char_tensor_from_literal(...)`, user-function call).
-        const isDirectOwnedCall =
-          s.rhs.kind === "Call" &&
-          (s.rhs.callee.kind === "userFunc" ||
-            (s.rhs.callee.kind === "builtin" &&
-              s.rhs.callee.sig.producesOwnedDirectly === true));
         if (
           isNumeric(s.ty) &&
           isMultiElement(s.ty) &&
           s.ty.elem === "double" &&
           s.rhs.kind !== "Var" &&
-          !isDirectOwnedCall
+          !isDirectOwnedCall(s.rhs)
         ) {
           emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
@@ -176,8 +173,9 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         break;
       }
       throw new Error(
-        `codegen: assignment to '${s.name}' with type ${typeToString(s.ty)} ` +
-          `is not yet supported`
+        `codegen internal: assignment to '${s.name}' with type ` +
+          `${typeToString(s.ty)} reached emitStmt with no matching arm ` +
+          `(should have been rejected at lowering)`
       );
     }
 
@@ -266,60 +264,22 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
     }
 
     case "Disp": {
+      // Dispatch through `dispEmitterFor` — one registry maps each
+      // ValueShape to its disp helper (text → mtoc_disp_text; tensor
+      // → mtoc_disp_tensor[_complex]; scalar char/real/complex →
+      // dedicated helpers). New value kinds (cells, structs, classes)
+      // plug in by adding an arm there, not by editing this switch.
       const ty = s.arg.ty;
-      if (isText(ty)) {
-        // Strings and char arrays share one disp path via the text
-        // view — `mtoc_disp_text` prints the bytes + newline regardless
-        // of the source struct shape.
-        useRuntimeByName(state, "mtoc_disp_text");
-        const view = wrapTextView(state, ty, emitExpr(state, s.arg, 0));
-        pushStmt(state, level, `mtoc_disp_text(${view});`);
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
-      const owned = ownedOps(ty);
-      if (owned !== null && owned.disp !== undefined) {
-        // Owned-kind disp for tensors. The lowering pass restricts arg
-        // shapes (Var-only for tensors); emitExpr renders safely.
-        useRuntimeByName(state, owned.structSnippet);
-        const helper = owned.disp(ty);
-        useRuntimeByName(state, helper);
-        pushStmt(state, level, `${helper}(${emitExpr(state, s.arg, 0)});`);
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
-      if (isCharScalar(ty)) {
-        // Scalar char: print the single character + newline.
-        useRuntimeByName(state, "mtoc_disp_char");
-        pushStmt(state, level, `mtoc_disp_char(${emitExpr(state, s.arg, 0)});`);
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
-      if (isScalarReal(ty)) {
-        useRuntimeByName(state, "mtoc_disp_double");
-        // Non-variadic call — `int` operands auto-promote to `double`,
-        // so no manual cast is needed (unlike `printf("%g", ...)`).
-        pushStmt(
-          state,
-          level,
-          `mtoc_disp_double(${emitExpr(state, s.arg, 0)});`
+      const dispEmit = dispEmitterFor(ty);
+      if (dispEmit === null) {
+        throw new Error(
+          `codegen internal: disp of ${typeToString(ty)} reached emitStmt ` +
+            `with no matching arm (should have been rejected at lowering)`
         );
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
       }
-      if (isScalarComplex(ty)) {
-        useRuntimeByName(state, "mtoc_disp_complex");
-        pushStmt(
-          state,
-          level,
-          `mtoc_disp_complex(${emitExpr(state, s.arg, 0)});`
-        );
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
-      throw new Error(
-        `codegen: disp of ${typeToString(ty)} is not yet supported`
-      );
+      dispEmit(state, level, emitExpr(state, s.arg, 0));
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
     }
 
     case "If": {

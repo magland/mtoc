@@ -207,6 +207,10 @@ modules:
 - `ownedKinds.ts` — registry mapping each owned MType (string, char
   array, real-or-complex tensor) to its C helper names. New owned
   kinds plug in by adding one entry.
+- `dispKinds.ts` — registry mapping each value shape (text / tensor /
+  scalar char / scalar real / scalar complex) to a single-line `disp`
+  emitter. The `Disp` IRStmt arm in `emitStmt` is one lookup —
+  cell / struct / class disp lowering plugs in by adding one entry.
 - `irRender.ts` — `renderStmt` / `renderExpr`: best-effort numbl
   pretty-printer for IR nodes. `emitStmt` drops the rendered string
   as a `/* ... */` comment above each emitted statement so a reader

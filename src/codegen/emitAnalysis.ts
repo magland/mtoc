@@ -10,20 +10,18 @@
  */
 
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
-import {
-  isCharScalar,
-  isMultiElement,
-  isNumeric,
-  isScalarComplex,
-  isScalarReal,
-  isText,
-  typeToString,
-} from "../lowering/types.js";
+import { typeToString } from "../lowering/types.js";
 import { forEachStmtInTree, forEachTopLevelExpr } from "../lowering/walk.js";
+import { renderFprintfArgInit } from "../workspace/builtins.js";
 import { topLevelOwnedDefs, topLevelOwnedUses } from "./liveness.js";
 import { ownedOps } from "./ownedKinds.js";
-import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
-import { analyzeExpr, emitExpr, wrapTextView } from "./emitExpr.js";
+import {
+  builtinEmitFacade,
+  pushStmt,
+  useRuntimeByName,
+  type EmitState,
+} from "./emitState.js";
+import { analyzeExpr, emitExpr } from "./emitExpr.js";
 
 /**
  * Statement-level companion to `analyzeExpr`. Visits every stmt in the
@@ -109,51 +107,16 @@ export function emitEarlyFrees(
 }
 
 /** Render a single fprintf / sprintf value arg as a `mtoc_fprintf_arg_t`
- *  designated-initializer expression. Dispatches on the arg's static
- *  type — text views go through the existing `mtoc_text_from_*`
- *  adapters; scalar numerics promote to `double` (scalar char widens
- *  to its numeric value); complex scalars pass through unchanged;
- *  multi-element tensors travel as a pointer to the caller's
- *  predeclared `mtoc_tensor_t` local. Wrapping owned-producing RHS
- *  forms in arg position is moot — the surrounding lowering rejects
- *  anything but a Var / literal here. */
+ *  designated-initializer expression — thin wrapper that renders `e`
+ *  to a C expression then delegates to `renderFprintfArgInit` (the
+ *  single source of truth for the format-arg ABI, in `builtins.ts`).
+ *  The sprintf one-shot sig's emit closure calls `renderFprintfArgInit`
+ *  directly with its already-rendered arg strings.
+ *
+ *  Post-ANF, every tensor-typed arg here is a `Var` (or an already-
+ *  hoisted owned producer rendered as one), so `&<cName>` is a valid
+ *  pointer to the caller's stack-allocated handle. */
 export function formatArgInit(state: EmitState, e: IRExpr): string {
-  // Activate the format-engine umbrella so the tag enums + struct
-  // definition are in scope at the call site. `mtoc_fprintf` /
-  // `mtoc_sprintf` callers have already activated their own
-  // umbrella, but doing it here keeps this helper self-contained
-  // for any future statement that calls it directly.
-  useRuntimeByName(state, "mtoc_format_engine");
-  const ty = e.ty;
   const c = emitExpr(state, e, 0);
-  if (isText(ty)) {
-    const view = wrapTextView(state, ty, c);
-    return `{.kind=MTOC_FA_TEXT, .u.t=${view}}`;
-  }
-  if (isScalarComplex(ty)) {
-    return `{.kind=MTOC_FA_COMPLEX, .u.z=${c}}`;
-  }
-  if (isCharScalar(ty)) {
-    // Scalar char promotes to its code-unit value for numeric specs
-    // (matches numbl's toNumber on a 1-char RuntimeChar). %s of a
-    // scalar char isn't supported in v1 — the test corpus doesn't
-    // hit it.
-    return `{.kind=MTOC_FA_DOUBLE, .u.d=(double)(unsigned char)(${c})}`;
-  }
-  if (isScalarReal(ty)) {
-    return `{.kind=MTOC_FA_DOUBLE, .u.d=${c}}`;
-  }
-  if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
-    useRuntimeByName(state, "mtoc_tensor_t");
-    // Post-ANF, every tensor-typed arg here is a `Var` (or an
-    // already-rendered owned producer that ANF hoisted into one);
-    // emitExpr renders it as the bare struct cName, so `&<cName>`
-    // is a valid pointer to the caller's stack-allocated handle.
-    return `{.kind=MTOC_FA_TENSOR, .u.tensor=&${c}}`;
-  }
-  throw new Error(
-    `codegen internal: fprintf/sprintf arg with unsupported type ` +
-      `${typeToString(ty)} reached formatArgInit (should have been ` +
-      `rejected at lowering)`
-  );
+  return renderFprintfArgInit(builtinEmitFacade(state), e.ty, c);
 }

@@ -22,8 +22,10 @@ import {
   isString,
   typeToString,
   type MType,
+  type NumericType,
 } from "../lowering/types.js";
 import { forEachSubExpr } from "../lowering/walk.js";
+import { isDirectOwnedCall } from "../lowering/anf.js";
 import {
   BIN_OP_C,
   CMP_OR_LOGICAL,
@@ -74,6 +76,48 @@ function iterIndexFor(state: EmitState, varCName: string): string {
 /** C-side struct field name for the column count of a tensor handle. */
 export function tensorColsField(ty: MType): string {
   return isNumeric(ty) && ty.elem === "char" ? "cols" : "dims[1]";
+}
+
+/** Compute the linear column-major buffer offset for a scalar
+ *  IndexStore / IndexLoad with `indices.length` scalar indices into a
+ *  base of the given type. Three branches:
+ *    - 1-arg linear: `(long)idx - 1L`.
+ *    - 2-arg row-major fast path: `(i - 1) + (j - 1) * rows` (char
+ *      tensors read `.rows`, double tensors `.dims[0]` via
+ *      `tensorRowsField`).
+ *    - N-D general (double tensors only — char is 2-D-only):
+ *      `sum_k (idx_k - 1) * prod(dims[0..k-1])`.
+ *  Centralized so IndexLoad, IndexStore, and any future scalar-index
+ *  consumer share one formula. */
+export function emitNdScalarOffset(
+  state: EmitState,
+  indices: ReadonlyArray<IRExpr>,
+  baseCName: string,
+  baseTy: NumericType
+): string {
+  if (indices.length === 1) {
+    return `(long)(${emitExpr(state, indices[0], 0)}) - 1L`;
+  }
+  if (indices.length === 2) {
+    const rowsField = tensorRowsField(baseTy);
+    return (
+      `(long)(${emitExpr(state, indices[0], 0)}) - 1L + ` +
+      `((long)(${emitExpr(state, indices[1], 0)}) - 1L) * ` +
+      `${baseCName}.${rowsField}`
+    );
+  }
+  const terms: string[] = [];
+  for (let i = 0; i < indices.length; i++) {
+    const idxStr = `((long)(${emitExpr(state, indices[i], 0)}) - 1L)`;
+    if (i === 0) {
+      terms.push(idxStr);
+    } else {
+      const strideParts: string[] = [];
+      for (let j = 0; j < i; j++) strideParts.push(`${baseCName}.dims[${j}]`);
+      terms.push(`${idxStr} * ${strideParts.join(" * ")}`);
+    }
+  }
+  return terms.join(" + ");
 }
 
 /** Wrap an already-emitted text expression in the appropriate
@@ -137,17 +181,12 @@ export function emitExpr(
   // value, which the surrounding owned-LHS assign path consumes via
   // `mtoc_<kind>_assign(&lhs, foo(args))` without going through the
   // iter-loop materialization machinery.
-  const isDirectOwnedCall =
-    e.kind === "Call" &&
-    (e.callee.kind === "userFunc" ||
-      (e.callee.kind === "builtin" &&
-        e.callee.sig.producesOwnedDirectly === true));
   if (
     state.iterStack.length === 0 &&
     e.kind !== "Var" &&
     e.kind !== "TensorLit" &&
     e.kind !== "CharLit" &&
-    !isDirectOwnedCall &&
+    !isDirectOwnedCall(e) &&
     isMultiElement(e.ty)
   ) {
     throw new Error(
@@ -377,56 +416,30 @@ export function emitExpr(
 
     case "IndexLoad": {
       // Compute the linear C buffer offset from the (1-indexed) MATLAB
-      // indices. Each index is a scalar IR expression that emitExpr
-      // renders as a `double`-valued C string; we cast to `long` and
-      // subtract 1 to reach the C 0-indexed slot. For 2D, codegen
-      // emits the column-major formula `i + j * rows` using the base's
-      // runtime row count (`.dims[0]` for double tensors, `.rows` for
-      // char tensors — see `tensorRowsField`). For N-D (N >= 3,
-      // double tensors only — char is 2-D-only), the general
-      // column-major formula stacks each axis's contribution scaled by
-      // its stride: `idx_k * prod(dims[0..k-1])`.
+      // indices via the shared `emitNdScalarOffset` helper — same path
+      // IndexStore uses, keeping the column-major formula in one place.
       //
       // The base is always rendered as the bare cName here — the per-
       // element iter rendering for multi-element Vars (`v.real[<iter>]`)
       // is wrong for indexing; we want the struct itself so we can
-      // pick the right slot. So we look at `e.base.cName` directly
-      // rather than recursing through `emitExpr` on the base.
+      // pick the right slot.
       const baseCName = e.base.cName;
       const baseTy = e.base.ty;
-      let offset: string;
-      if (e.indices.length === 1) {
-        offset = `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L`;
-      } else if (e.indices.length === 2) {
-        const baseRowsField = tensorRowsField(baseTy);
-        offset =
-          `(long)(${emitExpr(state, e.indices[0], 0)}) - 1L + ` +
-          `((long)(${emitExpr(state, e.indices[1], 0)}) - 1L) * ` +
-          `${baseCName}.${baseRowsField}`;
-      } else {
-        const terms: string[] = [];
-        for (let i = 0; i < e.indices.length; i++) {
-          const idxStr = `((long)(${emitExpr(state, e.indices[i], 0)}) - 1L)`;
-          if (i === 0) {
-            terms.push(idxStr);
-          } else {
-            const strideParts: string[] = [];
-            for (let j = 0; j < i; j++) {
-              strideParts.push(`${baseCName}.dims[${j}]`);
-            }
-            terms.push(`${idxStr} * ${strideParts.join(" * ")}`);
-          }
-        }
-        offset = terms.join(" + ");
+      if (!isNumeric(baseTy)) {
+        throw new Error(
+          `codegen internal: IndexLoad base has non-numeric type ` +
+            `${typeToString(baseTy)}`
+        );
       }
+      const offset = emitNdScalarOffset(state, e.indices, baseCName, baseTy);
       // Char tensor: read `.data[offset]` — yields a scalar `char`.
-      if (isNumeric(baseTy) && baseTy.elem === "char") {
+      if (baseTy.elem === "char") {
         return `${baseCName}.data[${offset}]`;
       }
       // Double tensor: complex composes `.real + .imag*I` into one
       // `double _Complex` value so the result can flow into either
       // real- or complex-typed contexts uniformly.
-      if (isNumeric(baseTy) && baseTy.isComplex) {
+      if (baseTy.isComplex) {
         return (
           `(${baseCName}.real[${offset}] + ` +
           `${baseCName}.imag[${offset}] * I)`

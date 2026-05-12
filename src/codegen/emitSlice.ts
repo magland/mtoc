@@ -5,11 +5,13 @@
  *   (`target = base(a:b)`).
  * - `emitIndexSliceStore`: emit a range/colon/scalar-mix indexed write
  *   (`base(slice) = rhs`).
- * - `emitNdScalarOffset`: compute the linear column-major buffer offset
- *   for a scalar IndexStore / IndexLoad with N scalar indices.
  * - `emitSliceSlotSetup` / `emitSingleSlotSliceRead` /
  *   `emitMultiSlotSliceRead` / `emitMultiSlotSliceStore` /
  *   `formatNdOffset`: internal helpers.
+ *
+ * Scalar IndexStore / IndexLoad offsets live in `emitExpr.emitNdScalarOffset`
+ * — that one path serves IndexLoad, IndexStore (via emitStmt), and any
+ * future scalar-index consumer.
  */
 
 import type { IRExpr, IRStmt, IndexSliceArg } from "../lowering/ir.js";
@@ -680,40 +682,4 @@ function emitMultiSlotSliceStore(
     pushStmt(state, level + 1 + (ndim - 1 - i), `}`);
   }
   pushStmt(state, level, `}`);
-}
-
-/** Compute the linear column-major buffer offset for a scalar
- *  IndexStore / IndexLoad with `indices.length` scalar indices into
- *  a base with the given type. Handles 1-D linear, 2-D row-major
- *  fast-path (char tensors use `.rows`, double tensors use `.dims[0]`),
- *  and the general N-D formula `sum_i (idx_i − 1) * prod(dims[0..i-1])`. */
-export function emitNdScalarOffset(
-  state: EmitState,
-  indices: ReadonlyArray<IRExpr>,
-  baseCName: string,
-  baseTy: NumericType
-): string {
-  if (indices.length === 1) {
-    return `(long)(${emitExpr(state, indices[0], 0)}) - 1L`;
-  }
-  if (indices.length === 2) {
-    const rowsField = tensorRowsField(baseTy);
-    return (
-      `(long)(${emitExpr(state, indices[0], 0)}) - 1L + ` +
-      `((long)(${emitExpr(state, indices[1], 0)}) - 1L) * ` +
-      `${baseCName}.${rowsField}`
-    );
-  }
-  const terms: string[] = [];
-  for (let i = 0; i < indices.length; i++) {
-    const idxStr = `((long)(${emitExpr(state, indices[i], 0)}) - 1L)`;
-    if (i === 0) {
-      terms.push(idxStr);
-    } else {
-      const strideParts: string[] = [];
-      for (let j = 0; j < i; j++) strideParts.push(`${baseCName}.dims[${j}]`);
-      terms.push(`${idxStr} * ${strideParts.join(" * ")}`);
-    }
-  }
-  return terms.join(" + ");
 }

@@ -33,11 +33,9 @@ import type {
   VarBinding,
 } from "./ir.js";
 import {
-  isCharArray,
-  isCharScalar,
+  absentDefaultFor,
+  canShareStorage,
   isMultiElement,
-  isOwned,
-  isScalar,
   isScalarReal,
   isString,
   MType,
@@ -73,7 +71,7 @@ import {
   forEachSubExpr,
   forEachTopLevelExpr,
 } from "./walk.js";
-import { anfNormalize } from "./anf.js";
+import { anfNormalize, classifyOwnedExpr, ownedExprMessage } from "./anf.js";
 
 // Reserved C identifiers that need mangling. Mirrors numbl's
 // cJit/codegen.ts list. Centralized here so emit.ts never has to
@@ -261,37 +259,6 @@ export class Lowerer {
     return this.currentBindingCName.get(name) ?? cNameFor(name);
   }
 
-  /** Determine whether `prev` and `next` can share a single predeclared
-   *  C variable. The C representation is determined by category:
-   *  scalar real (`double`), scalar complex (`double _Complex`), or
-   *  multi-element (`mtoc_tensor_t`). Two types share storage only if
-   *  they fall in the same category and agree on `isComplex` — codegen
-   *  picks ONE C type per binding, and a real-tensor predecl can't
-   *  hold a complex-tensor value. Specific size is no longer part of
-   *  the type; tensor reassignments at the same coarse shape free and
-   *  realloc the backing buffer at runtime. */
-  private static canShareStorage(prev: MType, next: MType): boolean {
-    // Two strings always share a single `mtoc_string_t` slot —
-    // reassignment goes through `mtoc_string_assign` which frees the
-    // prior buffer (or no-ops on a literal-pointing handle) and
-    // installs the new one.
-    if (prev.kind === "String" && next.kind === "String") return true;
-    if (prev.kind !== "Numeric" || next.kind !== "Numeric") return false;
-    if (prev.elem !== next.elem) return false;
-    if (prev.isComplex !== next.isComplex) return false;
-    const prevScalar = isScalar(prev);
-    const nextScalar = isScalar(next);
-    const prevMulti = isMultiElement(prev);
-    const nextMulti = isMultiElement(next);
-    // Both must classify into the same category. A type whose dims
-    // include `unknown` may be neither scalar nor multi-element here;
-    // such "could be either" types are forced to split (the C variable
-    // would be ambiguous between `double` and `mtoc_tensor_t`).
-    if (prevScalar && nextScalar) return true;
-    if (prevMulti && nextMulti) return true;
-    return false;
-  }
-
   // ── Statements ────────────────────────────────────────────────────────
 
   lowerStmts(stmts: Stmt[]): IRStmt[] {
@@ -363,7 +330,7 @@ export class Lowerer {
     }
 
     const merged = unify(prevBinding.ty, ty);
-    if (Lowerer.canShareStorage(prevBinding.ty, ty)) {
+    if (canShareStorage(prevBinding.ty, ty)) {
       // Compatible — widen the existing binding's type in place. The
       // merged type stays consistent with the predeclared C variable's
       // category (scalar/tensor, real/complex); shape-level coarsening
@@ -445,15 +412,13 @@ export class Lowerer {
         if (t !== undefined) present.push(t);
       }
       // Absent default: the value a C predeclaration gives the variable
-      // when a branch doesn't assign it. Numeric → 0.0; string →
-      // mtoc_string_empty(); char scalar → '\0'; char array → empty.
-      const absentDefault: MType = present.every(isString)
-        ? STRING
-        : present.every(t => isCharArray(t))
-          ? charArrayType({ kind: "notOne" })
-          : present.every(t => isCharScalar(t))
-            ? scalarChar()
-            : scalarDouble("zero");
+      // when a branch doesn't assign it. `absentDefaultFor` walks the
+      // present-types set and picks the right zero-value type for the
+      // shared storage category (string → mtoc_string_empty();
+      // char-array → empty handle; scalar char → '\0'; mixed or
+      // numeric → 0.0). New kinds register a default once in
+      // `types.ts` instead of editing this chain.
+      const absentDefault: MType = absentDefaultFor(present);
 
       let unified: MType | undefined;
       for (const e of envs) {
@@ -900,98 +865,6 @@ export class Lowerer {
           "span" in e ? e.span : null
         );
     }
-  }
-}
-
-/**
- * Owned-allocating expression kinds: expressions whose evaluation
- * returns a fresh heap-owned value at runtime (tensor / char tensor /
- * string). The post-lowering ANF pass (`src/lowering/anf.ts`) hoists
- * every such expression that isn't already at the top of an owned-LHS
- * `Assign.rhs` into a synthetic `Assign` to a `_mtoc_anf_<N>` temp,
- * so after ANF an owned producer appears at exactly one position: the
- * full RHS of an owned-LHS `Assign`. This validator verifies that
- * invariant.
- *
- * - `tensor-lit`: every TensorLit allocates a fresh tensor.
- * - `string-concat`: a string-typed `Binary` (`+`) calls
- *   `mtoc_string_concat`, which returns an owned handle.
- * - `index-slice`: an `IndexSlice` (range/colon read) allocates a
- *   fresh tensor sized by the index range.
- * - `user-call`: a `Call` to a user-defined function whose result is
- *   owned (`isOwned`), returned by struct value from the callee.
- *
- * `Var` is never an owned-allocating expression — it just reads an
- * already-owned heap value; the read doesn't transfer ownership.
- * `StringLit` points at `.rodata` (zero allocation) and is fine
- * anywhere. Elementwise scalar builtin Calls and Binary/Unary nodes
- * also don't allocate at the call site — they fold into iter-loop
- * staging buffers managed by `emitTensorAssignFromExpr`.
- */
-type OwnedExprKind =
-  | "tensor-lit"
-  | "string-concat"
-  | "index-slice"
-  | "make-range"
-  | "user-call"
-  | "builtin-call";
-
-function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
-  if (e.kind === "TensorLit") return "tensor-lit";
-  if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
-  if (e.kind === "IndexSlice") return "index-slice";
-  if (e.kind === "MakeRange") return "make-range";
-  if (e.kind === "Call" && isOwned(e.ty)) {
-    if (e.callee.kind === "userFunc") return "user-call";
-    // Builtin Call flagged as a direct owned producer (`size`,
-    // `reshape`, `zeros`, `ones`, `eye`, ...). Elementwise lifts
-    // don't allocate at the Call site, so they don't carry the flag.
-    if (
-      e.callee.kind === "builtin" &&
-      e.callee.sig.producesOwnedDirectly === true
-    ) {
-      return "builtin-call";
-    }
-  }
-  // `Var` and `StringLit` are intentionally absent: `Var` reads an
-  // already-owned heap value without allocating; `StringLit` points at
-  // .rodata and performs no heap allocation.
-  return null;
-}
-
-function ownedExprMessage(kind: OwnedExprKind): string {
-  switch (kind) {
-    case "tensor-lit":
-      return (
-        "internal: tensor literal still nested inside another expression " +
-        "after ANF; ANF pass should have hoisted it"
-      );
-    case "string-concat":
-      return (
-        "internal: string concatenation still nested inside another " +
-        "expression after ANF; ANF pass should have hoisted it"
-      );
-    case "index-slice":
-      return (
-        "internal: range/colon index slice still nested inside another " +
-        "expression after ANF; ANF pass should have hoisted it"
-      );
-    case "make-range":
-      return (
-        "internal: bare range expression still nested inside another " +
-        "expression after ANF; ANF pass should have hoisted it"
-      );
-    case "user-call":
-      return (
-        "internal: owned-returning user-function call still nested " +
-        "inside another expression after ANF; ANF pass should have " +
-        "hoisted it"
-      );
-    case "builtin-call":
-      return (
-        "internal: owned-returning builtin call still nested inside " +
-        "another expression after ANF; ANF pass should have hoisted it"
-      );
   }
 }
 

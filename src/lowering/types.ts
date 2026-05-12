@@ -126,6 +126,14 @@ export interface StringType {
 
 export const STRING: StringType = { kind: "String" };
 
+/** Maximum tensor dimensionality mtoc emits. MUST match
+ *  `MTOC_MAX_NDIM` in `runtime/tensor.h`; the runtime allocator helpers
+ *  (`mtoc_tensor_alloc_nd` / `mtoc_tensor_alloc_nd_complex`) `abort()`
+ *  when handed an `ndim` greater than this cap. The lowerer rejects
+ *  static shapes above the cap up front so the user sees a span
+ *  instead of a runtime abort. */
+export const MTOC_MAX_NDIM = 8;
+
 export type MType =
   | NumericType
   | StringType
@@ -404,6 +412,76 @@ export function shapeCategory(t: NumericType): string {
   if (isRowVec(t)) return "rowVec";
   if (isColVec(t)) return "colVec";
   return "matrix";
+}
+
+/** Stable identifier for the C storage slot a value of type `t` will
+ *  occupy. Two types share a single predeclared C variable iff they
+ *  return the same non-null category — codegen picks one C type per
+ *  binding (bare `double` vs `double _Complex` vs `mtoc_tensor_t` vs
+ *  `mtoc_char_tensor_t` vs `mtoc_string_t` vs the `char` scalar slot),
+ *  and an assignment that crosses categories has to split into a
+ *  fresh binding.
+ *
+ *  Null marks "no shareable category" — `Unknown` / `Void` / a numeric
+ *  type with `unknown` dims that classifies as neither scalar nor
+ *  multi-element. Adding a new owned kind (cells, structs, classes)
+ *  is a new branch here; every per-category dispatch site
+ *  (`canShareStorage`, `absentDefaultFor`) picks it up automatically. */
+export function storageCategory(t: MType): string | null {
+  if (t.kind === "String") return "string";
+  if (t.kind !== "Numeric") return null;
+  if (t.elem === "char") {
+    if (isScalar(t)) return "scalar-char";
+    if (isMultiElement(t)) return "char-array";
+    return null;
+  }
+  // elem === "double"
+  if (isScalar(t)) return t.isComplex ? "scalar-complex" : "scalar-real";
+  if (isMultiElement(t)) {
+    return t.isComplex ? "tensor-complex" : "tensor-real";
+  }
+  return null;
+}
+
+/** Can two types share a single predeclared C variable? Equivalent to
+ *  "same non-null storage category" — codegen picks one C type per
+ *  binding, and a real-tensor predecl can't hold a complex-tensor
+ *  value. Specific runtime size is NOT part of the category; tensor
+ *  reassignments at the same coarse shape free and realloc the
+ *  backing buffer in place. */
+export function canShareStorage(prev: MType, next: MType): boolean {
+  const pc = storageCategory(prev);
+  const nc = storageCategory(next);
+  return pc !== null && pc === nc;
+}
+
+/** The "absent default" type a control-flow branch merge picks when
+ *  a variable is assigned on some arms but not others. The value seen
+ *  at the merge point on the absent arm is the codegen-predeclared
+ *  default for the variable's C slot: `0.0` for numeric, `'\0'` for
+ *  scalar char, `mtoc_char_tensor_empty()` for char arrays,
+ *  `mtoc_string_empty()` for strings. The merge picks the absent
+ *  default to match the shared category of the present types so the
+ *  merge stays well-typed; mixed-category branches fall back to
+ *  `scalarDouble("zero")` (and the caller's unify pass will then
+ *  surface a clear conflict error). */
+export function absentDefaultFor(present: ReadonlyArray<MType>): MType {
+  if (present.length === 0) return scalarDouble("zero");
+  const cat = storageCategory(present[0]);
+  if (cat === null) return scalarDouble("zero");
+  for (let i = 1; i < present.length; i++) {
+    if (storageCategory(present[i]) !== cat) return scalarDouble("zero");
+  }
+  switch (cat) {
+    case "string":
+      return STRING;
+    case "char-array":
+      return charArrayType({ kind: "notOne" });
+    case "scalar-char":
+      return scalarChar();
+    default:
+      return scalarDouble("zero");
+  }
 }
 
 // ── Sign helpers ─────────────────────────────────────────────────────────

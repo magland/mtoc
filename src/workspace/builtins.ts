@@ -34,6 +34,7 @@ import {
   isScalarReal,
   isString,
   isText,
+  MTOC_MAX_NDIM,
   numericTypeND,
   rowVecDouble,
   scalarComplex,
@@ -1695,6 +1696,15 @@ function reshapeLowerExpr(
     }
   }
   const ndim = dimArgs.length;
+  if (ndim > MTOC_MAX_NDIM) {
+    throw new UnsupportedConstruct(
+      `reshape: requested ${ndim} dimensions, but mtoc tensors are ` +
+        `limited to ${MTOC_MAX_NDIM} (MTOC_MAX_NDIM in runtime/tensor.h). ` +
+        `Raise the cap and rebuild if you genuinely need higher-dimensional ` +
+        `tensors.`,
+      span
+    );
+  }
   // Refine the result-dim lattice when the dim arg is a positive-int
   // NumLit: literal `1` → `one`, literal integer > 1 → `notOne`, else
   // `unknown`. Lets downstream lowering (sum/min/max reductions on a
@@ -2129,7 +2139,7 @@ function sprintfLowerExpr(
       }
       const initList: string[] = [];
       for (let i = 1; i < argTys.length; i++) {
-        initList.push(renderSprintfArgInit(state, argStrs[i], argTys[i]));
+        initList.push(renderFprintfArgInit(state, argTys[i], argStrs[i]));
       }
       return (
         `${helperName}(${fmtView}, ${nVal}, ` +
@@ -2201,14 +2211,21 @@ function validateFprintfValueArg(
   void name;
 }
 
-/** Render a single `sprintf` value arg as a `mtoc_fprintf_arg_t`
- *  designated-initializer expression. Same dispatch as the
- *  `Fprintf` codegen arm — kept in this file so the sprintf one-shot
- *  sig's `emit` closure doesn't import from codegen. */
-function renderSprintfArgInit(
+/** Render a single fprintf / sprintf value arg as a `mtoc_fprintf_arg_t`
+ *  designated-initializer expression. Single source of truth for the
+ *  format-arg ABI; consumed by:
+ *    - the `sprintf` one-shot builtin sig's emit closure (this file),
+ *    - the `Fprintf` IRStmt codegen arm via emitAnalysis.formatArgInit.
+ *  Dispatches on the arg's static type — text views go through the
+ *  `mtoc_text_from_*` adapters; scalar numerics promote to double
+ *  (scalar char widens via its code-unit value); complex scalars pass
+ *  through; multi-element double tensors travel by pointer to the
+ *  caller's predeclared `mtoc_tensor_t` local. `c` is the already-
+ *  rendered C expression for the arg; `ty` is its IR type. */
+export function renderFprintfArgInit(
   state: BuiltinEmitState,
-  c: string,
-  ty: MType
+  ty: MType,
+  c: string
 ): string {
   state.useRuntime("mtoc_format_engine");
   if (isText(ty)) {
@@ -2228,11 +2245,13 @@ function renderSprintfArgInit(
     return `{.kind=MTOC_FA_DOUBLE, .u.d=${c}}`;
   }
   if (isNumeric(ty) && isMultiElement(ty) && ty.elem === "double") {
+    state.useRuntime("mtoc_tensor_t");
     return `{.kind=MTOC_FA_TENSOR, .u.tensor=&${c}}`;
   }
   throw new Error(
-    `codegen internal: sprintf arg with unsupported type ${typeToString(ty)} ` +
-      `reached renderSprintfArgInit (should have been rejected at lowering)`
+    `codegen internal: fprintf/sprintf arg with unsupported type ` +
+      `${typeToString(ty)} reached renderFprintfArgInit (should have ` +
+      `been rejected at lowering)`
   );
 }
 

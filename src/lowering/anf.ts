@@ -43,17 +43,32 @@ interface AnfCounter {
   value: number;
 }
 
-/** True when `e` is an "owned producer" — an expression that, when
+/** Discriminated kinds of "owned producer" expression — used by
+ *  `classifyOwnedExpr` so the post-ANF validator can render kind-
+ *  specific error messages when an owned producer slips past the
+ *  hoist. */
+export type OwnedExprKind =
+  | "tensor-lit"
+  | "string-concat"
+  | "index-slice"
+  | "make-range"
+  | "user-call"
+  | "builtin-call";
+
+/** Classify `e` as an "owned producer" — an expression that, when
  *  evaluated, returns a freshly-allocated heap-backed value (tensor /
- *  char tensor / string). After ANF every such expression sits as the
- *  full RHS of an owned-LHS `Assign`. */
-export function isOwnedProducer(e: IRExpr): boolean {
-  if (e.kind === "TensorLit") return true;
-  if (e.kind === "IndexSlice") return true;
-  if (e.kind === "MakeRange") return true;
-  if (e.kind === "Binary" && isString(e.ty)) return true;
+ *  char tensor / string) — or return `null` if it is not one. Single
+ *  source of truth for owned-producer recognition; consumed by the
+ *  ANF pass (lifting decision) and the post-ANF validator (error
+ *  message). After ANF every such expression sits as the full RHS of
+ *  an owned-LHS `Assign`. */
+export function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
+  if (e.kind === "TensorLit") return "tensor-lit";
+  if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
+  if (e.kind === "IndexSlice") return "index-slice";
+  if (e.kind === "MakeRange") return "make-range";
   if (e.kind === "Call" && isOwned(e.ty)) {
-    if (e.callee.kind === "userFunc") return true;
+    if (e.callee.kind === "userFunc") return "user-call";
     // Builtin calls flagged `producesOwnedDirectly` (e.g. `size(t)`,
     // `reshape(t, …)`, `zeros(N, M)`) return a fully-formed owned
     // value from a single C call and need ANF hoisting just like
@@ -64,10 +79,70 @@ export function isOwnedProducer(e: IRExpr): boolean {
       e.callee.kind === "builtin" &&
       e.callee.sig.producesOwnedDirectly === true
     ) {
-      return true;
+      return "builtin-call";
     }
   }
-  return false;
+  return null;
+}
+
+/** Boolean shim over `classifyOwnedExpr` for sites that just need to
+ *  decide "is this an owned producer?" without caring which kind. */
+export function isOwnedProducer(e: IRExpr): boolean {
+  return classifyOwnedExpr(e) !== null;
+}
+
+/** True when `e` is an owned-producing `Call` that codegen consumes
+ *  directly into an owned LHS via `mtoc_<kind>_assign(&lhs, foo(...))`
+ *  — i.e. a user-function call or a builtin Call flagged
+ *  `producesOwnedDirectly`. Used by emitExpr / emitStmt to detect the
+ *  "direct consume" path that bypasses the iter-loop materialization
+ *  machinery. */
+export function isDirectOwnedCall(e: IRExpr): boolean {
+  if (e.kind !== "Call") return false;
+  if (e.callee.kind === "userFunc") return true;
+  return (
+    e.callee.kind === "builtin" && e.callee.sig.producesOwnedDirectly === true
+  );
+}
+
+/** Human-readable explanation for an `OwnedExprKind` that survived the
+ *  ANF pass — used by the post-ANF validator's `UnsupportedConstruct`
+ *  throws. Marked `"internal:"` because the ANF pass should have
+ *  hoisted these; arriving here is an mtoc bug, not a user error. */
+export function ownedExprMessage(kind: OwnedExprKind): string {
+  switch (kind) {
+    case "tensor-lit":
+      return (
+        "internal: tensor literal still nested inside another expression " +
+        "after ANF; ANF pass should have hoisted it"
+      );
+    case "string-concat":
+      return (
+        "internal: string concatenation still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
+      );
+    case "index-slice":
+      return (
+        "internal: range/colon index slice still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
+      );
+    case "make-range":
+      return (
+        "internal: bare range expression still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
+      );
+    case "user-call":
+      return (
+        "internal: owned-returning user-function call still nested " +
+        "inside another expression after ANF; ANF pass should have " +
+        "hoisted it"
+      );
+    case "builtin-call":
+      return (
+        "internal: owned-returning builtin call still nested inside " +
+        "another expression after ANF; ANF pass should have hoisted it"
+      );
+  }
 }
 
 /** Mutate `prog` in place, A-normalizing main's body and every

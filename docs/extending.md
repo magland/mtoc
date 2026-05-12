@@ -73,6 +73,35 @@ Example: a hypothetical `IRExpr.IndexLoad` for `v(i)`.
 4. Update `analyzeExpr` if the variant has codegen activations.
 5. Tests under `test_scripts/<category>/`.
 
+## Add a new MType kind (cell, struct, class, …)
+
+Adding a value kind alongside `Numeric` / `String` is a foundation
+change with predictable plug-in points. The pieces:
+
+1. Add the variant to the `MType` union in `src/lowering/types.ts`.
+2. Add an arm to `storageCategory` in the same file (returns the new
+   category's string ID). `canShareStorage` and `absentDefaultFor`
+   pick the new category up automatically; lowering's
+   `recordAssignment` and `mergeBranchEnvs` won't need touching.
+3. Add an entry to `ownedKinds.ts` (`ownedOps`) so the new kind's
+   `mtoc_<kind>_assign` / `_free` / `_copy` / `disp` helpers route
+   correctly. `emitDeclarations` / `emitScopeExitFrees` /
+   `functionFreeOnExitSet` then handle the lifetime walks without
+   per-kind code.
+4. Add a `disp` arm to `dispKinds.ts` (`dispEmitterFor`). The
+   `Disp` IRStmt arm in `emitStmt` is one lookup — no edit needed.
+5. Extend `cTypeFor` in `types.ts` so codegen knows the C type to
+   declare.
+6. Drop the `.h` files for the C-side struct + helpers under
+   `src/codegen/runtime/` and register them in the runtime helpers
+   map.
+7. Lower a parser-side producer (`{a,b,c}` cell literal, `s.field`
+   member access, …) to a new IR node or extend an existing one.
+
+The intent is that touching the per-kind registries is enough — the
+walkers, validators, and pass machinery should not learn the new
+kind's name.
+
 ## Add a constant
 
 Trivial: extend the constants table in `src/workspace/constants.ts` with the
