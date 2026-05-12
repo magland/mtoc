@@ -36,6 +36,7 @@ import {
   absentDefaultFor,
   canShareStorage,
   isMultiElement,
+  isScalarComplex,
   isScalarReal,
   isString,
   MType,
@@ -454,6 +455,20 @@ export class Lowerer {
     if (!isScalarReal(ty)) {
       throw new UnsupportedConstruct(
         `${role} must be a real scalar (got ${typeToString(ty)})`,
+        span
+      );
+    }
+  }
+
+  /** Accept a scalar real or scalar complex as a boolean condition.
+   *  Used by `if` / `elseif` / `while` / `assert(cond)`. Complex
+   *  conditions follow numbl's toBool rule
+   *  (`creal(z) != 0 || cimag(z) != 0`), expanded by codegen at the
+   *  `Unary Not` / cmp-or-logical / `mtoc_assert_*` site. */
+  requireScalarCond(ty: MType, role: string, span: Span): void {
+    if (!isScalarReal(ty) && !isScalarComplex(ty)) {
+      throw new UnsupportedConstruct(
+        `${role} must be a real or complex scalar (got ${typeToString(ty)})`,
         span
       );
     }

@@ -22,6 +22,7 @@ import type { Expr, Span } from "../parser/index.js";
 import { UnsupportedConstruct } from "../lowering/errors.js";
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import {
+  arithResult,
   charArrayType,
   dimIsOne,
   isCharArray,
@@ -497,7 +498,9 @@ const BUILTINS: BuiltinSig[] = [
   // `mtoc_assert_double` runtime helper (prints "Assertion failed"
   // to stderr and exit(1)s on failure, no-op on success). The
   // 2-arg `assert(cond, msg)` and tensor-condition forms are
-  // deferred — rejected at lowering with a span.
+  // deferred — rejected at lowering with a span. Numbl rejects
+  // a genuinely-complex `cond` (its assert has no complex branch),
+  // so we do too.
   {
     name: "assert",
     category: "stmt",
@@ -506,7 +509,7 @@ const BUILTINS: BuiltinSig[] = [
         shape: "any",
         domain: null,
         elem: null,
-        complexDomain: "real-or-complex",
+        complexDomain: "real-only",
       },
     ],
     result: () => ({ kind: "Void" }),
@@ -525,8 +528,8 @@ const BUILTINS: BuiltinSig[] = [
       const cond = ctx.lowerExpr(args[0]);
       if (!isScalarReal(cond.ty)) {
         throw new UnsupportedConstruct(
-          `'assert' currently requires a scalar real condition ` +
-            `(got ${typeToString(cond.ty)})`,
+          `'assert' currently requires a scalar real ` +
+            `condition (got ${typeToString(cond.ty)})`,
           args[0].span
         );
       }
@@ -646,16 +649,31 @@ const BUILTINS: BuiltinSig[] = [
     lowerExpr: (_ctx, args, span) => sprintfLowerExpr(args, span),
   },
 
-  // ── 1-arg libm — real-only legacy ────────────────────────────────────
+  // ── 1-arg rounding family — real → libm; complex → componentwise ─────
+  // numbl's `floor` / `ceil` / `round` / `fix` apply componentwise on
+  // complex (numbl/src/numbl-core/interpreter/builtins/math.ts):
+  //   floor(z) = floor(creal(z)) + floor(cimag(z)) * I    (and similarly)
+  // C99 doesn't ship `cfloor`/`cceil`/`cround`/`ctrunc`, so each complex
+  // sibling is a small runtime helper. Real inputs keep the bare libm
+  // emit (`realIsLibm: true` — no `useRuntime` activation).
   // `mod`/`rem` are real-only by numbl semantics (their sign-of-divisor
   // / truncate-to-zero rules don't have a sensible complex extension).
-  // `floor`/`ceil`/`round`/`fix` need a componentwise runtime helper
-  // for complex; defining those as real-only here means complex inputs
-  // are rejected with a clean message until that helper lands.
-  libm("floor", 1, "floor", "unknown"),
-  libm("ceil", 1, "ceil", "unknown"),
-  libm("round", 1, "round", "unknown"),
-  libm("fix", 1, "trunc", "unknown"),
+  runtime("floor", 1, "floor", "unknown", [], {
+    complexHelperName: "mtoc_floor_complex",
+    realIsLibm: true,
+  }),
+  runtime("ceil", 1, "ceil", "unknown", [], {
+    complexHelperName: "mtoc_ceil_complex",
+    realIsLibm: true,
+  }),
+  runtime("round", 1, "round", "unknown", [], {
+    complexHelperName: "mtoc_round_complex",
+    realIsLibm: true,
+  }),
+  runtime("fix", 1, "trunc", "unknown", [], {
+    complexHelperName: "mtoc_trunc_complex",
+    realIsLibm: true,
+  }),
 
   // ── String / char comparison ─────────────────────────────────────────
   // `strcmp(a, b)` returns 1.0 if the two text values match
@@ -712,33 +730,59 @@ const BUILTINS: BuiltinSig[] = [
   // ── 1-arg numeric predicates — return 0.0/1.0 ────────────────────────
   // `isnan` / `isinf` / `isfinite` map to C99 macros (in <math.h>)
   // which return int; an explicit `(double)` cast makes the result
-  // type unambiguous at every call site. Real-only for now; numbl's
-  // complex semantics (true if EITHER lane satisfies the predicate
-  // for `isnan`/`isinf`, BOTH lanes for `isfinite`) needs a small
-  // runtime helper that we'll add when complex coverage matters.
+  // type unambiguous at every call site. Complex inputs are admitted
+  // through small runtime helpers that expand componentwise (numbl
+  // semantics):
+  //   isnan(z)    true iff EITHER creal(z) or cimag(z) is NaN
+  //   isinf(z)    true iff EITHER lane is infinite
+  //   isfinite(z) true iff BOTH lanes are finite
+  // A helper (rather than an inline expansion) keeps a single
+  // evaluation of the operand: an argument that's itself a Call
+  // (e.g. `isnan(csqrt(z))`) would otherwise be evaluated twice in
+  // the rendered C — the parameter binding inside the helper does
+  // the hoisting for us.
   // `logical(x)` is the numeric→logical coercion: nonzero → 1.0,
   // else 0.0. Matches numbl's `toBool` (`x !== 0`), so NaN and ±Inf
-  // both round to 1.0 (NaN ≠ 0 is true in IEEE 754).
+  // both round to 1.0 (NaN ≠ 0 is true in IEEE 754). Numbl rejects
+  // `logical` on a complex argument, so we do too.
   {
     name: "isnan",
     category: "expr",
-    params: scalarParams(1),
+    params: scalarParams(1, [], "real-or-complex"),
     result: () => scalarDouble("nonnegative"),
-    emit: args => `((double)(isnan(${args[0]}) ? 1 : 0))`,
+    emit: (args, argTys, state) => {
+      if (anyComplex(argTys)) {
+        state.useRuntime("mtoc_isnan_complex");
+        return `mtoc_isnan_complex(${args[0]})`;
+      }
+      return `((double)(isnan(${args[0]}) ? 1 : 0))`;
+    },
   },
   {
     name: "isinf",
     category: "expr",
-    params: scalarParams(1),
+    params: scalarParams(1, [], "real-or-complex"),
     result: () => scalarDouble("nonnegative"),
-    emit: args => `((double)(isinf(${args[0]}) ? 1 : 0))`,
+    emit: (args, argTys, state) => {
+      if (anyComplex(argTys)) {
+        state.useRuntime("mtoc_isinf_complex");
+        return `mtoc_isinf_complex(${args[0]})`;
+      }
+      return `((double)(isinf(${args[0]}) ? 1 : 0))`;
+    },
   },
   {
     name: "isfinite",
     category: "expr",
-    params: scalarParams(1),
+    params: scalarParams(1, [], "real-or-complex"),
     result: () => scalarDouble("nonnegative"),
-    emit: args => `((double)(isfinite(${args[0]}) ? 1 : 0))`,
+    emit: (args, argTys, state) => {
+      if (anyComplex(argTys)) {
+        state.useRuntime("mtoc_isfinite_complex");
+        return `mtoc_isfinite_complex(${args[0]})`;
+      }
+      return `((double)(isfinite(${args[0]}) ? 1 : 0))`;
+    },
   },
   {
     name: "logical",
@@ -851,6 +895,27 @@ const BUILTINS: BuiltinSig[] = [
       state.useRuntime("mtoc_angle_real");
       return `mtoc_angle_real(${args[0]})`;
     },
+  },
+
+  // `complex(...)` — the only path in numbl from a real-typed value to
+  // a complex-typed one. 1-arg `complex(a)` promotes real → complex
+  // (imag plane = 0); a complex `a` passes through unchanged. 2-arg
+  // `complex(a, b)` builds `a + b*i`; numbl rejects a complex arg in
+  // the 2-arg form (its `apply` calls `isRuntimeNumber` which is
+  // false for complex), so we do too. Scalar and tensor inputs both
+  // work — tensor inputs ride the standard elementwise lift, with
+  // shape from `arithResult` broadcast. See `lowerComplexCtor` below.
+  {
+    name: "complex",
+    category: "expr",
+    params: [],
+    result: () => ({ kind: "Unknown" }),
+    emit: () => {
+      throw new Error(
+        "internal: 'complex' must be lowered through its lowerExpr hook"
+      );
+    },
+    lowerExpr: lowerComplexCtor,
   },
 
   // ── 1-arg runtime — `sign` propagates complexity ─────────────────────
@@ -1864,6 +1929,96 @@ function lowerVariadicTensorCtor(
     name,
     callee: { kind: "builtin", sig },
     args: [...dimArgs],
+    ty: resultTy,
+    span,
+  };
+}
+
+/** Expression-position lowering for `complex(...)`. 1-arg form
+ *  promotes a real value to complex (and passes a complex value
+ *  through unchanged); 2-arg form `complex(a, b)` builds `a + b*i`
+ *  and rejects complex args (numbl semantics). Tensor inputs ride
+ *  the standard elementwise lift via a synthesized scalar-emit
+ *  BuiltinSig: the codegen iter-loop allocates a complex result
+ *  tensor at the broadcast shape and stamps the per-slot expression
+ *  `(a + 0*I)` (1-arg) or `(a + b*I)` (2-arg) into each cell. */
+function lowerComplexCtor(
+  _ctx: BuiltinLowerCtx,
+  args: ReadonlyArray<IRExpr>,
+  span: Span
+): IRExpr | null {
+  if (args.length < 1 || args.length > 2) {
+    throw new UnsupportedConstruct(
+      `'complex' takes 1 or 2 arguments (got ${args.length})`,
+      span
+    );
+  }
+  for (let i = 0; i < args.length; i++) {
+    if (!isNumeric(args[i].ty)) {
+      throw new UnsupportedConstruct(
+        `'complex' requires numeric arguments ` +
+          `(got ${typeToString(args[i].ty)})`,
+        args[i].span ?? span
+      );
+    }
+  }
+  // 1-arg passthrough: complex(z) where z is already complex returns z
+  // (assignment / disp do the deep copy where needed).
+  if (args.length === 1 && (args[0].ty as NumericType).isComplex) {
+    return args[0];
+  }
+  // 2-arg: numbl rejects a complex arg in either slot.
+  if (args.length === 2) {
+    for (let i = 0; i < 2; i++) {
+      if ((args[i].ty as NumericType).isComplex) {
+        throw new UnsupportedConstruct(
+          `'complex' requires real arguments in the 2-arg form ` +
+            `(got ${typeToString(args[i].ty)})`,
+          args[i].span ?? span
+        );
+      }
+    }
+  }
+  // Result type: complex with the broadcast shape of the args. Reuse
+  // `arithResult` for the 2-arg broadcast (Add is sign/elem-preserving
+  // so the dims it produces are what we want).
+  let resultTy: NumericType;
+  if (args.length === 1) {
+    const a = args[0].ty as NumericType;
+    resultTy = numericTypeND(a.dims, true, "unknown", a.elem);
+  } else {
+    const broadcasted = arithResult("Add", args[0].ty, args[1].ty);
+    if (!isNumeric(broadcasted)) {
+      throw new UnsupportedConstruct(
+        `'complex': cannot broadcast arguments with incompatible shapes ` +
+          `(${typeToString(args[0].ty)}, ${typeToString(args[1].ty)})`,
+        span
+      );
+    }
+    resultTy = numericTypeND(broadcasted.dims, true, "unknown", "double");
+  }
+  const params: ParamConstraint[] = args.map(() => ({
+    shape: "scalar" as const,
+    domain: null,
+    elem: "double" as const,
+    complexDomain: "real-only" as const,
+  }));
+  const emit: BuiltinEmit =
+    args.length === 1
+      ? argStrs => `((${argStrs[0]}) + 0.0 * I)`
+      : argStrs => `((${argStrs[0]}) + (${argStrs[1]}) * I)`;
+  const sig: BuiltinSig = {
+    name: "complex",
+    category: "expr",
+    params,
+    result: () => resultTy,
+    emit,
+  };
+  return {
+    kind: "Call",
+    name: "complex",
+    callee: { kind: "builtin", sig },
+    args: [...args],
     ty: resultTy,
     span,
   };

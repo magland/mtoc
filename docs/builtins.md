@@ -282,11 +282,18 @@ The text-view-aware builtins:
   `mtoc_text_from_*` adapter and emits a single `mtoc_strcmp_text(va,
 vb)` call returning a real scalar (1.0 / 0.0).
 
-Numeric predicates `isnan(x)` / `isinf(x)` / `isfinite(x)` and the
-`logical(x)` coercion are inlined as expression-level emits — no
-runtime helper, just a `(double)isnan(x)` / `(x != 0.0 ? 1.0 : 0.0)`
-shape. They follow numbl's logical-as-double convention so the
-result threads cleanly into arithmetic / `assert` / `disp`.
+Numeric predicates `isnan(x)` / `isinf(x)` / `isfinite(x)` accept
+both real and complex scalars. Real inputs render inline
+(`(double)isnan(x)`); complex inputs route through a small runtime
+helper (`mtoc_isnan_complex` / `mtoc_isinf_complex` /
+`mtoc_isfinite_complex`) that binds the argument to a local so a
+caller-side Call expression — e.g. `isnan(csqrt(z))` — is
+evaluated exactly once. The helpers expand componentwise per
+numbl: EITHER-lane for `isnan` / `isinf`, BOTH-lanes for
+`isfinite`. `logical(x)` is real-only (numbl rejects a complex
+argument) and renders inline as `(x != 0.0 ? 1.0 : 0.0)`. All
+four follow numbl's logical-as-double convention so the result
+threads cleanly into arithmetic / `assert` / `disp`.
 
 `length(s)` and `numel(s)` use their `lowerExpr` hook to handle
 non-tensor arguments. When the argument is a string, both fold to a
@@ -296,6 +303,19 @@ handle). When the argument is a char array, `CharLit` folds to a
 Call that reads `.cols` from the `mtoc_char_tensor_t` struct — no
 runtime helper needed. Tensor / numeric arguments fall through to
 the default `reduceTensor` validate / build path.
+
+`complex(...)` is the only path from a real-typed value to a
+complex-typed one (numbl has no `'like'` or `'complex'` companion
+arg on `zeros` / `ones` / `eye` / `nan` / `inf` / `randn`). Its
+`lowerExpr` hook handles both the 1-arg form
+(`complex(x)` — promote real → complex with imag plane = 0; a
+complex `x` passes through unchanged) and the 2-arg form
+(`complex(re, im)` — build `re + im*i`, rejects complex args).
+Scalar inputs render as a direct `(arg + 0.0 * I)` / `(re + im * I)`
+C expression; tensor inputs ride the standard elementwise lift —
+the iter-loop codegen allocates a complex result tensor and stamps
+the per-slot expression into each cell, including the broadcast
+cases `complex(scalar, tensor)` and `complex(tensor, scalar)`.
 
 String concat (`+`) is handled in the binary lowering path, not as a
 builtin. Whenever at least one operand is a string and the other is

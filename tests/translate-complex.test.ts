@@ -134,3 +134,211 @@ describe("complex codegen — no double-evaluation of Call operands", () => {
     expect(c).not.toContain("_mtoc_cx_tmp");
   });
 });
+
+describe("complex `^` / `.^`", () => {
+  // Scalar `^` / `.^` with at least one complex operand routes through
+  // C99's `cpow`. Tensor `.^` produces a complex result tensor at the
+  // broadcast shape (the iter-loop already emits cpow per slot via the
+  // existing complex-result branch in emitExpr).
+
+  it("emits cpow for scalar complex^integer", () => {
+    const c = translate("z = 1 + 2i;\ndisp(z^2);\n");
+    expect(c).toContain("cpow(z, 2.0)");
+    // result is typed double _Complex
+    expect(c).toMatch(/double _Complex/);
+  });
+
+  it("emits cpow for scalar real^complex", () => {
+    const c = translate("disp(2^(0 + 1i));\n");
+    expect(c).toContain("cpow(");
+  });
+
+  it("emits cpow elementwise for tensor .^ complex", () => {
+    const c = translate("z = [1+2i, 3+4i];\ndisp(z .^ 2);\n");
+    expect(c).toContain("cpow(");
+    // Result staging buffer uses the complex tensor allocator.
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+  });
+});
+
+describe("complex control-flow conditions (if / elseif / while)", () => {
+  // Numbl admits a scalar complex cond in `if`/`elseif`/`while` and
+  // applies its toBool rule. Codegen expands `if (z)` to
+  // `if (creal(z) != 0.0 || cimag(z) != 0.0)`.
+
+  it("expands `if z` to creal-or-cimag-nonzero", () => {
+    const c = translate("z = 1 + 2i;\nif z\n  disp(1);\nend\n");
+    expect(c).toMatch(
+      /if \(\(creal\(z\) != 0\.0 \|\| cimag\(z\) != 0\.0\)\) \{/
+    );
+  });
+
+  it("expands `while z` the same way", () => {
+    const c = translate("z = 1 + 2i;\nwhile z\n  z = 0 + 0i;\nend\n");
+    expect(c).toMatch(
+      /while \(\(creal\(z\) != 0\.0 \|\| cimag\(z\) != 0\.0\)\) \{/
+    );
+  });
+
+  it("expands elseif with a complex cond", () => {
+    const c = translate("if 0\n  disp(1);\nelseif 1 + 2i\n  disp(2);\nend\n");
+    expect(c).toMatch(
+      /else if \(\(creal\(.*\) != 0\.0 \|\| cimag\(.*\) != 0\.0\)\) \{/
+    );
+  });
+
+  it("hoists a non-Var complex if-cond to a temp (no double-eval)", () => {
+    // A complex Binary cond shouldn't be expanded twice.
+    const c = translate(
+      "z = 1 + 2i;\nw = 3 + 4i;\nif z + w\n  disp(1);\nend\n"
+    );
+    expect(c).toContain("_mtoc_cx_tmp_");
+    // The temp should be on a separate line above the if.
+    expect(c).toMatch(/double _Complex _mtoc_cx_tmp_\d+ = z \+ w;/);
+  });
+
+  it("keeps real cond on the bare path (no creal/cimag expansion)", () => {
+    const c = translate("x = 5;\nif x > 0\n  disp(1);\nend\n");
+    expect(c).toContain("if (x > 0.0)");
+    expect(c).not.toContain("creal(x");
+  });
+});
+
+describe("complex rounding family — floor / ceil / round / fix", () => {
+  // Numbl applies floor / ceil / round / trunc (`fix`) componentwise
+  // on complex inputs. C99 has no cfloor/cceil/cround/ctrunc, so
+  // each complex sibling is a small runtime helper.
+
+  it("routes complex floor through mtoc_floor_complex", () => {
+    const c = translate("z = 1.5 + 2.5i;\ndisp(floor(z));\n");
+    expect(c).toContain("mtoc_floor_complex(z)");
+    expect(c).toContain("static double _Complex mtoc_floor_complex(");
+  });
+
+  it("routes complex ceil through mtoc_ceil_complex", () => {
+    const c = translate("z = 1.5 + 2.5i;\ndisp(ceil(z));\n");
+    expect(c).toContain("mtoc_ceil_complex(z)");
+  });
+
+  it("routes complex round through mtoc_round_complex", () => {
+    const c = translate("z = 1.5 + 2.5i;\ndisp(round(z));\n");
+    expect(c).toContain("mtoc_round_complex(z)");
+  });
+
+  it("routes complex `fix` through mtoc_trunc_complex", () => {
+    const c = translate("z = 1.7 - 2.7i;\ndisp(fix(z));\n");
+    expect(c).toContain("mtoc_trunc_complex(z)");
+  });
+
+  it("keeps real floor / ceil / round / fix on bare libm names", () => {
+    const c = translate("x = 1.5;\ndisp(floor(x));\ndisp(fix(x));\n");
+    expect(c).not.toContain("mtoc_floor_complex");
+    expect(c).not.toContain("mtoc_trunc_complex");
+    expect(c).toContain("floor(x)");
+    expect(c).toContain("trunc(x)");
+  });
+});
+
+describe("complex isnan / isinf / isfinite / logical", () => {
+  // Complex inputs route through a runtime helper that expands
+  // componentwise per numbl: EITHER-lane for isnan/isinf, BOTH-lanes
+  // for isfinite, toBool (creal||cimag != 0) for logical. Using a
+  // helper rather than an inline expansion keeps the operand
+  // evaluated exactly once on a caller-side Call argument.
+
+  it("routes complex isnan through mtoc_isnan_complex", () => {
+    const c = translate("z = 1 + 2i;\ndisp(isnan(z));\n");
+    expect(c).toContain("mtoc_isnan_complex(z)");
+    expect(c).toContain("static double mtoc_isnan_complex(");
+    expect(c).toMatch(/isnan\(creal\(z\)\) \|\| isnan\(cimag\(z\)\)/);
+  });
+
+  it("routes complex isinf through mtoc_isinf_complex", () => {
+    const c = translate("z = 1 + 2i;\ndisp(isinf(z));\n");
+    expect(c).toContain("mtoc_isinf_complex(z)");
+    expect(c).toContain("static double mtoc_isinf_complex(");
+  });
+
+  it("routes complex isfinite through mtoc_isfinite_complex (AND of lanes)", () => {
+    const c = translate("z = 1 + 2i;\ndisp(isfinite(z));\n");
+    expect(c).toContain("mtoc_isfinite_complex(z)");
+    expect(c).toMatch(/isfinite\(creal\(z\)\) && isfinite\(cimag\(z\)\)/);
+  });
+
+  it("rejects complex logical (numbl rejects it too)", () => {
+    // Numbl's `logical` has no complex branch — it errors at runtime.
+    // We match that by rejecting at lowering.
+    expect(() => translate("z = 0 + 1i;\ndisp(logical(z));\n")).toThrow();
+  });
+
+  it("keeps real isnan / logical on the inline path (no helper pulled in)", () => {
+    const c = translate("x = 3.5;\ndisp(isnan(x));\ndisp(logical(x));\n");
+    expect(c).not.toContain("mtoc_isnan_complex");
+    expect(c).toContain("isnan(x)");
+  });
+});
+
+describe("complex(...) builtin — the only path from real to complex", () => {
+  // Numbl's `complex(...)` is the only constructor surface that
+  // produces a complex-typed value from real arguments. Scalar
+  // and tensor cases both work; tensor cases ride the standard
+  // elementwise lift so the iter-loop allocates a complex result
+  // tensor and stamps `(a + 0*I)` or `(a + b*I)` per slot.
+
+  it("emits `(a + 0.0 * I)` for scalar 1-arg real", () => {
+    const c = translate("a = complex(3);\ndisp(a);\n");
+    expect(c).toContain("double _Complex a");
+    expect(c).toMatch(/a = \(\(3\.0\) \+ 0\.0 \* I\);/);
+  });
+
+  it("passes a scalar complex through unchanged (no extra C call)", () => {
+    const c = translate("z = 1 + 2i;\nw = complex(z);\ndisp(w);\n");
+    // `w` is just `z` — no `+ 0.0 * I` re-wrap.
+    expect(c).toMatch(/w = z;/);
+    expect(c).not.toContain("(z) + 0.0 * I");
+  });
+
+  it("emits `(a + b * I)` for scalar 2-arg form", () => {
+    const c = translate("a = complex(1.5, 2.5);\ndisp(a);\n");
+    expect(c).toMatch(/a = \(\(1\.5\) \+ \(2\.5\) \* I\);/);
+  });
+
+  it("lifts elementwise for `complex(real_tensor)`", () => {
+    const c = translate("a = complex([1 2 3]);\ndisp(a);\n");
+    // Complex result tensor allocated; per-slot stamp uses `+ 0.0 * I`.
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+    expect(c).toContain("+ 0.0 * I");
+  });
+
+  it("lifts elementwise for `complex(re, im)` over same-shape tensors", () => {
+    const c = translate("a = complex([1 2 3], [4 5 6]);\ndisp(a);\n");
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+    // Both lanes are inlined per slot — look for the body shape.
+    expect(c).toMatch(/\) \+ \(.*\) \* I/);
+  });
+
+  it("supports scalar-broadcast in the 2-arg tensor form", () => {
+    const c = translate("a = complex([1 2 3], 7);\ndisp(a);\n");
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+  });
+
+  it("composes with `zeros` for the canonical complex-tensor idiom", () => {
+    const c = translate("a = complex(zeros(2, 3));\ndisp(a);\n");
+    // `zeros` produces a real tensor; `complex(...)` lifts it.
+    expect(c).toContain("mtoc_zeros_nd");
+    expect(c).toMatch(/mtoc_tensor_alloc(_nd)?_complex/);
+  });
+
+  it("rejects a complex arg in the 2-arg form (matches numbl)", () => {
+    expect(() => translate("a = complex(1 + 2i, 3);\ndisp(a);\n")).toThrow(
+      /real arguments in the 2-arg form/
+    );
+  });
+
+  it("rejects 0 args and 3+ args", () => {
+    expect(() => translate("disp(complex());\n")).toThrow(/1 or 2 arguments/);
+    expect(() => translate("disp(complex(1, 2, 3));\n")).toThrow(
+      /1 or 2 arguments/
+    );
+  });
+});

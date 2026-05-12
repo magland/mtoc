@@ -15,7 +15,11 @@ export function lowerIf(
 ): IRStmt {
   return this.withControlDepth(() => {
     const cond = this.lowerExpr(s.cond);
-    this.requireScalarReal(cond.ty, "if condition", s.span);
+    // Numbl treats a scalar complex `z` as `creal(z) != 0 || cimag(z) != 0`
+    // in a boolean position (same toBool rule as `~z` and `&&`/`||`).
+    // The codegen's `If` emitter renders this expansion via the same
+    // path that handles complex `~z` and complex comparisons.
+    this.requireScalarCond(cond.ty, "if condition", s.span);
 
     const envBefore = new Map(this.env);
 
@@ -32,7 +36,7 @@ export function lowerIf(
     for (const b of s.elseifBlocks) {
       this.env = new Map(envBefore);
       const ec = this.lowerExpr(b.cond);
-      this.requireScalarReal(ec.ty, "elseif condition", b.cond.span);
+      this.requireScalarCond(ec.ty, "elseif condition", b.cond.span);
       const body = this.lowerStmts(b.body);
       elseifs.push({ cond: ec, body });
       envElseifs.push(new Map(this.env));

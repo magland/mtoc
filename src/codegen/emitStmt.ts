@@ -17,7 +17,7 @@
  *     `emitIndexSliceStore`, `emitNdScalarOffset`, and helpers.
  */
 
-import type { IRStmt } from "../lowering/ir.js";
+import type { IRExpr, IRStmt } from "../lowering/ir.js";
 import { isDirectOwnedCall } from "../lowering/anf.js";
 import {
   cTypeFor,
@@ -52,6 +52,46 @@ import { emitIndexSliceAssign, emitIndexSliceStore } from "./emitSlice.js";
 import { emitMakeRangeAssign } from "./emitRange.js";
 
 export { analyzeStmts } from "./emitAnalysis.js";
+
+/** Render a scalar IRExpr in a boolean-context position (an `if`,
+ *  `elseif`, `while`, or `assert(cond)`). Real-valued conds render
+ *  exactly as the underlying expression (numbl's toBool on real is
+ *  `x != 0`, which C's `if(x)` already implements bit-for-bit modulo
+ *  NaN — numbl rejects NaN at `assert`, which the runtime helper
+ *  handles separately, while `if`/`while` treat NaN as truthy in
+ *  both numbl and C).
+ *
+ *  Complex conds expand to numbl's toBool rule
+ *  `creal(z) != 0.0 || cimag(z) != 0.0`. For the top-level `if` cond
+ *  `allowHoist=true` lifts a non-Var operand to a `_mtoc_cx_tmp_<N>`
+ *  at the current statement level (same pattern as the complex `Unary
+ *  Not` path) so a caller-side Call is evaluated once. `elseif` and
+ *  `while` conds set `allowHoist=false`: for `elseif` a hoisted decl
+ *  would land inside the prior arm's `{...}` scope and not be visible;
+ *  for `while` the cond must be re-evaluated per iteration. Numbl
+ *  funcs are pure, so double-eval is benign in both no-hoist cases. */
+function emitBoolCond(
+  state: EmitState,
+  level: number,
+  cond: IRExpr,
+  allowHoist: boolean
+): string {
+  if (!isScalarComplex(cond.ty)) {
+    return emitExpr(state, cond, 0);
+  }
+  let s = emitExpr(state, cond, 0);
+  if (allowHoist && cond.kind !== "Var") {
+    const tmp = `_mtoc_cx_tmp_${state.complexTmpCounter++}`;
+    pushStmt(state, level, `double _Complex ${tmp} = ${s};`);
+    s = tmp;
+    return `(creal(${s}) != 0.0 || cimag(${s}) != 0.0)`;
+  }
+  // No hoist — re-inline the operand expression on each lane access.
+  // For a Var this is a pure read and matches the hoisted form; for a
+  // non-Var while-cond the duplication is intentional (per-iteration
+  // re-evaluation matches numbl).
+  return `(creal(${s}) != 0.0 || cimag(${s}) != 0.0)`;
+}
 
 export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   // Track the current statement level so that expression-level helpers
@@ -294,7 +334,11 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       const preFreed = new Set(state.freedOwned);
       const armFreedSets: Set<string>[] = [];
 
-      pushStmt(state, level, `if (${emitExpr(state, s.cond, 0)}) {`);
+      pushStmt(
+        state,
+        level,
+        `if (${emitBoolCond(state, level, s.cond, true)}) {`
+      );
       state.freedOwned = new Set(preFreed);
       for (const t of s.thenBody) emitStmt(state, level + 1, t);
       armFreedSets.push(state.freedOwned);
@@ -303,7 +347,15 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // Reset currentLevel so any complex temp hoisted by the condition
         // expression is pushed at the outer scope level, not the thenBody level.
         state.currentLevel = level;
-        pushStmt(state, level, `} else if (${emitExpr(state, eif.cond, 0)}) {`);
+        // No hoist for elseif: a hoisted decl would land textually inside
+        // the prior arm's `{...}` scope (between its last stmt and its `}`)
+        // and the elseif wouldn't see it. Numbl funcs are pure (see anf.ts),
+        // so double-eval of the cond on both lanes is benign.
+        pushStmt(
+          state,
+          level,
+          `} else if (${emitBoolCond(state, level, eif.cond, false)}) {`
+        );
         state.freedOwned = new Set(preFreed);
         for (const t of eif.body) emitStmt(state, level + 1, t);
         armFreedSets.push(state.freedOwned);
@@ -341,7 +393,11 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // post-loop scope-exit free of the same var (via the safety
       // net) is sound.
       const preFreed = new Set(state.freedOwned);
-      pushStmt(state, level, `while (${emitExpr(state, s.cond, 0)}) {`);
+      pushStmt(
+        state,
+        level,
+        `while (${emitBoolCond(state, level, s.cond, false)}) {`
+      );
       state.freedOwned = new Set(preFreed);
       for (const t of s.body) emitStmt(state, level + 1, t);
       pushStmt(state, level, `}`);
@@ -372,15 +428,18 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // free dead-after vars on the success path. The 2-arg form
       // routes through the text-view helper, accepting either a
       // string or a char-array msg uniformly.
+      //
+      // Complex conds reduce to a real 0.0/1.0 via numbl's toBool
+      // (`creal(z) != 0 || cimag(z) != 0`); the resulting bool is
+      // never NaN, so the existing real-side helpers fail correctly
+      // on a both-lanes-zero value and pass on anything else. The
+      // `emitBoolCond` helper hoists a non-Var complex cond to a
+      // temp so a Call-bearing condition isn't double-evaluated.
+      const condC = emitBoolCond(state, level, s.cond, true);
       if (s.msg === null) {
         useRuntimeByName(state, "mtoc_assert_double");
-        pushStmt(
-          state,
-          level,
-          `mtoc_assert_double(${emitExpr(state, s.cond, 0)});`
-        );
+        pushStmt(state, level, `mtoc_assert_double(${condC});`);
       } else {
-        const condC = emitExpr(state, s.cond, 0);
         useRuntimeByName(state, "mtoc_assert_double_msg_text");
         const view = wrapTextView(state, s.msg.ty, emitExpr(state, s.msg, 0));
         pushStmt(

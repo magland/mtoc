@@ -371,32 +371,82 @@ function inferPowSign(baseSign: Sign, expVal: number | null): Sign {
 }
 
 /** Power ops:
- *    - `^` is scalar-real; lifts to complex when the base is
- *      statically negative AND the exponent folds to a non-integer
- *      constant (e.g. `(-1)^0.5`). Matrix power on two tensors is
- *      rejected with a pointer to `.^`.
- *    - `.^` is element-wise: scalar-real, or broadcastable real-elem
- *      tensors. The negative-base / non-integer-exponent lift is
- *      scalar-only for now.
- *  Codegen renders the real path as `pow(<left>, <right>)`; the
- *  complex-result path emits `cpow(...)` and the variable receiving
- *  it is typed `double _Complex`. Inside an iter loop the operand
- *  strings already reduce to per-slot scalar reads, so the same emit
- *  path covers tensor `.^` for free. */
+ *    - `^` is scalar; the result is complex if either operand is
+ *      complex (numbl uses `cpow`), or if the base is statically
+ *      negative AND the exponent folds to a non-integer constant
+ *      (e.g. `(-1)^0.5`). Matrix power on two tensors is rejected
+ *      with a pointer to `.^`.
+ *    - `.^` is element-wise: scalar or broadcastable tensors. Either
+ *      operand may be complex; the result is complex if either side
+ *      is. The negative-base / non-integer-exponent real-to-complex
+ *      lift is scalar-only for now.
+ *  Codegen renders the real path as `pow(<left>, <right>)`; any
+ *  complex-result path emits `cpow(...)` (C99 implicitly promotes a
+ *  real operand to `double _Complex`). Inside an iter loop the
+ *  operand strings already reduce to per-slot scalar reads, so the
+ *  same emit path covers tensor `.^` over real and complex elements
+ *  uniformly. */
 function lowerPow(
   e: Extract<Expr, { type: "Binary" }>,
   left: IRExpr,
   right: IRExpr
 ): IRExpr {
-  if (
+  const eitherComplex =
     (isNumeric(left.ty) && left.ty.isComplex) ||
-    (isNumeric(right.ty) && right.ty.isComplex)
-  ) {
-    throw new UnsupportedConstruct(
-      `binary ${e.op} on complex operands is not yet supported`,
-      e.span
-    );
+    (isNumeric(right.ty) && right.ty.isComplex);
+
+  // Complex `^` / `.^` follow numbl's `cpow`. For scalar operands the
+  // result is a scalar complex; for elementwise `.^` over tensors the
+  // result is a complex tensor at the broadcast shape.
+  if (eitherComplex) {
+    if (e.op === "Pow") {
+      // Matrix power on tensors is matrix exponentiation — not yet
+      // implemented. Two-scalar `^` is fine and goes through cpow.
+      if (!isScalar(left.ty) || !isScalar(right.ty)) {
+        throw new UnsupportedConstruct(
+          `binary ^ on tensors is not yet supported (matrix power; ` +
+            `use .^ for elementwise instead)`,
+          e.span
+        );
+      }
+      return {
+        kind: "Binary",
+        op: e.op,
+        left,
+        right,
+        ty: scalarComplex(),
+        span: e.span,
+      };
+    }
+    // ElemPow with at least one complex operand.
+    if (isScalar(left.ty) && isScalar(right.ty)) {
+      return {
+        kind: "Binary",
+        op: e.op,
+        left,
+        right,
+        ty: scalarComplex(),
+        span: e.span,
+      };
+    }
+    const leftTy = left.ty as NumericType;
+    const rightTy = right.ty as NumericType;
+    const dims = isScalar(leftTy)
+      ? rightTy.dims
+      : isScalar(rightTy)
+        ? leftTy.dims
+        : broadcastShape(leftTy.dims, rightTy.dims);
+    const resultTy: NumericType = numericTypeND(dims, true, "unknown");
+    return {
+      kind: "Binary",
+      op: e.op,
+      left,
+      right,
+      ty: resultTy,
+      span: e.span,
+    };
   }
+
   // Mirror numbl: a statically negative base raised to a non-integer
   // constant exponent produces a complex principal-value result
   // (e.g. `(-1)^0.5 == 1i`). Without this lift the C-emitted `pow`
