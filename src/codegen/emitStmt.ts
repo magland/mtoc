@@ -64,13 +64,19 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
   if (srcLine !== null) {
     pushStmt(state, level, `/* ${sanitizeForBlockComment(srcLine)} */`);
   }
-  // Fusion plan hook: a producer `Assign` that was inlined into a
-  // downstream consumer's elementwise loop has its loop emission
-  // skipped here. The source-line comment above still emits, so the
-  // reader can follow each numbl statement; the consumer's emit
-  // below produces the single fused C loop. See
-  // `src/codegen/opt/fuseSameShape.ts`.
+  // Optimizer hooks: a producer `Assign` that has been folded into
+  // a downstream consumer (same-shape fusion or column-slice
+  // inlining) has its emission skipped here. The source-line
+  // comment above still emits, so the reader can follow each numbl
+  // statement; the consumer's emit below produces the fused loop.
+  // See `src/codegen/opt/{fuseSameShape,inlineColumnSlice}.ts`.
   if (state.fusionPlan !== null && state.fusionPlan.skipProducers.has(s)) {
+    return;
+  }
+  if (
+    state.columnSlicePlan !== null &&
+    state.columnSlicePlan.skipProducers.has(s)
+  ) {
     return;
   }
   switch (s.kind) {
@@ -147,7 +153,19 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           // expression instead of `s.rhs`. The producer's own Assign
           // is in `state.fusionPlan.skipProducers` and emits no loop.
           const effectiveRhs = state.fusionPlan?.consumerRhs.get(s) ?? s.rhs;
-          emitTensorAssignFromExpr(state, level, s.cName, effectiveRhs);
+          // Column-slice inlining hook: pass the consumer's
+          // slice-inline map through so the emitter can resolve
+          // axis sizes from the base, skip per-operand precompute
+          // for inlined slices, and attach inline info to the iter
+          // frame (consumed at the `Var`-read site in `emitExpr`).
+          const sliceInlines = state.columnSlicePlan?.consumerInlines.get(s);
+          emitTensorAssignFromExpr(
+            state,
+            level,
+            s.cName,
+            effectiveRhs,
+            sliceInlines
+          );
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
           break;
         }

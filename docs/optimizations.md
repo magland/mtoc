@@ -114,6 +114,72 @@ pair.
 `translate()`. The plan-builder is bypassed; emission falls back to
 the pre-fusion shape.
 
+### Column/row-slice inlining (`inlineColumnSlice.ts`)
+
+Recognizes producers of the form `_anf = base(:, k)` (column slice)
+or `_anf = base(k, :)` (row slice) whose result is consumed exactly
+once by a downstream elementwise `Assign`, and rewrites the read of
+the slice's value at the consumer's loop body to read directly from
+`base`'s buffer at the right column-major offset — skipping the
+slice's allocation and copy loop entirely.
+
+For example, the source
+
+```matlab
+function r = f(m)
+  col = m(:, 1);
+  row = m(1, :);
+  r = col + row;
+end
+```
+
+emits a slice alloc + copy loop per `col` and `row` plus a broadcast
+loop for `r` by default. With slice inlining the per-slice
+allocations and copy loops disappear; the broadcast loop reads
+`m.real[k0 + (k-1) * m.dims[0]]` for `col` and `m.real[(k-1) + k1 *
+m.dims[0]]` for `row` directly.
+
+**Preconditions (all must hold).**
+
+- Producer is `Assign(prodCName, IndexSlice)` whose `.index` is
+  exactly `[Colon, Scalar]` (column slice) or `[Scalar, Colon]`
+  (row slice).
+- The slice's base is a 2-D multi-element real-double `Var`.
+- The fixed-axis `Scalar` is a `NumLit`, scalar `Var`, or `EndRef`
+  — all pure, side-effect-free, safe to evaluate once into a
+  per-consumer local.
+- The producer's cName has exactly one use in the body: at a
+  downstream elementwise consumer (flat-iter or broadcast).
+- The cName appears in the consumer's RHS only in iter-slot
+  positions (not as an `IndexLoad.base` / `IndexSlice.base` etc.).
+- Between producer and consumer, no statement mutates the
+  producer's base or LHS; only same-body fusion is allowed.
+
+**Hook sites (delete these and the file to revert):**
+
+- `src/codegen/emit.ts` / `src/codegen/emitFunction.ts` — build the
+  plan after liveness; stash on `EmitState.columnSlicePlan`.
+- `src/codegen/emitStmt.ts` — early-return on
+  `plan.skipProducers`; pass `plan.consumerInlines.get(s)` down to
+  `emitTensorAssignFromExpr`.
+- `src/codegen/emitTensor.ts` — `operandAxisSize` resolves inlined
+  slice dims from the base; per-operand index precompute skipped
+  for inlined slices; `_mtoc_inline_<...>_fixed` locals hoisted
+  before the loop; iter frame carries the inline info + `loopVars`.
+- `src/codegen/emitExpr.ts` — `Var`-read substitution at the
+  iter-frame inline-map lookup.
+- `src/codegen/emitAnalysis.ts::deadAfterStmt` — augment the
+  consumer's owned-use set with each inlined slice's base so the
+  base is freed at the right point on the linear path.
+
+**Out of scope (deferred):**
+
+- Complex / char-tensor / N-D bases.
+- Slices into N-D bases (the row/col stride math generalizes but
+  needs an N-D-aware substitution).
+- Composition with same-shape fusion when the chain crosses
+  shapes (e.g. slice → flat-iter → broadcast).
+
 ## Adding an optimization
 
 1. Drop a new file under `src/codegen/opt/<name>.ts`. Export:

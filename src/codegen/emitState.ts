@@ -18,17 +18,53 @@ import type { MType } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import type { FutureTouchMap } from "./liveness.js";
 import type { FusionPlan } from "./opt/fuseSameShape.js";
+import type { ColumnSlicePlan } from "./opt/inlineColumnSlice.js";
 import { RUNTIME_HELPERS, type RuntimeSnippet } from "./runtime.js";
+
+/** Per-slice emit-time info for a slice that has been inlined into
+ *  the consumer currently in this iter frame. The Var-read for the
+ *  slice's cName at `emitExpr` consults this map and substitutes a
+ *  direct read into the base tensor; the slice handle itself is
+ *  never populated.
+ *
+ *   - `baseCName`: C identifier for the base tensor struct.
+ *   - `axis`: ranging axis (0 = column slice / axis 0 ranges;
+ *             1 = row slice / axis 1 ranges).
+ *   - `fixedIndexCName`: name of a `long` local declared at the
+ *             top of the consumer's emission block; holds the
+ *             0-based fixed-axis index. */
+export interface InlinedSliceFrameInfo {
+  baseCName: string;
+  axis: 0 | 1;
+  fixedIndexCName: string;
+}
 
 /** A frame on the per-element-loop stack. `flat` is the same-shape
  *  case where every multi-element operand has identical layout and
  *  shares one iter variable. `broadcast` is the implicit-expansion
  *  case where each multi-element operand has its own precomputed
  *  linear index variable — keyed by C name — so a size-1 axis on one
- *  operand reads the same element while the others advance. */
+ *  operand reads the same element while the others advance.
+ *
+ *  Both kinds carry an optional `inlinedSlices` map for the
+ *  column-slice inlining peephole (`opt/inlineColumnSlice.ts`):
+ *  when a slice has been inlined into this consumer, the map keys
+ *  its cName to the emit-time info needed by the Var-read
+ *  substitution at `emitExpr`. The `broadcast` frame additionally
+ *  carries its `loopVars` (one per output axis) so the substitution
+ *  can pick the correct ranging-axis loop variable. */
 export type IterFrame =
-  | { kind: "flat"; iter: string }
-  | { kind: "broadcast"; perVarIndex: ReadonlyMap<string, string> };
+  | {
+      kind: "flat";
+      iter: string;
+      inlinedSlices?: ReadonlyMap<string, InlinedSliceFrameInfo>;
+    }
+  | {
+      kind: "broadcast";
+      perVarIndex: ReadonlyMap<string, string>;
+      loopVars: ReadonlyArray<string>;
+      inlinedSlices?: ReadonlyMap<string, InlinedSliceFrameInfo>;
+    };
 
 export interface EmitState {
   /** Boxed so the `BuiltinSig.emit` closure (which receives a small
@@ -130,6 +166,15 @@ export interface EmitState {
    *  plan returns the codegen to its pre-fusion behavior. See
    *  `src/codegen/opt/fuseSameShape.ts`. */
   fusionPlan: FusionPlan | null;
+  /** Column-slice inlining plan for the scope currently being
+   *  emitted, or `null` when disabled or no scope is active. Hook
+   *  points in `emitStmt.ts` (skip slice producers; pass the
+   *  consumer's inline map down to `emitTensor`), `emitTensor.ts`
+   *  (resolve axis sizes from the base, skip per-operand precompute,
+   *  attach inline info to the iter frame), and `emitExpr.ts`
+   *  (substitute slice Var reads) consult this field. See
+   *  `src/codegen/opt/inlineColumnSlice.ts`. */
+  columnSlicePlan: ColumnSlicePlan | null;
   /** When true, every per-scope plan-build site substitutes the
    *  empty plan (no fusion). Mirrors the
    *  `EmitOptions.disableOptimizations` knob; carried on the state

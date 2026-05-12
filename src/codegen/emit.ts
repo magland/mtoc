@@ -36,6 +36,10 @@ import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
 import { buildFusionPlan, EMPTY_FUSION_PLAN } from "./opt/fuseSameShape.js";
+import {
+  buildColumnSlicePlan,
+  EMPTY_COLUMN_SLICE_PLAN,
+} from "./opt/inlineColumnSlice.js";
 
 /** Options for `emitC`. */
 export interface EmitOptions {
@@ -78,6 +82,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
     currentFunctionOutputs: null,
     multiAssignCallCounter: 0,
     fusionPlan: null,
+    columnSlicePlan: null,
     disableOptimizations,
   };
 
@@ -100,12 +105,16 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   state.currentScopeVars = prog.assignedVars;
   state.futureTouches = computeFutureTouches(prog.stmts);
   state.freedOwned = new Set();
-  // Build the same-shape elementwise fusion plan for main once
-  // liveness is available; if the optimizer is disabled, install
-  // the empty plan so the hook sites short-circuit uniformly.
+  // Build the per-scope optimization plans once liveness is
+  // available. Each plan is independent; if the optimizer is
+  // disabled, install the corresponding EMPTY_*_PLAN so the hook
+  // sites short-circuit uniformly.
   state.fusionPlan = disableOptimizations
     ? EMPTY_FUSION_PLAN
     : buildFusionPlan(prog.stmts, state.futureTouches);
+  state.columnSlicePlan = disableOptimizations
+    ? EMPTY_COLUMN_SLICE_PLAN
+    : buildColumnSlicePlan(prog.stmts, state.futureTouches);
   emitDeclarations(state, 1, prog.assignedVars);
   for (const s of prog.stmts) emitStmt(state, 1, s);
   // Free every tensor backing allocated for top-level vars not
@@ -116,6 +125,7 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   state.currentScopeVars = null;
   state.futureTouches = null;
   state.fusionPlan = null;
+  state.columnSlicePlan = null;
 
   // Headers: explicit needs from user code, plus runtime-snippet
   // headers when those snippets are part of the output. With

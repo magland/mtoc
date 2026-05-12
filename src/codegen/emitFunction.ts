@@ -27,6 +27,10 @@ import {
   functionFreeOnExitSet,
 } from "./emitOwned.js";
 import { buildFusionPlan, EMPTY_FUSION_PLAN } from "./opt/fuseSameShape.js";
+import {
+  buildColumnSlicePlan,
+  EMPTY_COLUMN_SLICE_PLAN,
+} from "./opt/inlineColumnSlice.js";
 
 /** Per-function scope-exit free set with output cNames removed. Owned
  *  return values transfer to the caller — for a 1-output function the
@@ -92,6 +96,7 @@ export function emitFunctionBody(
   const outerFreed = state.freedOwned;
   const outerOutputs = state.currentFunctionOutputs;
   const outerFusionPlan = state.fusionPlan;
+  const outerColumnSlicePlan = state.columnSlicePlan;
   state.lines = [];
   // Predecls cover assignedVars only — params are declared by the C
   // signature. Scope-exit frees cover both: locals from the body and
@@ -107,6 +112,9 @@ export function emitFunctionBody(
   state.fusionPlan = state.disableOptimizations
     ? EMPTY_FUSION_PLAN
     : buildFusionPlan(fn.body, state.futureTouches);
+  state.columnSlicePlan = state.disableOptimizations
+    ? EMPTY_COLUMN_SLICE_PLAN
+    : buildColumnSlicePlan(fn.body, state.futureTouches);
 
   emitDeclarations(state, 1, fn.assignedVars);
   for (const s of fn.body) emitStmt(state, 1, s);
@@ -147,6 +155,7 @@ export function emitFunctionBody(
   state.freedOwned = outerFreed;
   state.currentFunctionOutputs = outerOutputs;
   state.fusionPlan = outerFusionPlan;
+  state.columnSlicePlan = outerColumnSlicePlan;
   return { lines: bodyLines };
 }
 

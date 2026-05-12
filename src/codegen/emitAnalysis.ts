@@ -22,6 +22,7 @@ import {
 import { forEachStmtInTree, forEachTopLevelExpr } from "../lowering/walk.js";
 import { topLevelOwnedDefs, topLevelOwnedUses } from "./liveness.js";
 import { fusedOwnedUses } from "./opt/fuseSameShape.js";
+import { columnSliceInlinedOwnedUses } from "./opt/inlineColumnSlice.js";
 import { ownedOps } from "./ownedKinds.js";
 import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 import { analyzeExpr, emitExpr, wrapTextView } from "./emitExpr.js";
@@ -70,7 +71,19 @@ export function deadAfterStmt(state: EmitState, s: IRStmt): string[] {
   if (futureTouchOut === undefined) return [];
   const fused =
     state.fusionPlan === null ? null : fusedOwnedUses(s, state.fusionPlan);
-  const touched = fused ?? topLevelOwnedUses(s);
+  let touched = fused ?? topLevelOwnedUses(s);
+  // Column-slice inlining: the consumer effectively reads from each
+  // inlined slice's base, so the base counts as a touch at this
+  // stmt for the early-free decision. The producer's emit was
+  // skipped, so its original early-free of the base doesn't run.
+  if (state.columnSlicePlan !== null) {
+    const augmented = columnSliceInlinedOwnedUses(
+      s,
+      state.columnSlicePlan,
+      touched
+    );
+    if (augmented !== null) touched = augmented;
+  }
   for (const d of topLevelOwnedDefs(s)) touched.add(d);
   const out: string[] = [];
   for (const v of touched) {

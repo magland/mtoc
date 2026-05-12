@@ -17,9 +17,15 @@ import {
   type NumericType,
 } from "../lowering/types.js";
 import { findInExpr, forEachSubExpr } from "../lowering/walk.js";
-import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
+import {
+  pushStmt,
+  useRuntimeByName,
+  type EmitState,
+  type InlinedSliceFrameInfo,
+} from "./emitState.js";
 import { emitExpr, tensorColsField, tensorRowsField } from "./emitExpr.js";
 import { formatNumLit } from "./emitFormat.js";
+import type { ColumnSliceInline } from "./opt/inlineColumnSlice.js";
 
 /** Walk an IR expression and return the first multi-element `Var`
  *  encountered — the "shape source" for an elementwise assign whose
@@ -115,7 +121,16 @@ export function emitTensorAssignFromExpr(
   state: EmitState,
   level: number,
   cTarget: string,
-  rhs: IRExpr
+  rhs: IRExpr,
+  /** Per-consumer column-slice inline map, threaded down from
+   *  `emitStmt`'s `Assign` arm. When present, multi-element Var
+   *  operands whose cName is a key are NOT materialized: the
+   *  emitter resolves their axis sizes from the underlying base,
+   *  skips per-operand precompute, and attaches inline info to the
+   *  iter frame so the Var-read substitution at `emitExpr` can
+   *  rewrite the read into a direct base-buffer load. See
+   *  `src/codegen/opt/inlineColumnSlice.ts`. */
+  sliceInlines?: ReadonlyMap<string, ColumnSliceInline>
 ): void {
   const src = findShapeSourceVar(rhs);
   // When there is no multi-element Var in the RHS (e.g. `'abc' + 1`
@@ -156,17 +171,65 @@ export function emitTensorAssignFromExpr(
   }
 
   if (needsBroadcast) {
-    emitBroadcastAssign(state, level, cTarget, rhs, multiVars);
+    emitBroadcastAssign(state, level, cTarget, rhs, multiVars, sliceInlines);
     return;
   }
-  emitFlatAssign(state, level, cTarget, rhs, src, charLitSrc, multiVars);
+  emitFlatAssign(
+    state,
+    level,
+    cTarget,
+    rhs,
+    src,
+    charLitSrc,
+    multiVars,
+    sliceInlines
+  );
+}
+
+/** Emit `long _mtoc_inline_<sliceCName>_fixed = (long)(<idxExpr>) - 1L;`
+ *  declarations for every inlined slice in `multiVars`. The locals
+ *  hold the 0-based fixed-axis index and are reused by the Var-read
+ *  substitution inside the consumer's loop. Returns an emit-time
+ *  info map keyed by slice cName (for attaching to the iter frame).
+ *  Iterates in `multiVars` insertion order so the emitted declaration
+ *  order is stable across runs. */
+function emitInlinedSliceLocals(
+  state: EmitState,
+  level: number,
+  multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>,
+  sliceInlines: ReadonlyMap<string, ColumnSliceInline> | undefined
+): Map<string, InlinedSliceFrameInfo> {
+  const out = new Map<string, InlinedSliceFrameInfo>();
+  if (sliceInlines === undefined) return out;
+  for (const cName of multiVars.keys()) {
+    const inline = sliceInlines.get(cName);
+    if (inline === undefined) continue;
+    const localName = `_mtoc_inline_${cName}_fixed`;
+    const idxC = emitExpr(state, inline.fixedIndex, 0);
+    pushStmt(state, level, `long ${localName} = (long)(${idxC}) - 1L;`);
+    out.set(cName, {
+      baseCName: inline.baseVar.cName,
+      axis: inline.axis,
+      fixedIndexCName: localName,
+    });
+  }
+  return out;
 }
 
 /** Same-shape (no implicit expansion) emission. Every multi-element
  *  operand has identical static shape, so one shared iter variable
  *  walks every operand's flat layout. Runtime mismatch between two
  *  same-static-shape operands (e.g. both `[notOne, notOne]` but
- *  different sizes) is caught by `mtoc_check_shape` before the loop. */
+ *  different sizes) is caught by `mtoc_check_shape` before the loop.
+ *
+ *  Inlined column/row slices (when `sliceInlines` is non-empty) are
+ *  treated as never-materialized: their axis sizes resolve to the
+ *  underlying base's dims with the slice's fixed-axis size folded
+ *  to `1L`, they're skipped in `mtoc_check_shape` pairs (the
+ *  static-shape lattice already guaranteed compatibility), and
+ *  emit-time inline info is attached to the iter frame so the Var-
+ *  read substitution at `emitExpr` rewrites the slice read into a
+ *  direct base-buffer load. */
 function emitFlatAssign(
   state: EmitState,
   level: number,
@@ -174,7 +237,8 @@ function emitFlatAssign(
   rhs: IRExpr,
   src: Extract<IRExpr, { kind: "Var" }> | null,
   charLitSrc: Extract<IRExpr, { kind: "CharLit" }> | null,
-  multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>
+  multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>,
+  sliceInlines: ReadonlyMap<string, ColumnSliceInline> | undefined
 ): void {
   useRuntimeByName(state, "mtoc_tensor_t");
   useRuntimeByName(state, "mtoc_tensor_assign");
@@ -209,10 +273,21 @@ function emitFlatAssign(
   // When the shape source is a CharLit, no runtime shape checks are
   // emitted for other CharLit operands (their lengths are statically
   // known; the dim lattice already admitted them as compatible).
+  //
+  // Inlined slices are skipped on both sides of the check pair: the
+  // static-shape lattice already guaranteed compatibility, and the
+  // slice's runtime handle is never populated — emitting a check on
+  // it would crash. If the picked `src` is itself an inlined slice,
+  // we cannot emit any flat check, so we skip the whole runtime
+  // check (the broadcast path is the right home for shape-mismatch
+  // diagnostics; same-shape inlining trusts the static lattice).
   const checkPairs: Array<Extract<IRExpr, { kind: "Var" }>> = [];
-  if (src !== null) {
+  const srcIsInlinedSlice =
+    src !== null && sliceInlines !== undefined && sliceInlines.has(src.cName);
+  if (src !== null && !srcIsInlinedSlice) {
     for (const [cName, v] of multiVars) {
       if (cName === src.cName) continue;
+      if (sliceInlines !== undefined && sliceInlines.has(cName)) continue;
       checkPairs.push(v);
     }
   }
@@ -226,6 +301,12 @@ function emitFlatAssign(
   // path, pull every axis off the source's `dims[i]`; for the 2-D
   // path, use the legacy field names (which become `rows`/`cols`
   // on char tensors and `dims[0]`/`dims[1]` on double tensors).
+  //
+  // When the shape source is an inlined slice, its runtime handle
+  // is never populated — its dims come from the base instead, with
+  // the fixed axis folded to a literal `1L`. The N-D path doesn't
+  // currently see slice sources (slices are 2-D only in the MVP),
+  // so this only matters for the 2-D branch.
   let shapeArgs: string;
   let numelExpr: string;
   if (isNd) {
@@ -242,6 +323,19 @@ function emitFlatAssign(
     );
     shapeArgs = `${resultNdim}, (long[]){${dimRefs.join(", ")}}`;
     numelExpr = dimRefs.join(" * ");
+  } else if (srcIsInlinedSlice) {
+    // src is an inlined column or row slice: read shape from its
+    // base. Column slice (axis=0 ranges, axis=1 fixed):
+    // rows=base.dims[0], cols=1L. Row slice (axis=1 ranges,
+    // axis=0 fixed): rows=1L, cols=base.dims[1].
+    const inline = sliceInlines!.get(src!.cName)!;
+    const baseCName = inline.baseVar.cName;
+    if (inline.axis === 0) {
+      shapeArgs = `${baseCName}.dims[0], 1L`;
+    } else {
+      shapeArgs = `1L, ${baseCName}.dims[1]`;
+    }
+    numelExpr = `${stagingName}.dims[0] * ${stagingName}.dims[1]`;
   } else {
     shapeArgs =
       src !== null
@@ -260,6 +354,15 @@ function emitFlatAssign(
       );
     }
   }
+  // Hoist each inlined slice's fixed-axis index into a `long` local
+  // before the loop so the substitution at the Var-read site can
+  // reuse it across iterations without re-evaluating the index expr.
+  const inlinedFrameInfo = emitInlinedSliceLocals(
+    state,
+    level + 1,
+    multiVars,
+    sliceInlines
+  );
   pushStmt(
     state,
     level + 1,
@@ -271,7 +374,11 @@ function emitFlatAssign(
     level + 1,
     `for (long ${iterName} = 0; ${iterName} < _mtoc_n; ${iterName}++) {`
   );
-  state.iterStack.push({ kind: "flat", iter: iterName });
+  state.iterStack.push({
+    kind: "flat",
+    iter: iterName,
+    inlinedSlices: inlinedFrameInfo.size === 0 ? undefined : inlinedFrameInfo,
+  });
   const bodyStr = emitExpr(state, rhs, 0);
   state.iterStack.pop();
   if (isComplex) {
@@ -305,11 +412,27 @@ function emitFlatAssign(
 /** Axis-i runtime size for operand `v`. Double tensors carry shape in
  *  `dims[…]`; char tensors keep their legacy `.rows`/`.cols` fields
  *  for axes 0/1. Operand axes past the operand's own ndim are
- *  implicit-1 (the trailing-pad rule). */
+ *  implicit-1 (the trailing-pad rule).
+ *
+ *  For an inlined column/row slice, the slice handle is never
+ *  populated, so the axis-size lookup is redirected to the
+ *  underlying base — column slice axis 0 reads `<base>.dims[0]`
+ *  and axis 1 is literal `1L`; row slice flips them. The slice's
+ *  static dim lattice in `v.ty` is unchanged, so the broadcast
+ *  emitter's "is this axis `one`?" classification still picks the
+ *  correct per-axis index-math template. */
 function operandAxisSize(
   v: Extract<IRExpr, { kind: "Var" }>,
-  i: number
+  i: number,
+  sliceInlines?: ReadonlyMap<string, ColumnSliceInline>
 ): string {
+  const inline = sliceInlines?.get(v.cName);
+  if (inline !== undefined) {
+    if (inline.axis === 0) {
+      return i === 0 ? `${inline.baseVar.cName}.dims[0]` : "1L";
+    }
+    return i === 0 ? "1L" : `${inline.baseVar.cName}.dims[1]`;
+  }
   const ndim = isNumeric(v.ty) ? v.ty.dims.length : 2;
   if (i < ndim) {
     if (i === 0) return `${v.cName}.${tensorRowsField(v.ty)}`;
@@ -333,7 +456,8 @@ function emitBroadcastAssign(
   level: number,
   cTarget: string,
   rhs: IRExpr,
-  multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>
+  multiVars: Map<string, Extract<IRExpr, { kind: "Var" }>>,
+  sliceInlines: ReadonlyMap<string, ColumnSliceInline> | undefined
 ): void {
   useRuntimeByName(state, "mtoc_tensor_t");
   useRuntimeByName(state, "mtoc_tensor_assign");
@@ -364,13 +488,25 @@ function emitBroadcastAssign(
 
   pushStmt(state, level, `{`);
 
+  // Hoist each inlined slice's fixed-axis index into a `long` local
+  // before the loop so the Var-read substitution at `emitExpr` can
+  // reuse it without re-evaluating the index expr.
+  const inlinedFrameInfo = emitInlinedSliceLocals(
+    state,
+    level + 1,
+    multiVars,
+    sliceInlines
+  );
+
   // Per-axis broadcast result: chain mtoc_broadcast_dim across every
   // operand. Validates compatibility at runtime and yields the
-  // axis-wise output size in one shot.
+  // axis-wise output size in one shot. `operandAxisSize` returns
+  // the base's dims (with the slice's fixed-axis size folded to
+  // `1L`) when the operand is an inlined slice.
   for (let i = 0; i < outNdim; i++) {
-    let expr = operandAxisSize(operands[0], i);
+    let expr = operandAxisSize(operands[0], i, sliceInlines);
     for (let k = 1; k < operands.length; k++) {
-      expr = `mtoc_broadcast_dim(${expr}, ${operandAxisSize(operands[k], i)})`;
+      expr = `mtoc_broadcast_dim(${expr}, ${operandAxisSize(operands[k], i, sliceInlines)})`;
     }
     pushStmt(state, level + 1, `long ${outDimNames[i]} = ${expr};`);
   }
@@ -416,14 +552,22 @@ function emitBroadcastAssign(
   // for axis i is the product of the operand's lower-axis sizes
   // (column-major), padded with `1L` for axes the operand doesn't
   // carry.
+  //
+  // Inlined slices are skipped here: the slice's runtime handle is
+  // never populated, so there's nothing to index into via the slice.
+  // The Var-read substitution at `emitExpr` rewrites the slice read
+  // to a direct base-buffer load using the broadcast frame's
+  // `loopVars` for the ranging axis and the precomputed
+  // `_mtoc_inline_<...>_fixed` local for the fixed axis.
   const perVarIndex = new Map<string, string>();
   for (const [cName, v] of multiVars) {
+    if (sliceInlines !== undefined && sliceInlines.has(cName)) continue;
     const ndim = isNumeric(v.ty) ? v.ty.dims.length : 2;
     const idxName = `_mtoc_${cName}_idx`;
     const parts: string[] = [];
     const stridePieces: string[] = [];
     for (let i = 0; i < outNdim; i++) {
-      const axis = operandAxisSize(v, i);
+      const axis = operandAxisSize(v, i, sliceInlines);
       const staticDim =
         i < ndim && isNumeric(v.ty) ? v.ty.dims[i] : { kind: "one" as const };
       let term: string | null;
@@ -447,8 +591,15 @@ function emitBroadcastAssign(
   }
 
   // Render the body with the broadcast iter frame so each operand
-  // Var read picks up its precomputed index.
-  state.iterStack.push({ kind: "broadcast", perVarIndex });
+  // Var read picks up its precomputed index. `loopVars` rides
+  // along on the frame so the inlined-slice Var-read substitution
+  // can pick the correct ranging-axis loop variable.
+  state.iterStack.push({
+    kind: "broadcast",
+    perVarIndex,
+    loopVars,
+    inlinedSlices: inlinedFrameInfo.size === 0 ? undefined : inlinedFrameInfo,
+  });
   const bodyStr = emitExpr(state, rhs, 0);
   state.iterStack.pop();
 

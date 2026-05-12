@@ -71,6 +71,35 @@ function iterIndexFor(state: EmitState, varCName: string): string {
   return idx;
 }
 
+/** Compute the C read expression for an inlined column/row slice
+ *  inside an iter loop. The slice handle is never populated; we
+ *  read directly from the base's `.real` buffer with a column-major
+ *  offset built from the slice's ranging axis (iter / loopVars) and
+ *  its fixed-axis index (precomputed local).
+ *
+ *  Column slice (`axis === 0`, e.g. `base(:, k)`): slot at logical
+ *  row `r` is `base.real[r + (k-1) * base.dims[0]]`. The ranging
+ *  iter is the row index — in flat-iter, `frame.iter`; in
+ *  broadcast, the axis-0 loop variable.
+ *
+ *  Row slice (`axis === 1`, e.g. `base(k, :)`): slot at logical
+ *  column `c` is `base.real[(k-1) + c * base.dims[0]]`. Ranging
+ *  iter is the column index — in flat-iter, `frame.iter`; in
+ *  broadcast, the axis-1 loop variable. */
+function inlinedSliceRead(
+  frame: import("./emitState.js").IterFrame,
+  info: import("./emitState.js").InlinedSliceFrameInfo
+): string {
+  const rangingIter =
+    frame.kind === "flat"
+      ? frame.iter
+      : frame.loopVars[info.axis === 0 ? 0 : 1];
+  if (info.axis === 0) {
+    return `${info.baseCName}.real[${rangingIter} + ${info.fixedIndexCName} * ${info.baseCName}.dims[0]]`;
+  }
+  return `${info.baseCName}.real[${info.fixedIndexCName} + ${rangingIter} * ${info.baseCName}.dims[0]]`;
+}
+
 /** C-side struct field name for the column count of a tensor handle. */
 export function tensorColsField(ty: MType): string {
   return isNumeric(ty) && ty.elem === "char" ? "cols" : "dims[1]";
@@ -191,7 +220,18 @@ export function emitExpr(
       // Char-array Vars in iter context widen to double (char arithmetic
       // always produces double; the iter loop stores into a double
       // tensor staging buffer).
+      //
+      // Column-slice inlining hook: if the current iter frame has
+      // an `inlinedSlices` entry for this cName, the slice's handle
+      // is never populated — substitute a direct read into the
+      // underlying base tensor at the right column-major offset.
+      // See `src/codegen/opt/inlineColumnSlice.ts`.
       if (state.iterStack.length > 0 && isMultiElement(e.ty)) {
+        const frame = state.iterStack[state.iterStack.length - 1];
+        const slice = frame.inlinedSlices?.get(e.cName);
+        if (slice !== undefined) {
+          return inlinedSliceRead(frame, slice);
+        }
         const iter = iterIndexFor(state, e.cName);
         if (isNumeric(e.ty) && e.ty.elem === "char") {
           return `(double)(${e.cName}.data[${iter}])`;
