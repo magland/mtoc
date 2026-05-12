@@ -204,6 +204,14 @@ export const RUNTIME_HELPERS: ReadonlyMap<string, RuntimeSnippet> = new Map([
     "mtoc_eye_2d",
     loadSnippet("tensor_eye.h", ["mtoc_tensor_t", "mtoc_tensor_alloc"]),
   ],
+  [
+    "mtoc_make_range",
+    loadSnippet("tensor_range.h", [
+      "mtoc_tensor_t",
+      "mtoc_tensor_alloc",
+      "mtoc_loop_count",
+    ]),
+  ],
   // rng.h defines several related symbols (mtoc_rng_seed,
   // mtoc_rng_random, mtoc_rng_randn) plus the shared static state.
   // We register the whole block under one canonical key so an

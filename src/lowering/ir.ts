@@ -161,6 +161,27 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Bare range expression `start:end` or `start:step:end` used as
+       *  a value (not as a for-loop iterable, not as an index slot).
+       *  Materializes a 1×n row-vector real-double tensor, matching
+       *  numbl's `runtimeRange` (see
+       *  `numbl/src/numbl-core/runtime/tensor-construction.ts`).
+       *
+       *  Like `TensorLit` and `IndexSlice`, this is an owned-allocating
+       *  producer — after ANF it only appears as the entire `rhs` of an
+       *  owned-LHS `Assign`. `start`, `step`, and `end` are scalar real
+       *  IR expressions; `step` is filled in with a literal `1` when the
+       *  source omitted it. Unlike the for-loop and index-slot forms,
+       *  `step` does NOT have to be a numeric literal — codegen routes
+       *  through `mtoc_loop_count` to compute the runtime element count. */
+      kind: "MakeRange";
+      start: IRExpr;
+      step: IRExpr;
+      end: IRExpr;
+      ty: MType;
+      span: Span;
+    }
+  | {
       /** Reference to the `end` keyword inside an index expression.
        *  Resolved at lowering time to the relevant axis size of the
        *  enclosing index's base. The result is a nonneg long-valued

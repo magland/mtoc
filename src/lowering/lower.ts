@@ -494,6 +494,46 @@ export class Lowerer {
     }
   }
 
+  /** Lower a bare `Range` AST node (`a:b` / `a:s:b` used as a value,
+   *  not as a for-loop iterable or index slot) into a `MakeRange` IR
+   *  node. Matches numbl's `runtimeRange` semantics: result is a 1×n
+   *  row vector of real doubles. `step` defaults to a literal `1`
+   *  when the source omitted it. start / step / end must be scalar
+   *  real expressions; complex / char ranges are deferred. */
+  private lowerBareRange(e: Extract<Expr, { type: "Range" }>): IRExpr {
+    const start = this.lowerExpr(e.start);
+    const end = this.lowerExpr(e.end);
+    this.requireScalarReal(start.ty, "range start", e.start.span);
+    this.requireScalarReal(end.ty, "range end", e.end.span);
+    let step: IRExpr;
+    if (e.step === null) {
+      step = {
+        kind: "NumLit",
+        value: 1,
+        ty: scalarDouble("positive"),
+        span: e.span,
+      };
+    } else {
+      step = this.lowerExpr(e.step);
+      this.requireScalarReal(step.ty, "range step", e.step.span);
+    }
+    const ty: NumericType = {
+      kind: "Numeric",
+      elem: "double",
+      isComplex: false,
+      dims: [{ kind: "one" }, { kind: "notOne" }],
+      sign: "unknown",
+    };
+    return {
+      kind: "MakeRange",
+      start,
+      step,
+      end,
+      ty,
+      span: e.span,
+    };
+  }
+
   private lowerStmt(s: Stmt): IRStmt | null {
     switch (s.type) {
       case "Function":
@@ -851,6 +891,9 @@ export class Lowerer {
       case "FuncCall":
         return lowerFuncCall.call(this, e);
 
+      case "Range":
+        return this.lowerBareRange(e);
+
       default:
         throw new UnsupportedConstruct(
           `unsupported expression: ${e.type}`,
@@ -889,6 +932,7 @@ type OwnedExprKind =
   | "tensor-lit"
   | "string-concat"
   | "index-slice"
+  | "make-range"
   | "user-call"
   | "builtin-call";
 
@@ -896,6 +940,7 @@ function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
   if (e.kind === "TensorLit") return "tensor-lit";
   if (e.kind === "Binary" && isString(e.ty)) return "string-concat";
   if (e.kind === "IndexSlice") return "index-slice";
+  if (e.kind === "MakeRange") return "make-range";
   if (e.kind === "Call" && isOwned(e.ty)) {
     if (e.callee.kind === "userFunc") return "user-call";
     // Builtin Call flagged as a direct owned producer (`size`,
@@ -929,6 +974,11 @@ function ownedExprMessage(kind: OwnedExprKind): string {
     case "index-slice":
       return (
         "internal: range/colon index slice still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
+      );
+    case "make-range":
+      return (
+        "internal: bare range expression still nested inside another " +
         "expression after ANF; ANF pass should have hoisted it"
       );
     case "user-call":
@@ -1015,6 +1065,11 @@ function validateStmt(s: IRStmt): void {
           rejectNestedOwnedExpr(slot.expr);
         }
       }
+    } else if (top === "make-range") {
+      const r = s.rhs as Extract<IRExpr, { kind: "MakeRange" }>;
+      rejectNestedOwnedExpr(r.start);
+      rejectNestedOwnedExpr(r.step);
+      rejectNestedOwnedExpr(r.end);
     } else if (top === "user-call" || top === "builtin-call") {
       const call = s.rhs as Extract<IRExpr, { kind: "Call" }>;
       for (const a of call.args) rejectNestedOwnedExpr(a);

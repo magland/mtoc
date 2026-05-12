@@ -78,6 +78,11 @@ export function forEachSubExpr(
         }
       }
       return;
+    case "MakeRange":
+      forEachSubExpr(e.start, visit);
+      forEachSubExpr(e.step, visit);
+      forEachSubExpr(e.end, visit);
+      return;
   }
 }
 

@@ -184,3 +184,57 @@ describe("elementwise shape check", () => {
     expect(c).toMatch(/static void mtoc_check_shape\(/);
   });
 });
+
+describe("range expressions", () => {
+  // Bare `a:b` / `a:s:b` lowers to a `MakeRange` IR node that
+  // materializes a 1×n row vector through the `mtoc_make_range`
+  // runtime helper. Composes with all the usual owned-producer
+  // sites via the ANF pass.
+
+  it("emits mtoc_make_range for a bare range assigned to a name", () => {
+    const c = translate("v = 1:5;\ndisp(v);\n");
+    expect(c).toContain("mtoc_make_range(");
+    // Result lands at `v` via the same assign helper TensorLit /
+    // IndexSlice use.
+    expect(c).toMatch(/mtoc_tensor_assign\(&v,\s*mtoc_make_range\(/);
+    // Runtime helper body is included.
+    expect(c).toMatch(/static mtoc_tensor_t mtoc_make_range\(/);
+  });
+
+  it("defaults the step to 1 when the source omits it", () => {
+    const c = translate("v = 1:5;\ndisp(v);\n");
+    // Three args: start, step (=1.0), end.
+    expect(c).toMatch(/mtoc_make_range\(1\.0,\s*1\.0,\s*5\.0\)/);
+  });
+
+  it("threads an explicit float step through unchanged", () => {
+    const c = translate("v = 0:0.25:1;\ndisp(v);\n");
+    expect(c).toMatch(/mtoc_make_range\(0\.0,\s*0\.25,\s*1\.0\)/);
+  });
+
+  it("hoists a range nested inside a larger expression via ANF", () => {
+    // `(1:5) + 1` is not a direct Assign-RHS for the range — the
+    // ANF pass lifts the producer into its own synthetic Assign.
+    const c = translate("v = (1:5) + 1;\ndisp(v);\n");
+    expect(c).toContain("mtoc_make_range(");
+    // One synthetic _mtoc_anf_<N> binding holds the lifted range.
+    expect(c).toMatch(/_mtoc_anf_\d+/);
+  });
+
+  it("accepts a runtime-shaped end (range with a variable bound)", () => {
+    const c = translate("n = 4;\nv = 1:n;\ndisp(v);\n");
+    // The end argument is the C variable `n`, not a literal.
+    expect(c).toMatch(/mtoc_make_range\(1\.0,\s*1\.0,\s*n\)/);
+  });
+
+  it("rejects a non-scalar range start with a span", () => {
+    let err: Error | null = null;
+    try {
+      translate("a = [1 2 3];\nv = a:5;\n");
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err).not.toBeNull();
+    expect(err?.message).toMatch(/range start must be a real scalar/);
+  });
+});

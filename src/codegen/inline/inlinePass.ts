@@ -533,6 +533,7 @@ function isPureElementwiseExpr(e: IRExpr): boolean {
       return e.indices.every(isPureElementwiseExpr);
     case "TensorLit":
     case "IndexSlice":
+    case "MakeRange":
     case "StringLit":
     case "CharLit":
       return false;
@@ -759,6 +760,18 @@ function appearsInNonSlotPosition(e: IRExpr, cName: string): boolean {
       }
       return found;
     }
+    case "MakeRange":
+      // A bare range produces an owned tensor — the consumer's iter
+      // loop never descends through it. After ANF the producer Var
+      // we're tracking can only appear inside start/step/end, which
+      // are scalar real and inlining-safe; treat any match there as
+      // "in a non-slot position" so the conservative pre-substitution
+      // gate keeps the produced reference safe.
+      return (
+        appearsInNonSlotPosition(e.start, cName) ||
+        appearsInNonSlotPosition(e.step, cName) ||
+        appearsInNonSlotPosition(e.end, cName)
+      );
   }
 }
 
@@ -780,6 +793,7 @@ function substituteVar(e: IRExpr, target: string, replacement: IRExpr): IRExpr {
     case "EndRef":
     case "TensorLit":
     case "IndexSlice":
+    case "MakeRange":
       return e;
     case "Binary": {
       const left = substituteVar(e.left, target, replacement);

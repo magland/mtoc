@@ -126,7 +126,7 @@ if(_mtoc_n > 1024)` above the outermost loop of both the flat-iter
   `src/codegen/emitTensor.ts::parallelForPragma`.
 - **ANF normalization (`src/lowering/anf.ts`)**: a post-lowering pass that
   hoists every owned-producing sub-expression (TensorLit, IndexSlice,
-  string concat, user-function call returning an owned kind) out of
+  MakeRange, string concat, user-function call returning an owned kind) out of
   larger expressions into its own synthetic
   `_mtoc_anf_<N> = <producer>;` Assign, registered in the enclosing
   scope's `assignedVars`. After ANF, owned producers appear at exactly

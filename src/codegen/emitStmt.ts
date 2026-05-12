@@ -47,6 +47,7 @@ import {
   emitIndexSliceStore,
   emitNdScalarOffset,
 } from "./emitSlice.js";
+import { emitMakeRangeAssign } from "./emitRange.js";
 
 export { analyzeStmts } from "./emitAnalysis.js";
 
@@ -108,6 +109,11 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       }
       if (s.rhs.kind === "IndexSlice") {
         emitIndexSliceAssign(state, level, s.cName, s.rhs);
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
+        break;
+      }
+      if (s.rhs.kind === "MakeRange") {
+        emitMakeRangeAssign(state, level, s.cName, s.rhs);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }

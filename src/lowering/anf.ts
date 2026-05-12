@@ -49,6 +49,7 @@ interface AnfCounter {
 export function isOwnedProducer(e: IRExpr): boolean {
   if (e.kind === "TensorLit") return true;
   if (e.kind === "IndexSlice") return true;
+  if (e.kind === "MakeRange") return true;
   if (e.kind === "Binary" && isString(e.ty)) return true;
   if (e.kind === "Call" && isOwned(e.ty)) {
     if (e.callee.kind === "userFunc") return true;
@@ -249,6 +250,13 @@ function anfExprChildren(
       return {
         ...e,
         index: e.index.map(slot => anfSliceArg(slot, pre, av, c)),
+      };
+    case "MakeRange":
+      return {
+        ...e,
+        start: anfExpr(e.start, pre, av, c),
+        step: anfExpr(e.step, pre, av, c),
+        end: anfExpr(e.end, pre, av, c),
       };
     case "NumLit":
     case "ImagLit":

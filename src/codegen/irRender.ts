@@ -105,6 +105,14 @@ export function renderExpr(e: IRExpr, parentPrec = 0): string {
     }
     case "IndexSlice":
       return `${e.base.name}(${e.index.map(renderSliceArg).join(", ")})`;
+    case "MakeRange": {
+      const start = renderExpr(e.start, 0);
+      const end = renderExpr(e.end, 0);
+      if (e.step.kind === "NumLit" && e.step.value === 1) {
+        return `${start}:${end}`;
+      }
+      return `${start}:${renderExpr(e.step, 0)}:${end}`;
+    }
   }
 }
 

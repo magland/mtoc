@@ -186,6 +186,12 @@ The subset is growing iteratively. Roughly:
   [docs/limitations.md](docs/limitations.md)
 - Statically-sized tensor literals (`[1 2 3]`, `[1 2; 3 4]`), elementwise
   arithmetic on them, `sum` / `min` / `max` reductions, `length`, `numel`
+- **Bare range expressions** `a:b` / `a:s:b` materialize a 1×n row
+  vector (real doubles), matching numbl's `runtimeRange` byte-for-byte.
+  `start`, `step`, and `end` may be any scalar real expressions —
+  unlike the for-loop and index-slot forms, the step doesn't have to
+  be a literal. Composes with every owned-producer consume site (the
+  ANF pass hoists `(1:n) + 1`, `sum(1:n)`, `disp(1:n)`, etc.)
 - **Broadcasting (implicit expansion)** on elementwise arithmetic and
   comparison ops: `row + col`, `M + r`, `A + M` (with `A` 3-D and `M`
   2-D), `row .* col`, `a < b` on differently-shaped tensors. Same-shape

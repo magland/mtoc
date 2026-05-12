@@ -250,6 +250,16 @@ export function emitExpr(
           "rejected at lowering"
       );
 
+    case "MakeRange":
+      // Bare `a:b` / `a:s:b` produces a fresh 1×n tensor — same legal
+      // position as TensorLit / IndexSlice (top of Assign.rhs). The
+      // dedicated emitter `emitMakeRangeAssign` handles it; arriving
+      // here is a lowerer escape.
+      throw new Error(
+        "codegen internal: MakeRange reached emitExpr; should have been " +
+          "rejected at lowering"
+      );
+
     case "Call": {
       // User-function calls render as `mangled(args)`. Builtins delegate
       // to the registry's `emit` closure, which renders the C call and
