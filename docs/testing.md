@@ -10,9 +10,8 @@ primary safety net — most changes to lowering / codegen / runtime helpers
 should fall under here.
 
 ```bash
-npx tsx scripts/run_test_scripts.ts                  # all scripts (native)
+npx tsx scripts/run_test_scripts.ts                  # all scripts
 npx tsx scripts/run_test_scripts.ts <files…>         # specific files
-npx tsx scripts/run_test_scripts.ts --target wasm    # WASM target (needs emcc)
 MTOC_TEST_CONCURRENCY=4 npx tsx scripts/run_test_scripts.ts
 ```
 
@@ -25,15 +24,6 @@ is built with `-fsanitize=address`. AddressSanitizer + LeakSanitizer fail
 the script (with the leak trace surfaced in the failure detail) if any
 buffer is still live at exit. Tests therefore double as a memory-leak
 invariant on every codegen path that produces output.
-
-`--target wasm` compiles each script through `emcc` (override via
-`MTOC_EMCC`) and runs the resulting `.wasm` via the Emscripten ES-module
-factory in the same Node process — no separate child. Threads are forced
-off (emsdk doesn't ship libomp); leak-checking is off (no ASan port in
-emscripten by default). The wasm target is the cheapest way to verify
-that the same C builds and runs to byte-identical output under emcc's
-wasm-libc as under glibc — useful when touching the runtime helpers.
-See `docs/web.md` for the long-term plan around WASM threads + COOP/COEP.
 
 ### Layout
 

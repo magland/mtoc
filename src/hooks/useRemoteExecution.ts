@@ -4,7 +4,7 @@ import {
   executeRemoteRun,
   getPasskey,
   getRemoteServiceUrl,
-  type RemoteServiceHealth,
+  getWasmServiceUrl,
   type RunEvent,
 } from "../utils/remoteExecution";
 import { buildWasm, runWasm, type WasmOptLevel } from "../utils/wasmExecution";
@@ -24,10 +24,15 @@ export type RunStatus =
   | "aborted"
   | "compile_error";
 
-/** Where execution physically happens. `native` is the existing path
- *  (server compiles + runs a native binary, streams stdio over SSE).
- *  `wasm` makes the server compile to WebAssembly with emcc and ship
- *  the artifact to the browser, which runs it in-process. */
+/** Where execution physically happens.
+ *
+ *  - `native`: the local `mtoc serve` translates + compiles with `cc` and
+ *    runs the binary, streaming stdio over SSE. Requires the local server
+ *    to be reachable.
+ *  - `wasm`: the browser translates locally, POSTs the resulting C to a
+ *    public C-to-wasm compile service (default `https://wasm.numbl.org`),
+ *    and instantiates the returned module in-process. Always available
+ *    as long as the compile service is reachable. */
 export type ExecutionMode = "native" | "wasm";
 
 export interface ConsoleLine {
@@ -49,17 +54,16 @@ export interface RunOptions {
 
 interface UseRemoteExecutionResult {
   status: RunStatus;
+  /** Status of the local `mtoc serve` server. Only relevant to native
+   *  mode — wasm mode talks to a separate public service. */
   connection: ConnectionStatus;
-  /** Last successful health probe — exposes whether emcc is available on
-   *  the server so the UI can grey out wasm mode when it isn't. Null
-   *  before the first successful probe. */
-  health: RemoteServiceHealth | null;
   /** Console output as a list of typed lines. Cleared at run start. */
   lines: ConsoleLine[];
-  /** Refresh by re-pinging /health. Called when the IDE mounts and when
-   *  the user opens the settings dialog. */
+  /** Refresh by re-pinging the local server's /health. Called when the
+   *  IDE mounts and when the user opens the settings dialog. */
   checkConnection: () => Promise<void>;
-  /** Translate + compile + run the project on the remote server. */
+  /** Translate + compile + run the project, routing through the
+   *  selected mode's pipeline. */
   run: (
     files: SourceFile[],
     activeName: string,
@@ -73,7 +77,6 @@ interface UseRemoteExecutionResult {
 export function useRemoteExecution(): UseRemoteExecutionResult {
   const [status, setStatus] = useState<RunStatus>("idle");
   const [connection, setConnection] = useState<ConnectionStatus>("unknown");
-  const [health, setHealth] = useState<RemoteServiceHealth | null>(null);
   const [lines, setLines] = useState<ConsoleLine[]>([]);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -86,7 +89,6 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
     const url = getRemoteServiceUrl();
     const passkey = getPasskey();
     const result = await checkRemoteServiceHealth(url, passkey);
-    setHealth(result);
     setConnection(result ? "connected" : "disconnected");
   }, []);
 
@@ -120,8 +122,6 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
       opts: RunOptions = {}
     ) => {
       if (status === "running") return;
-      const url = getRemoteServiceUrl();
-      const passkey = getPasskey();
 
       setLines([]);
       setStatus("running");
@@ -135,11 +135,7 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
       };
 
       if (mode === "wasm") {
-        // WASM threads (OpenMP) aren't yet supported by the bundled
-        // emsdk, so we force single-thread translation regardless of
-        // the UI selection. The build step on the server also forces
-        // threads=1 to defense-in-depth this. The user-visible threads
-        // dropdown is hidden in WASM mode so this isn't surprising.
+        const wasmUrl = getWasmServiceUrl();
         const build = await buildWasm(
           files,
           activeName,
@@ -149,8 +145,7 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
             simd: opts.simd ?? false,
             optLevel: opts.optLevel ?? "O2",
           },
-          url,
-          passkey,
+          wasmUrl,
           abort.signal
         );
         if (!build.ok) {
@@ -162,10 +157,9 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
           if (build.kind === "transport") {
             append({
               channel: "info",
-              text: `\n[server error: ${build.message}]\n`,
+              text: `\n[wasm service error: ${build.message}]\n`,
             });
             finish("error");
-            setConnection("disconnected");
             return;
           }
           if (build.kind === "translate") {
@@ -204,11 +198,12 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
           return;
         }
         finish(result.success ? "success" : "error");
-        setConnection("connected");
         return;
       }
 
       // Native path.
+      const url = getRemoteServiceUrl();
+      const passkey = getPasskey();
       const result = await executeRemoteRun(
         files,
         activeName,
@@ -251,11 +246,12 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
     [append, handleEvent, status]
   );
 
-  // Probe the server once on mount so the icon shows a meaningful state
-  // before the user does anything.
+  // Probe the local server once on mount so the icon shows a meaningful
+  // state before the user does anything. Wasm mode doesn't need this
+  // (it talks to a separate public service that's effectively always up).
   useEffect(() => {
     checkConnection();
   }, [checkConnection]);
 
-  return { status, connection, health, lines, checkConnection, run, stop };
+  return { status, connection, lines, checkConnection, run, stop };
 }

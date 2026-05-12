@@ -16,8 +16,14 @@ import type { SourceFile } from "../translate";
 const URL_KEY = "mtoc_remote_service_url";
 const ENABLED_KEY = "mtoc_remote_execution_enabled";
 const PASSKEY_KEY = "mtoc_passkey";
+const WASM_SERVICE_URL_KEY = "mtoc_wasm_service_url";
 
 export const DEFAULT_REMOTE_SERVICE_URL = "http://localhost:3002";
+
+/** Default URL for the public C → WebAssembly compile service.
+ *  See `../../numbl-wasm-service/` for the implementation; deployed on
+ *  Fly.io with always-on. */
+export const DEFAULT_WASM_SERVICE_URL = "https://wasm.numbl.org";
 
 export function getRemoteServiceUrl(): string {
   return localStorage.getItem(URL_KEY) || DEFAULT_REMOTE_SERVICE_URL;
@@ -25,6 +31,14 @@ export function getRemoteServiceUrl(): string {
 
 export function setRemoteServiceUrl(url: string): void {
   localStorage.setItem(URL_KEY, url);
+}
+
+export function getWasmServiceUrl(): string {
+  return localStorage.getItem(WASM_SERVICE_URL_KEY) || DEFAULT_WASM_SERVICE_URL;
+}
+
+export function setWasmServiceUrl(url: string): void {
+  localStorage.setItem(WASM_SERVICE_URL_KEY, url);
 }
 
 export function isRemoteExecutionEnabled(): boolean {
@@ -66,10 +80,6 @@ export interface RemoteServiceHealth {
   status: string;
   activeExecutions: number;
   cc: string;
-  /** First line of `emcc --version`, or `null` when the server can't find
-   *  emcc on `PATH` (or `MTOC_EMCC` env). The IDE uses this to grey out the
-   *  WASM execution-mode toggle when the server can't compile to wasm. */
-  emcc?: string | null;
 }
 
 export async function checkRemoteServiceHealth(
@@ -83,6 +93,30 @@ export async function checkRemoteServiceHealth(
     });
     if (!response.ok) return null;
     return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+export interface WasmServiceHealth {
+  ok: boolean;
+  /** First line of `emcc --version` from the service, or `null` if the
+   *  service couldn't probe its own emcc. The IDE uses this to display
+   *  the live compiler version in the settings dialog. */
+  emcc: string | null;
+}
+
+export async function checkWasmServiceHealth(
+  serviceUrl: string
+): Promise<WasmServiceHealth | null> {
+  try {
+    const response = await fetch(`${serviceUrl}/health`, { method: "GET" });
+    if (!response.ok) return null;
+    const data = (await response.json()) as Record<string, unknown>;
+    return {
+      ok: data.ok === true,
+      emcc: typeof data.emcc === "string" ? data.emcc : null,
+    };
   } catch {
     return null;
   }

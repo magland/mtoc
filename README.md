@@ -40,24 +40,27 @@ npm run serve -- --passkey <key>          # passkey shown in the IDE's settings 
 npx tsx src/cli.ts serve --passkey <key> [--port 3002] [--host 127.0.0.1]
 ```
 
-The IDE's Run button POSTs the project's `.m` source files (not the C) to
-the server. Two execution modes, selected by the `native | wasm` toggle in
-the IDE toolbar:
+The IDE's Run button has two execution modes, selected by the `native |
+wasm` toggle in the toolbar:
 
-- **native** (`POST /run`) — server translates, compiles with `cc` (override
-  via `CC`), runs the binary, and streams stdout/stderr back as Server-Sent
-  Events.
-- **wasm** (`POST /build-wasm`) — server translates, compiles to WebAssembly
-  with `emcc` (override via `MTOC_EMCC`), and returns the `.wasm` plus
-  Emscripten's ES-module glue. The browser instantiates the module and runs
-  it in-process, plumbing stdout/stderr into the same console UI. Supports
-  `-O2`/`-O3` and `-msimd128`. Threads/OpenMP are not yet supported because
-  the bundled `emsdk` ships without `libomp`; the threads dropdown is hidden
-  in wasm mode.
+- **native** — POSTs the project's `.m` source files to the local
+  `mtoc serve` server, which translates, compiles with `cc` (override via
+  `CC`), runs the binary, and streams stdout/stderr back as Server-Sent
+  Events. Requires `mtoc serve` to be running locally.
+- **wasm** — translates in-browser, then POSTs the resulting C to a public
+  C-to-WebAssembly compile service (default `https://wasm.numbl.org`,
+  configurable in the settings dialog). The browser instantiates the
+  returned module and runs it in-process, plumbing stdout/stderr into the
+  same console UI. Supports `-O2`/`-O3` and `-msimd128`. No local server
+  needed.
 
-Default bind is `127.0.0.1`. Sending source rather than C means only
-mtoc-generated C ever reaches the compiler. See [`docs/web.md`](docs/web.md)
-for protocol and architecture, including the long-term plan for WASM threads.
+mtoc itself ships no emcc tooling. The wasm-compile service is a separate
+project (`numbl-wasm-service` sibling repo) so mtoc stays focused on the
+translator + native runtime. See [`docs/web.md`](docs/web.md) for protocol
+and architecture.
+
+Default bind for `mtoc serve` is `127.0.0.1`. Sending source rather than C
+to the native server means only mtoc-generated C ever reaches the compiler.
 
 `run` translates to a temporary directory, compiles with `cc` (override via the
 `CC` env var), and runs the resulting binary, streaming stdout/stderr through.
@@ -336,9 +339,8 @@ Two tracks:
   (`scripts/run_test_scripts.ts`) finishes the corpus in a few seconds.
 
   ```bash
-  npx tsx scripts/run_test_scripts.ts                 # all scripts (native)
+  npx tsx scripts/run_test_scripts.ts                 # all scripts
   npx tsx scripts/run_test_scripts.ts foo.m bar.m     # specific files
-  npx tsx scripts/run_test_scripts.ts --target wasm   # WASM target (needs emcc)
   MTOC_TEST_CONCURRENCY=4 npx tsx scripts/run_test_scripts.ts
   ```
 

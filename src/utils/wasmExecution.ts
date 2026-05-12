@@ -1,27 +1,31 @@
 /**
- * Client for the mtoc execution server's `/build-wasm` endpoint plus the
- * browser-side runner that instantiates the returned WebAssembly module.
+ * Browser-side WASM-mode pipeline: translate locally, compile remotely,
+ * run in-process.
  *
- * Sibling of `remoteExecution.ts` (the native-execution path): same passkey,
- * same service URL, same `RunEvent` shape on the consumer side — different
- * transport and different runtime. Compilation happens on the server,
- * execution happens in the browser.
+ * Unlike the native path (which sends numbl source to the local
+ * `mtoc serve` and lets the server translate + compile + run), the wasm
+ * path splits responsibilities:
  *
- * Two stages:
+ *   1. The browser translates numbl → C with `translateProject` (same
+ *      pipeline used for the live C-output panel).
+ *   2. The translated C is POSTed to a public C-to-wasm service
+ *      (defaults to `https://wasm.numbl.org/compile`). The service is
+ *      stateless — no `.m` understanding, no auth, just `emcc`. See
+ *      `../../numbl-wasm-service/` for its implementation.
+ *   3. The wasm bytes + Emscripten ES-module glue come back; the browser
+ *      instantiates the module and routes stdout/stderr into the same
+ *      `RunEvent` stream the native (SSE) path uses.
  *
- *   1. `buildWasm`  — POST /build-wasm, get back `{ wasm: base64, glue }`
- *      or a translate/compile error. Single JSON reply, not SSE.
- *   2. `runWasm`    — turn the build artifact into a runnable Emscripten
- *      module factory (via a Blob-URL ES-module import), wire its
- *      `print`/`printErr` callbacks into the caller's `onEvent`, and emit
- *      a `done` event when `_main` finishes.
- *
- * The split is deliberate: a single build can be replayed many times
- * without a server round-trip, and the UI can cache the artifact in
- * memory if it wants. For Phase 1 the IDE just builds-then-runs back-to-back.
+ * Since the compile service speaks raw C, the IDE can always run in wasm
+ * mode without `mtoc serve` being up. Native mode still requires the
+ * local server for the C compiler + binary launcher.
  */
+import {
+  translateProject,
+  type SourceFile,
+  type TranslateError,
+} from "../translate";
 import type { RunEvent, RunResult } from "./remoteExecution";
-import type { SourceFile } from "../translate";
 
 export type WasmOptLevel = "O0" | "O2" | "O3";
 
@@ -48,11 +52,7 @@ export interface WasmBuildArtifact {
 
 export type BuildWasmResult =
   | { ok: true; artifact: WasmBuildArtifact }
-  | {
-      ok: false;
-      kind: "translate";
-      error: { kind: string; message: string; fileName?: string };
-    }
+  | { ok: false; kind: "translate"; error: TranslateError }
   | { ok: false; kind: "compile"; stderr: string }
   | { ok: false; kind: "transport"; message: string }
   | { ok: false; kind: "aborted" };
@@ -64,26 +64,42 @@ function base64ToUint8Array(b64: string): Uint8Array {
   return out;
 }
 
+/**
+ * Translate the project to C in-browser, then POST the C to the public
+ * compile service. The compile service has no concept of `.m` files —
+ * it's a generic C-to-wasm endpoint — so translation must happen here.
+ *
+ * Translation forces `threads = 1`: emcc currently has no libomp port
+ * shipped with the upstream emsdk, so any `<omp.h>` include in the C
+ * source breaks the build. The native path keeps the user's threads
+ * choice; wasm-mode display also forces threads=1 (see IDEWorkspace).
+ */
 export async function buildWasm(
   files: SourceFile[],
   activeName: string,
   opts: WasmBuildOpts,
-  serviceUrl: string,
-  passkey: string,
+  wasmServiceUrl: string,
   abortSignal?: AbortSignal
 ): Promise<BuildWasmResult> {
+  // Step 1: translate in-browser. Any UnsupportedConstruct / TypeError
+  // raised by the lowerer surfaces here, before we touch the network.
+  const translateResult = translateProject(files, activeName, {
+    enableTempInlining: opts.enableTempInlining ?? false,
+    threads: 1,
+  });
+  if (translateResult.error) {
+    return { ok: false, kind: "translate", error: translateResult.error };
+  }
+  const cSource = translateResult.c!;
+
+  // Step 2: POST to the compile service.
   let response: Response;
   try {
-    response = await fetch(`${serviceUrl}/build-wasm`, {
+    response = await fetch(`${wasmServiceUrl}/compile`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${passkey}`,
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        files,
-        activeName,
-        enableTempInlining: opts.enableTempInlining ?? false,
+        source: cSource,
         fastMath: opts.fastMath ?? false,
         simd: opts.simd ?? false,
         optLevel: opts.optLevel ?? "O2",
@@ -128,18 +144,6 @@ export async function buildWasm(
   }
   const r = body as Record<string, unknown>;
   if (r.ok === false) {
-    if (r.phase === "translate" && r.error && typeof r.error === "object") {
-      const err = r.error as Record<string, unknown>;
-      return {
-        ok: false,
-        kind: "translate",
-        error: {
-          kind: typeof err.kind === "string" ? err.kind : "Error",
-          message: typeof err.message === "string" ? err.message : "",
-          fileName: typeof err.fileName === "string" ? err.fileName : undefined,
-        },
-      };
-    }
     if (r.phase === "compile") {
       return {
         ok: false,
@@ -149,7 +153,6 @@ export async function buildWasm(
     }
     return { ok: false, kind: "transport", message: "Unknown build error" };
   }
-
   if (
     r.ok !== true ||
     typeof r.wasm !== "string" ||

@@ -230,14 +230,13 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
       ? "Fix translation errors before running."
       : null;
 
-  const wasmAvailable = exec.health?.emcc != null;
-
   const handleRun = () => {
-    if (exec.connection !== "connected") {
-      setSettingsOpen(true);
-      return;
-    }
-    if (mode === "wasm" && !wasmAvailable) {
+    // Native mode requires the local `mtoc serve` to be reachable; pop
+    // the settings dialog if it isn't. Wasm mode talks to a public
+    // compile service (no local server needed) so we never block on
+    // connection there — any service failure surfaces as a transport
+    // error in the console after the user clicks Run.
+    if (mode === "native" && exec.connection !== "connected") {
       setSettingsOpen(true);
       return;
     }
@@ -279,7 +278,6 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
         connection={exec.connection}
         mode={mode}
         onModeChange={handleModeChange}
-        wasmAvailable={wasmAvailable}
         onRun={handleRun}
         onStop={exec.stop}
         onOpenSettings={() => setSettingsOpen(true)}
@@ -367,9 +365,6 @@ interface ToolbarProps {
   connection: ReturnType<typeof useRemoteExecution>["connection"];
   mode: ExecutionMode;
   onModeChange: (mode: ExecutionMode) => void;
-  /** False when the server is reachable but lacks `emcc`. Used to grey
-   *  out the wasm-mode toggle button. */
-  wasmAvailable: boolean;
   onRun: () => void;
   onStop: () => void;
   onOpenSettings: () => void;
@@ -382,11 +377,14 @@ function Toolbar({
   connection,
   mode,
   onModeChange,
-  wasmAvailable,
   onRun,
   onStop,
   onOpenSettings,
 }: ToolbarProps) {
+  // The connection indicator tracks the *local* `mtoc serve` server.
+  // Only native mode depends on it; in wasm mode the IDE talks to a
+  // separate public compile service, so we display nothing rather than
+  // a misleading "no server" warning.
   const { color, label } = connectionDisplay(connection);
   const runButton = (
     <span>
@@ -422,34 +420,22 @@ function Toolbar({
       ) : (
         runButton
       )}
-      <Tooltip
-        title={
-          wasmAvailable
-            ? "Where the program runs. Native: server compiles + runs locally. WASM: server compiles to WebAssembly, browser runs it."
-            : "WASM mode needs emcc on the server (install emsdk and activate it in the shell where you run `mtoc serve`)."
-        }
-      >
-        <span>
-          <ToggleButtonGroup
-            size="small"
-            value={mode}
-            exclusive
-            onChange={(_, v) => v && onModeChange(v as ExecutionMode)}
-            disabled={isRunning}
-            sx={{ height: 28 }}
-          >
-            <ToggleButton value="native" sx={{ py: 0, px: 1.5, fontSize: 12 }}>
-              native
-            </ToggleButton>
-            <ToggleButton
-              value="wasm"
-              disabled={!wasmAvailable}
-              sx={{ py: 0, px: 1.5, fontSize: 12 }}
-            >
-              wasm
-            </ToggleButton>
-          </ToggleButtonGroup>
-        </span>
+      <Tooltip title="Where the program runs. Native: local mtoc serve compiles with cc and runs the binary. WASM: browser translates locally, then the public compile service produces WebAssembly that the browser runs in-process.">
+        <ToggleButtonGroup
+          size="small"
+          value={mode}
+          exclusive
+          onChange={(_, v) => v && onModeChange(v as ExecutionMode)}
+          disabled={isRunning}
+          sx={{ height: 28 }}
+        >
+          <ToggleButton value="native" sx={{ py: 0, px: 1.5, fontSize: 12 }}>
+            native
+          </ToggleButton>
+          <ToggleButton value="wasm" sx={{ py: 0, px: 1.5, fontSize: 12 }}>
+            wasm
+          </ToggleButton>
+        </ToggleButtonGroup>
       </Tooltip>
       <Stack direction="row" alignItems="center" spacing={0.5}>
         <Tooltip title="Execution settings">
@@ -457,9 +443,11 @@ function Toolbar({
             <DnsIcon fontSize="small" />
           </IconButton>
         </Tooltip>
-        <Typography variant="caption" sx={{ color }}>
-          {label}
-        </Typography>
+        {mode === "native" && (
+          <Typography variant="caption" sx={{ color }}>
+            {label}
+          </Typography>
+        )}
       </Stack>
     </Box>
   );
