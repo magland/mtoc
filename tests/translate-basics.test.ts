@@ -62,29 +62,35 @@ describe("translate scalar example", () => {
   it("accepts sqrt of a known-positive literal", () => {
     const c = translate("disp(sqrt(2));\n");
     expect(c).toContain("sqrt(2.0)");
+    expect(c).not.toContain("csqrt(");
     expect(c).toContain("#include <math.h>");
   });
 
   it("accepts sqrt(abs(x)) because abs forces nonneg", () => {
     const c = translate("x = -5;\ndisp(sqrt(abs(x)));\n");
     expect(c).toContain("sqrt(fabs(x))");
+    expect(c).not.toContain("csqrt(");
   });
 
-  it("rejects sqrt(x) when x is not provably nonneg", () => {
-    // x is assigned a negative literal so its sign is 'negative'.
-    expect(() => translate("x = -5;\ndisp(sqrt(x));\n")).toThrow(
-      /sqrt requires .* to be statically nonnegative/
-    );
+  it("promotes sqrt(x) to csqrt when x has a negative-possible sign", () => {
+    // Numbl's runtime fallback (`realFn → NaN → complexFn`) is mirrored
+    // by mtoc as a static type-promotion: sqrt of a real arg whose sign
+    // can't be proved nonneg emits the complex sibling and produces a
+    // complex result. `BuiltinSig.promoteOnDomainMiss` is what gates
+    // this admission.
+    const c = translate("x = -5;\ndisp(sqrt(x));\n");
+    expect(c).toContain("csqrt(x)");
+    // disp picks the complex-scalar helper, proving the result type
+    // is complex (not real).
+    expect(c).toContain("mtoc_disp_complex(");
   });
 
-  it("sqrt(x) rejection flows through params[0].domain (reports arg sign)", () => {
-    // The `validateDomain` path off `BuiltinSig.params[0].domain`
-    // includes the inferred sign in its message — proves the error
-    // came from the registry-driven domain check rather than an
-    // ad-hoc string compare.
-    expect(() => translate("x = -5;\ndisp(sqrt(x));\n")).toThrow(
-      /got sign='negative'/
-    );
+  it("promotes sqrt(t) on a mixed-sign tensor to csqrt + complex tensor", () => {
+    // Per-element csqrt(double) auto-promotes to double _Complex; the
+    // staging tensor is allocated via `mtoc_tensor_alloc_complex`.
+    const c = translate("disp(sqrt([-1 4 -9 16]));\n");
+    expect(c).toContain("csqrt(");
+    expect(c).toContain("mtoc_tensor_alloc_complex(");
   });
 
   it("disp(x) lowers via IRStmt.Disp (statement-only path)", () => {
