@@ -22,6 +22,7 @@ import type { Expr, LValue, Span } from "../parser/index.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr, IRStmt } from "./ir.js";
 import { Lowerer } from "./lower.js";
+import { decodeNumblQuotedLexeme } from "./lexerHelpers.js";
 import type { StructShape } from "./structPrePass.js";
 import {
   isStruct,
@@ -32,6 +33,57 @@ import {
   type MType,
   type StructType,
 } from "./types.js";
+
+/** When a function parameter is a struct, seed the inner lowerer's
+ *  per-root field-type tracking so member reads on the param work
+ *  even before the body has assigned through it. Also augment the
+ *  pre-pass struct-shape map to reflect the param's call-site shape.
+ *  Recurses into nested-struct fields. No-op for non-struct types so
+ *  callers can hand any param type through. */
+export function seedStructParamFieldTypes(
+  inner: Lowerer,
+  rootName: string,
+  ty: MType
+): void {
+  if (!isStruct(ty)) return;
+  let shape = inner.structShapes.get(rootName);
+  if (shape === undefined) {
+    shape = { fields: new Map(), firstSpan: { file: "", start: 0, end: 0 } };
+    inner.structShapes.set(rootName, shape);
+  }
+  let fieldTypes = inner.structFieldTypes.get(rootName);
+  if (fieldTypes === undefined) {
+    fieldTypes = new Map();
+    inner.structFieldTypes.set(rootName, fieldTypes);
+  }
+  seedShape(shape, fieldTypes, ty, []);
+}
+
+function seedShape(
+  shape: StructShape,
+  fieldTypes: Map<string, MType>,
+  ty: StructType,
+  pathSoFar: string[]
+): void {
+  for (const f of ty.fields) {
+    const newPath = [...pathSoFar, f.name];
+    if (isStruct(f.type)) {
+      let nested = shape.fields.get(f.name);
+      if (nested === undefined || nested === null) {
+        nested = { fields: new Map(), firstSpan: shape.firstSpan };
+        shape.fields.set(f.name, nested);
+      }
+      seedShape(nested, fieldTypes, f.type, newPath);
+    } else {
+      if (!shape.fields.has(f.name)) {
+        shape.fields.set(f.name, null);
+      }
+      if (!fieldTypes.has(newPath.join("."))) {
+        fieldTypes.set(newPath.join("."), f.type);
+      }
+    }
+  }
+}
 
 /** Build the runtime `StructType` from a pre-pass shape, picking the
  *  current field types from `fieldTypes`. Fields the user has assigned
@@ -343,7 +395,7 @@ export function lowerStructConstructor(
         keyArg.span
       );
     }
-    const name = decodeQuotedLexeme(keyArg.value);
+    const name = decodeNumblQuotedLexeme(keyArg.value);
     if (seen.has(name)) {
       throw new UnsupportedConstruct(
         `struct(...) field '${name}' specified more than once`,
@@ -362,16 +414,4 @@ export function lowerStructConstructor(
     ty,
     span: call.span,
   };
-}
-
-/** Decode a numbl-style quoted literal lexeme (the parser keeps the
- *  surrounding quotes and the doubled-quote escapes). */
-function decodeQuotedLexeme(raw: string): string {
-  if (raw.length >= 2 && raw[0] === '"' && raw[raw.length - 1] === '"') {
-    return raw.slice(1, -1).replace(/""/g, '"');
-  }
-  if (raw.length >= 2 && raw[0] === "'" && raw[raw.length - 1] === "'") {
-    return raw.slice(1, -1).replace(/''/g, "'");
-  }
-  return raw;
 }

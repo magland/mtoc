@@ -18,6 +18,7 @@ import type { MType } from "../lowering/types.js";
 import type { BuiltinEmitState } from "../workspace/builtins.js";
 import type { FutureTouchMap } from "./liveness.js";
 import type { InlinedFromMap } from "./inline/inlinePass.js";
+import type { SnippetActivation } from "./ownedKinds.js";
 import { RUNTIME_HELPERS, type RuntimeSnippet } from "./runtime.js";
 
 /** A frame on the per-element-loop stack. `flat` is the same-shape
@@ -171,33 +172,32 @@ export function useRuntime(
 
 /** Activate a snippet looked up from the registry by name. Throws if
  *  the name isn't registered — that means a codegen path is referring
- *  to a helper that doesn't exist.
- *
- *  Struct typedefs use the sentinel form `__struct__:<mangled>` (see
- *  `ownedKinds.ts::ownedOps`). The definitions for those typedefs are
- *  emitted directly by `emitStruct.ts` ahead of the user functions,
- *  not registered in the runtime helper table — activation here is
- *  a deliberate no-op so callers can uniformly call
- *  `useRuntimeByName(state, owned.structSnippet)` regardless of kind. */
+ *  to a helper that doesn't exist. Used for runtime-only helpers
+ *  whose activation key is the same as the C identifier the codegen
+ *  emits (libm wrappers, the `mtoc_*` runtime library). For owned-
+ *  kind helpers (which may be either runtime-registered or program-
+ *  emitted in the same pass), prefer `useSnippet`. */
 export function useRuntimeByName(state: EmitState, name: string): void {
-  // Struct typedefs + their generated helpers (`<typedef>_empty`,
-  // `_free`, `_copy`, `_assign`, `_disp`) are emitted directly by
-  // `emitStruct.ts` ahead of every user function; they're not in the
-  // runtime registry, so activation here is a no-op so callers can
-  // uniformly call useRuntimeByName regardless of kind.
-  if (name.startsWith("__struct__:")) return;
-  if (name.startsWith("_mtoc_struct__")) return;
-  // Handle typedefs + their generated helpers (`<typedef>_empty`,
-  // `_free`, `_copy`, `_assign`) are emitted directly by
-  // `emitHandle.ts` ahead of every user function; same no-op
-  // intercept as struct.
-  if (name.startsWith("__handle__:")) return;
-  if (name.startsWith("_mtoc_handle")) return;
   const snippet = RUNTIME_HELPERS.get(name);
   if (!snippet) {
     throw new Error(`codegen: unknown runtime helper '${name}'`);
   }
   useRuntime(state, name, snippet);
+}
+
+/** Activate an owned-kind helper. `registered` looks the snippet up in
+ *  the runtime registry and pulls it (plus dependencies) into the
+ *  emission. `programEmitted` is a deliberate no-op: the helper is
+ *  defined inline by `emitStruct.ts` / `emitHandle.ts` during the same
+ *  pass, ahead of the user-function bodies, so no registry lookup is
+ *  needed.
+ *
+ *  The discriminated-union form replaces a prior string-sentinel
+ *  convention (`__struct__:`/`_mtoc_handle…` prefix sniffing) — call
+ *  sites no longer need to know whether a helper is in the registry. */
+export function useSnippet(state: EmitState, snip: SnippetActivation): void {
+  if (snip.kind === "programEmitted") return;
+  useRuntimeByName(state, snip.name);
 }
 
 export function indent(level: number): string {

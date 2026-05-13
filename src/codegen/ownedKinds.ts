@@ -4,16 +4,22 @@
  *
  * "Owned" means a value backed by a heap allocation that the generated
  * code is responsible for releasing — strings, multi-element double
- * tensors, multi-element char arrays. The `isOwned` predicate in
- * `lowering/types.ts` is the seed; this registry picks up where it
- * leaves off and answers, for a given owned type, which C helper to
- * call for each role (typedef, empty placeholder, free, assign, copy,
- * disp).
+ * tensors, multi-element char arrays, structs, function handles. The
+ * `isOwned` predicate in `lowering/types.ts` is the seed; this
+ * registry picks up where it leaves off and answers, for a given
+ * owned type, which C helper to call for each role (typedef, empty
+ * placeholder, free, assign, copy, disp).
  *
- * Adding a new owned kind (logical-tensor, cell, struct, …) is a
- * single entry plus the matching .h files; every call site that
- * currently switches on `(isString | isCharArray | isMultiElement)` to
- * pick a helper collapses to `ownedOps(ty).<role>`.
+ * Each helper is a `SnippetActivation` — a discriminated union over
+ * "registered runtime snippet" (looked up in `RUNTIME_HELPERS`) and
+ * "program-emitted" (defined inline by `emitStruct.ts` / `emitHandle.ts`
+ * during the same emit pass). Call sites activate via `useSnippet`,
+ * which is a no-op for program-emitted entries.
+ *
+ * Adding a new owned kind (logical-tensor, cell, class, …) is a single
+ * entry plus the matching .h files or per-shape emitter; every call
+ * site that currently switches on `(isString | isCharArray |
+ * isMultiElement)` to pick a helper collapses to `ownedOps(ty).<role>`.
  */
 
 import {
@@ -28,12 +34,23 @@ import {
   type MType,
 } from "../lowering/types.js";
 
+/** A snippet activation. `registered` names a key in the runtime
+ *  helper registry (`RUNTIME_HELPERS`); `programEmitted` names a
+ *  helper that emitStruct.ts / emitHandle.ts defines directly in the
+ *  output. Both forms carry the C-side identifier the codegen calls. */
+export type SnippetActivation =
+  | { kind: "registered"; name: string }
+  | { kind: "programEmitted"; name: string };
+
+const r = (name: string): SnippetActivation => ({ kind: "registered", name });
+const p = (name: string): SnippetActivation => ({
+  kind: "programEmitted",
+  name,
+});
+
 /** Names of the runtime-helper snippets a single owned kind needs.
- *  Every field is a name registered in `RUNTIME_HELPERS` (see
- *  `runtime.ts`); call sites activate via `useRuntimeByName` and emit
- *  the call directly. The `copy` and `disp` slots accept the value's
- *  MType so the registry can pick a complex sibling when it exists
- *  (e.g. `mtoc_tensor_copy_complex`, `mtoc_disp_tensor_complex`).
+ *  Every field is a `SnippetActivation`; call sites activate it via
+ *  `useSnippet` and read `helper.name` to emit the C call.
  *
  *  Text kinds (string / char array) leave `disp` undefined — `Disp`
  *  codegen routes them through `mtoc_disp_text` via a text view, a
@@ -43,57 +60,60 @@ import {
 export interface OwnedKindOps {
   /** C type used to declare and pass the value. */
   cType: string;
-  /** Snippet name for the typedef. Activated whenever the C type is
-   *  emitted (declarations, function params, function returns). */
-  structSnippet: string;
+  /** Snippet activation for the typedef. */
+  structSnippet: SnippetActivation;
   /** Helper that produces a known-empty handle (predeclaration default). */
-  empty: string;
+  empty: SnippetActivation;
   /** Helper that releases the backing buffer in place. Idempotent on
    *  an already-empty / -freed handle. */
-  free: string;
+  free: SnippetActivation;
   /** Helper that consume-replaces the LHS, freeing its prior buffer
    *  and installing the RHS in one call. */
-  assign: string;
-  /** Helper name for a deep copy of a value of this kind. May depend
+  assign: SnippetActivation;
+  /** Helper for a deep copy of a value of this kind. May depend
    *  on the value's MType (real vs complex tensor, etc.). */
-  copy: (ty: MType) => string;
-  /** Helper name for `disp` of a value of this kind. Absent for text
+  copy: (ty: MType) => SnippetActivation;
+  /** Helper for `disp` of a value of this kind. Absent for text
    *  kinds — those route through `mtoc_disp_text` (see header). */
-  disp?: (ty: MType) => string;
+  disp?: (ty: MType) => SnippetActivation;
 }
 
 const STRING_OPS: OwnedKindOps = {
   cType: "mtoc_string_t",
-  structSnippet: "mtoc_string_t",
-  empty: "mtoc_string_empty",
-  free: "mtoc_string_free",
-  assign: "mtoc_string_assign",
-  copy: () => "mtoc_string_copy",
+  structSnippet: r("mtoc_string_t"),
+  empty: r("mtoc_string_empty"),
+  free: r("mtoc_string_free"),
+  assign: r("mtoc_string_assign"),
+  copy: () => r("mtoc_string_copy"),
 };
 
 const CHAR_TENSOR_OPS: OwnedKindOps = {
   cType: "mtoc_char_tensor_t",
-  structSnippet: "mtoc_char_tensor_t",
-  empty: "mtoc_char_tensor_empty",
-  free: "mtoc_char_tensor_free",
-  assign: "mtoc_char_tensor_assign",
-  copy: () => "mtoc_char_tensor_copy",
+  structSnippet: r("mtoc_char_tensor_t"),
+  empty: r("mtoc_char_tensor_empty"),
+  free: r("mtoc_char_tensor_free"),
+  assign: r("mtoc_char_tensor_assign"),
+  copy: () => r("mtoc_char_tensor_copy"),
 };
 
 const DOUBLE_TENSOR_OPS: OwnedKindOps = {
   cType: "mtoc_tensor_t",
-  structSnippet: "mtoc_tensor_t",
-  empty: "mtoc_tensor_empty",
-  free: "mtoc_tensor_free",
-  assign: "mtoc_tensor_assign",
+  structSnippet: r("mtoc_tensor_t"),
+  empty: r("mtoc_tensor_empty"),
+  free: r("mtoc_tensor_free"),
+  assign: r("mtoc_tensor_assign"),
   copy: ty =>
-    isNumeric(ty) && ty.isComplex
-      ? "mtoc_tensor_copy_complex"
-      : "mtoc_tensor_copy",
+    r(
+      isNumeric(ty) && ty.isComplex
+        ? "mtoc_tensor_copy_complex"
+        : "mtoc_tensor_copy"
+    ),
   disp: ty =>
-    isNumeric(ty) && ty.isComplex
-      ? "mtoc_disp_tensor_complex"
-      : "mtoc_disp_tensor",
+    r(
+      isNumeric(ty) && ty.isComplex
+        ? "mtoc_disp_tensor_complex"
+        : "mtoc_disp_tensor"
+    ),
 };
 
 /** Resolve the owned-kind ops for a given MType. Returns null for
@@ -110,39 +130,33 @@ export function ownedOps(ty: MType): OwnedKindOps | null {
   if (isStruct(ty)) {
     const name = structMangledName(ty);
     // Helpers are emitted by `emitStruct.ts` directly into the output
-    // (one set per distinct struct shape). They're NOT registered in
-    // the runtime registry — no `useRuntimeByName` activation needed
-    // because the definitions are always present in the same C file
-    // when the typedef appears.
+    // (one set per distinct struct shape). They are flagged as
+    // `programEmitted` so `useSnippet` is a no-op — the typedef +
+    // helper definitions are guaranteed in scope by the same emit pass.
     return {
       cType: name,
-      // `structSnippet` is consumed by callers that try to activate
-      // the typedef via `useRuntimeByName`. Struct typedefs aren't in
-      // the runtime registry, so we set this to a sentinel name and
-      // intercept activation in callers that go through this path.
-      structSnippet: `__struct__:${name}`,
-      empty: `${name}_empty`,
-      free: `${name}_free`,
-      assign: `${name}_assign`,
-      copy: () => `${name}_copy`,
-      disp: () => `${name}_disp`,
+      structSnippet: p(name),
+      empty: p(`${name}_empty`),
+      free: p(`${name}_free`),
+      assign: p(`${name}_assign`),
+      copy: () => p(`${name}_copy`),
+      disp: () => p(`${name}_disp`),
     };
   }
   if (isHandle(ty)) {
     const name = handleMangledName(ty);
     // Same shape as struct: helpers are emitted by `emitHandle.ts`
     // directly into the output (one set per distinct capture-tuple
-    // shape; one shared set for the no-capture case). Not in the
-    // runtime registry — same `__handle__:` sentinel intercept as
-    // struct. No `disp` helper — `disp(h)` is rejected at lowering
-    // (no byte-for-byte numbl format to match).
+    // shape; one shared set for the no-capture case). No `disp`
+    // helper — `disp(h)` is rejected at lowering (no byte-for-byte
+    // numbl format to match).
     return {
       cType: name,
-      structSnippet: `__handle__:${name}`,
-      empty: `${name}_empty`,
-      free: `${name}_free`,
-      assign: `${name}_assign`,
-      copy: () => `${name}_copy`,
+      structSnippet: p(name),
+      empty: p(`${name}_empty`),
+      free: p(`${name}_free`),
+      assign: p(`${name}_assign`),
+      copy: () => p(`${name}_copy`),
     };
   }
   return null;

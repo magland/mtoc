@@ -90,6 +90,7 @@ import {
   forEachTopLevelExpr,
 } from "./walk.js";
 import { anfNormalize, classifyOwnedExpr, ownedExprMessage } from "./anf.js";
+import { decodeNumblQuotedLexeme } from "./lexerHelpers.js";
 import { normalizeStructTypes } from "./normalizeStructTypes.js";
 
 // Reserved C identifiers that need mangling. Mirrors numbl's
@@ -870,7 +871,7 @@ export class Lowerer {
             e.span
           );
         }
-        const inner = raw.slice(1, -1).replace(/""/g, '"');
+        const inner = decodeNumblQuotedLexeme(raw);
         return {
           kind: "StringLit",
           value: inner,
@@ -892,7 +893,7 @@ export class Lowerer {
           );
         }
         // Doubled single-quote '' → ' inside a char literal.
-        const inner = raw.slice(1, -1).replace(/''/g, "'");
+        const inner = decodeNumblQuotedLexeme(raw);
         if (inner.length === 0) {
           throw new UnsupportedConstruct(
             `empty char literal ('') is not yet supported ` +

@@ -45,6 +45,7 @@ import {
   builtinEmitFacade,
   pushStmt,
   useRuntimeByName,
+  useSnippet,
   type EmitState,
 } from "./emitState.js";
 
@@ -170,8 +171,8 @@ export function wrapOwnedArgCopy(
     return inner;
   }
   const helper = owned.copy(argTy);
-  useRuntimeByName(state, helper);
-  return `${helper}(${inner})`;
+  useSnippet(state, helper);
+  return `${helper.name}(${inner})`;
 }
 
 export function emitExpr(
@@ -228,7 +229,8 @@ export function emitExpr(
       if (cTy === null) {
         throw new Error("codegen internal: HandleLit ty has no C type");
       }
-      useRuntimeByName(state, `__handle__:${cTy}`);
+      const handleOwned = ownedOps(e.ty);
+      if (handleOwned !== null) useSnippet(state, handleOwned.structSnippet);
       if (e.captures.length === 0) {
         return `(${cTy}){0}`;
       }
@@ -539,8 +541,8 @@ export function emitExpr(
         let valStr = emitExpr(state, val, 0);
         if (owned !== null && val.kind === "Var") {
           const copyHelper = owned.copy(val.ty);
-          useRuntimeByName(state, copyHelper);
-          valStr = `${copyHelper}(${val.cName})`;
+          useSnippet(state, copyHelper);
+          valStr = `${copyHelper.name}(${val.cName})`;
         }
         inits.push(`.${field.name} = ${valStr}`);
       }

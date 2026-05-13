@@ -216,7 +216,11 @@ modules:
   runtime snippets + function blocks + main into the final C string.
 - `emitState.ts` — `EmitState` interface plus the small helpers that
   every other module needs (`useRuntime` / `useRuntimeByName` /
-  `pushStmt` / `indent` / `builtinEmitFacade`).
+  `useSnippet` / `pushStmt` / `indent` / `builtinEmitFacade`).
+  `useSnippet` accepts the typed `SnippetActivation` discriminated
+  union from `ownedKinds.ts` and no-ops on `programEmitted` entries
+  (struct / handle helpers emitted in-band); `useRuntimeByName` is
+  the string-keyed entry point for the rest of the runtime library.
 - `emitFormat.ts` — pure formatters (`formatNumLit`,
   `formatStringLit`, `formatCharLit`, op tables, precedence). No
   state; no side effects.
@@ -231,8 +235,23 @@ modules:
 - `emitFunction.ts` — `emitFunction` and `emitFunctionBody`, plus
   the per-specialization header comment.
 - `ownedKinds.ts` — registry mapping each owned MType (string, char
-  array, real-or-complex tensor) to its C helper names. New owned
-  kinds plug in by adding one entry.
+  array, real-or-complex tensor, struct, function handle) to its C
+  helper names via a typed `SnippetActivation` discriminated union
+  (`registered` for runtime-registry helpers, `programEmitted` for
+  in-band typedefs + their helpers). New owned kinds plug in by
+  adding one entry.
+- `emitNamedTypedef.ts` — shared driver for any "named-typedef" owned
+  kind (struct, handle, future class). Walks the IR to collect every
+  distinct shape, renders the per-shape typedef plus the four
+  owned-kind helpers (`_empty` / `_free` / `_copy` / `_assign`), and
+  optionally a `_disp` body. The driver is parameterized by a
+  `NamedTypedefSpec` so per-kind variations (member-name prefix,
+  header label, optional disp, topological-sort order) stay in one
+  declarative file.
+- `emitStruct.ts` / `emitHandle.ts` — thin per-kind specs over
+  `emitNamedTypedef`. Struct supplies the rich `_disp` body that
+  matches numbl's `formatStruct` byte-for-byte; handle supplies the
+  shared `_mtoc_handle_empty_t` placeholder prologue.
 - `dispKinds.ts` — registry mapping each value shape (text / tensor /
   scalar char / scalar real / scalar complex) to a single-line `disp`
   emitter. The `Disp` IRStmt arm in `emitStmt` is one lookup —

@@ -38,6 +38,8 @@ import { Lowerer, assertNotMtocReserved, cNameFor } from "./lower.js";
 import { lowerIndexLoad } from "./lowerIndexLoad.js";
 import { lowerIndexSlice } from "./lowerIndexSlice.js";
 import { isSliceArg } from "./indexResolve.js";
+import { fnv1a32Hex } from "./hashing.js";
+import { seedStructParamFieldTypes } from "./lowerStruct.js";
 
 /** Top-level dispatcher for `name(args)` syntax. Splits out the
  *  reserved `disp` (only valid as a stmt) and routes user functions
@@ -649,56 +651,6 @@ export function specializeUserCallWithIRArgs(
   return { args, mangledName, spec };
 }
 
-/** When a function parameter is a struct, seed the inner lowerer's
- *  per-root field-type tracking so member reads on the param work
- *  even before the body has assigned through it. Also augment the
- *  pre-pass struct-shape map to reflect the param's call-site shape.
- *  Recurses into nested-struct fields. */
-function seedStructParamFieldTypes(
-  inner: Lowerer,
-  rootName: string,
-  ty: MType
-): void {
-  if (!isStruct(ty)) return;
-  let shape = inner.structShapes.get(rootName);
-  if (shape === undefined) {
-    shape = { fields: new Map(), firstSpan: { file: "", start: 0, end: 0 } };
-    inner.structShapes.set(rootName, shape);
-  }
-  let fieldTypes = inner.structFieldTypes.get(rootName);
-  if (fieldTypes === undefined) {
-    fieldTypes = new Map();
-    inner.structFieldTypes.set(rootName, fieldTypes);
-  }
-  seedShape(shape, fieldTypes, ty, []);
-}
-
-function seedShape(
-  shape: import("./structPrePass.js").StructShape,
-  fieldTypes: Map<string, MType>,
-  ty: import("./types.js").StructType,
-  pathSoFar: string[]
-): void {
-  for (const f of ty.fields) {
-    const newPath = [...pathSoFar, f.name];
-    if (isStruct(f.type)) {
-      let nested = shape.fields.get(f.name);
-      if (nested === undefined || nested === null) {
-        nested = { fields: new Map(), firstSpan: shape.firstSpan };
-        shape.fields.set(f.name, nested);
-      }
-      seedShape(nested, fieldTypes, f.type, newPath);
-    } else {
-      if (!shape.fields.has(f.name)) {
-        shape.fields.set(f.name, null);
-      }
-      if (!fieldTypes.has(newPath.join("."))) {
-        fieldTypes.set(newPath.join("."), f.type);
-      }
-    }
-  }
-}
-
 /**
  * Build the C identifier for a specialization.
  *
@@ -725,23 +677,6 @@ function mangleSpecName(
     args: argTypes.map(canonicalizeType),
   });
   return `${matlabName}__${fnv1a32Hex(canonical)}`;
-}
-
-/** FNV-1a 32-bit hash of a UTF-16 string, returned as zero-padded 8-hex.
- *  Browser-safe replacement for the previous SHA-256-truncated-to-8-hex
- *  scheme; identical entropy (32 bits) and identical mangle width. */
-function fnv1a32Hex(s: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i) & 0xff;
-    h = Math.imul(h, 0x01000193);
-    const upper = s.charCodeAt(i) >>> 8;
-    if (upper) {
-      h ^= upper;
-      h = Math.imul(h, 0x01000193);
-    }
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
 }
 
 /** Lower a function body for a specific argument-type signature.

@@ -26,6 +26,7 @@
 
 import type { LValue, Expr, Stmt, Span } from "../parser/index.js";
 import { UnsupportedConstruct } from "./errors.js";
+import { decodeNumblQuotedLexeme } from "./lexerHelpers.js";
 
 /** One root variable's accumulated struct shape. */
 export interface StructShape {
@@ -201,7 +202,7 @@ function inferRhsStructShape(
     for (let i = 0; i < expr.args.length; i += 2) {
       const keyArg = expr.args[i];
       if (keyArg.type !== "String" && keyArg.type !== "Char") return null;
-      const name = decodeNumblStringLikeLexeme(keyArg.value);
+      const name = decodeNumblQuotedLexeme(keyArg.value);
       // Recursively check the value for struct-of-struct cases.
       const valShape = inferRhsStructShape(expr.args[i + 1], knownShapes);
       shape.fields.set(name, valShape);
@@ -347,24 +348,11 @@ function addConstructorShape(
         keyArg.span
       );
     }
-    const name = decodeNumblStringLikeLexeme(keyArg.value);
+    const name = decodeNumblQuotedLexeme(keyArg.value);
     if (!shape.fields.has(name)) {
       shape.fields.set(name, null);
     }
   }
-}
-
-/** Decode a numbl-style quoted literal lexeme (the parser keeps the
- *  surrounding quotes and the doubled-quote escapes). Handles both
- *  single- and double-quoted forms. */
-function decodeNumblStringLikeLexeme(raw: string): string {
-  if (raw.length >= 2 && raw[0] === '"' && raw[raw.length - 1] === '"') {
-    return raw.slice(1, -1).replace(/""/g, '"');
-  }
-  if (raw.length >= 2 && raw[0] === "'" && raw[raw.length - 1] === "'") {
-    return raw.slice(1, -1).replace(/''/g, "'");
-  }
-  return raw;
 }
 
 /** Deep-clone a shape map so each branch arm can accumulate its own

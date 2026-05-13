@@ -57,12 +57,21 @@ describe("function handles — type-system invariants", () => {
     const a = anonymousHandle("anon_0", fakeAst, "x.m");
     // Storage category encodes both the target identity AND the
     // capture-tuple shape (`:empty` for no captures).
-    expect(storageCategory(u)).toBe("handle:userFunc:x.m:foo:empty");
-    expect(storageCategory(b)).toBe("handle:builtin:sin:empty");
-    expect(storageCategory(a)).toBe("handle:anonymous:anon_0:empty");
+    expect(storageCategory(u)).toEqual({
+      kind: "handle",
+      id: "handle:userFunc:x.m:foo:empty",
+    });
+    expect(storageCategory(b)).toEqual({
+      kind: "handle",
+      id: "handle:builtin:sin:empty",
+    });
+    expect(storageCategory(a)).toEqual({
+      kind: "handle",
+      id: "handle:anonymous:anon_0:empty",
+    });
     // Two distinct anonymous handles must have distinct categories.
     const a2 = anonymousHandle("anon_1", fakeAst, "x.m");
-    expect(storageCategory(a)).not.toBe(storageCategory(a2));
+    expect(storageCategory(a)?.id).not.toBe(storageCategory(a2)?.id);
   });
 
   it("canonicalizeType produces distinct JSON for differently-targeted handles", () => {

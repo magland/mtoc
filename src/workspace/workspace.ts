@@ -25,8 +25,8 @@ import { resolveFunction } from "../numbl-core/functionResolve.js";
 import type { CallSite } from "../numbl-core/runtime/runtimeHelpers.js";
 import { UnsupportedConstruct } from "../lowering/errors.js";
 
-/** Narrowed alias for the parser's `Stmt.Function`. */
-export type FunctionStmt = Extract<Stmt, { type: "Function" }>;
+import type { FunctionStmt } from "../lowering/astAliases.js";
+export type { FunctionStmt };
 
 export interface WorkspaceFile {
   name: string;

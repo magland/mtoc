@@ -13,13 +13,8 @@
  * ripple through numeric-only code paths.
  */
 
-import type { Stmt } from "../parser/index.js";
-
-/** AST shape of a `function … end` declaration. Re-derived from the
- *  parser's `Stmt` union to avoid a circular import through
- *  `../workspace/workspace.js` (whose `FunctionStmt` re-export
- *  transitively imports `../lowering/types.js` via `./builtins.js`). */
-type FunctionStmt = Extract<Stmt, { type: "Function" }>;
+import type { FunctionStmt } from "./astAliases.js";
+import { fnv1a32Hex } from "./hashing.js";
 
 export type ElemKind = "double" | "char";
 
@@ -365,23 +360,6 @@ export function handleMangledName(t: HandleType): string {
   return `_mtoc_handle__${fnv1a32Hex(canonical)}`;
 }
 
-/** FNV-1a 32-bit hash of a UTF-16 string, returned as zero-padded 8-hex.
- *  Matches `mangleSpecName` in `lowerFuncCall.ts` so struct type IDs
- *  share the same hash flavor as function specialization keys. */
-function fnv1a32Hex(s: string): string {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < s.length; i++) {
-    h ^= s.charCodeAt(i) & 0xff;
-    h = Math.imul(h, 0x01000193);
-    const upper = s.charCodeAt(i) >>> 8;
-    if (upper) {
-      h ^= upper;
-      h = Math.imul(h, 0x01000193);
-    }
-  }
-  return (h >>> 0).toString(16).padStart(8, "0");
-}
-
 /** Mangled C typedef name for a struct shape. Two `StructType`s with
  *  the same canonicalized field/type tuple produce the same name. */
 export function structMangledName(t: StructType): string {
@@ -712,8 +690,36 @@ export function shapeCategory(t: NumericType): string {
  *  multi-element. Adding a new owned kind (cells, structs, classes)
  *  is a new branch here; every per-category dispatch site
  *  (`canShareStorage`, `absentDefaultFor`) picks it up automatically. */
-export function storageCategory(t: MType): string | null {
-  if (t.kind === "String") return "string";
+/** Discriminator over the C-storage-slot categories a value's type
+ *  can occupy. Two types share a single predeclared C variable iff
+ *  they produce the same `StorageCategory.kind` AND the same `.id`.
+ *  Adding a new owned kind appends one variant here and one branch
+ *  in `storageCategory`; the `kind` discriminator is what every
+ *  category-aware dispatcher (e.g. `absentDefaultFor`) switches on,
+ *  replacing the prior `cat.startsWith("struct:")` string sniff. */
+export type CategoryKind =
+  | "scalar-real"
+  | "scalar-complex"
+  | "scalar-char"
+  | "tensor-real"
+  | "tensor-complex"
+  | "char-array"
+  | "string"
+  | "struct"
+  | "handle";
+
+/** Stable identity for a C storage slot. `kind` is the coarse category
+ *  used by dispatchers; `id` carries enough additional detail to
+ *  distinguish slots within the same kind (struct field-name set,
+ *  handle target+captures identity). Two types share a slot iff their
+ *  full `id` strings match. */
+export interface StorageCategory {
+  kind: CategoryKind;
+  id: string;
+}
+
+export function storageCategory(t: MType): StorageCategory | null {
+  if (t.kind === "String") return { kind: "string", id: "string" };
   if (t.kind === "Handle") {
     // Storage category encodes both the resolved target identity AND
     // the capture-tuple shape — two handles share a binding only
@@ -722,7 +728,10 @@ export function storageCategory(t: MType): string | null {
     // Different targets OR different capture shapes trip
     // `canShareStorage` and fall into the split / error path
     // depending on `controlDepth`.
-    return `handle:${handleTargetId(t.target)}:${handleCapturesId(t.captures)}`;
+    return {
+      kind: "handle",
+      id: `handle:${handleTargetId(t.target)}:${handleCapturesId(t.captures)}`,
+    };
   }
   if (t.kind === "Struct") {
     // Storage category is keyed on the SORTED FIELD-NAME SET only,
@@ -734,24 +743,33 @@ export function storageCategory(t: MType): string | null {
     // it returns Unknown and `recordAssignment` falls into the error
     // path. Recording the final widened type then lets `cTypeFor`
     // pick a single, stable typedef name for the variable's lifetime.
-    return `struct:{${t.fields.map(f => f.name).join(",")}}`;
+    return {
+      kind: "struct",
+      id: `struct:{${t.fields.map(f => f.name).join(",")}}`,
+    };
   }
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
-    if (isScalar(t)) return "scalar-char";
-    if (isMultiElement(t)) return "char-array";
+    if (isScalar(t)) return { kind: "scalar-char", id: "scalar-char" };
+    if (isMultiElement(t)) return { kind: "char-array", id: "char-array" };
     return null;
   }
   // elem === "double"
-  if (isScalar(t)) return t.isComplex ? "scalar-complex" : "scalar-real";
+  if (isScalar(t)) {
+    return t.isComplex
+      ? { kind: "scalar-complex", id: "scalar-complex" }
+      : { kind: "scalar-real", id: "scalar-real" };
+  }
   if (isMultiElement(t)) {
-    return t.isComplex ? "tensor-complex" : "tensor-real";
+    return t.isComplex
+      ? { kind: "tensor-complex", id: "tensor-complex" }
+      : { kind: "tensor-real", id: "tensor-real" };
   }
   return null;
 }
 
 /** Can two types share a single predeclared C variable? Equivalent to
- *  "same non-null storage category" — codegen picks one C type per
+ *  "same non-null storage category id" — codegen picks one C type per
  *  binding, and a real-tensor predecl can't hold a complex-tensor
  *  value. Specific runtime size is NOT part of the category; tensor
  *  reassignments at the same coarse shape free and realloc the
@@ -759,7 +777,7 @@ export function storageCategory(t: MType): string | null {
 export function canShareStorage(prev: MType, next: MType): boolean {
   const pc = storageCategory(prev);
   const nc = storageCategory(next);
-  return pc !== null && pc === nc;
+  return pc !== null && nc !== null && pc.id === nc.id;
 }
 
 /** The "absent default" type a control-flow branch merge picks when
@@ -777,34 +795,31 @@ export function absentDefaultFor(present: ReadonlyArray<MType>): MType {
   const cat = storageCategory(present[0]);
   if (cat === null) return scalarDouble("zero");
   for (let i = 1; i < present.length; i++) {
-    if (storageCategory(present[i]) !== cat) return scalarDouble("zero");
+    const other = storageCategory(present[i]);
+    if (other === null || other.id !== cat.id) return scalarDouble("zero");
   }
-  switch (cat) {
+  switch (cat.kind) {
     case "string":
       return STRING;
     case "char-array":
       return charArrayType({ kind: "notOne" });
     case "scalar-char":
       return scalarChar();
-    default:
-      // Struct category: every arm carries the same struct shape, so
-      // the absent default is that shape (the predeclared empty handle
-      // matches it). Fall back to scalar zero for anything else.
-      if (cat.startsWith("struct:") && isStruct(present[0])) {
-        return present[0];
-      }
-      // Handle category: every arm carries the same handle target
-      // (the category-equality check above guaranteed it), so the
-      // "absent default" is that handle. Branch-divergent handle
-      // identity is rejected upstream by the storage-category check
-      // in `recordAssignment` — but a branch that simply doesn't
-      // assign the handle on every arm is fine as long as the
-      // resulting C code never tries to *call* through the absent
-      // path. v1 handles are phantom (no C declaration), so an
-      // absent arm produces no codegen issue.
-      if (cat.startsWith("handle:") && isHandle(present[0])) {
-        return present[0];
-      }
+    case "struct":
+      // Every arm carries the same struct shape (category-id equality
+      // above guaranteed it), so the absent default is that shape —
+      // the predeclared empty handle matches it field-for-field.
+      return present[0];
+    case "handle":
+      // Every arm carries the same handle target + capture shape. An
+      // absent arm produces no codegen issue: handles' C declarations
+      // are zero-init structs whose only liability is the per-shape
+      // typedef being in scope (which the predeclaration ensures).
+      return present[0];
+    case "scalar-real":
+    case "scalar-complex":
+    case "tensor-real":
+    case "tensor-complex":
       return scalarDouble("zero");
   }
 }

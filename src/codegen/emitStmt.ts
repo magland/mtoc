@@ -32,7 +32,12 @@ import {
 } from "../lowering/types.js";
 import { dispEmitterFor } from "./dispKinds.js";
 import { ownedOps } from "./ownedKinds.js";
-import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
+import {
+  pushStmt,
+  useRuntimeByName,
+  useSnippet,
+  type EmitState,
+} from "./emitState.js";
 import { emitScopeExitFrees } from "./emitOwned.js";
 import {
   emitExpr,
@@ -203,13 +208,13 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
           break;
         }
-        useRuntimeByName(state, owned.structSnippet);
-        useRuntimeByName(state, owned.assign);
+        useSnippet(state, owned.structSnippet);
+        useSnippet(state, owned.assign);
         let rhsExpr: string;
         if (s.rhs.kind === "Var") {
           const copyHelper = owned.copy(s.rhs.ty);
-          useRuntimeByName(state, copyHelper);
-          rhsExpr = `${copyHelper}(${s.rhs.cName})`;
+          useSnippet(state, copyHelper);
+          rhsExpr = `${copyHelper.name}(${s.rhs.cName})`;
         } else if (
           s.rhs.kind === "MemberLoad" ||
           s.rhs.kind === "HandleCaptureLoad"
@@ -217,12 +222,16 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           // Struct-field or handle-capture read: deep-copy so the
           // assignment owns its own buffer (same shape as Var read).
           const copyHelper = owned.copy(s.rhs.ty);
-          useRuntimeByName(state, copyHelper);
-          rhsExpr = `${copyHelper}(${emitExpr(state, s.rhs, 0)})`;
+          useSnippet(state, copyHelper);
+          rhsExpr = `${copyHelper.name}(${emitExpr(state, s.rhs, 0)})`;
         } else {
           rhsExpr = emitExpr(state, s.rhs, 0);
         }
-        pushStmt(state, level, `${owned.assign}(&${s.cName}, ${rhsExpr});`);
+        pushStmt(
+          state,
+          level,
+          `${owned.assign.name}(&${s.cName}, ${rhsExpr});`
+        );
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
@@ -269,16 +278,20 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // value via the kind's `assign` helper. If the RHS is a `Var`
         // of the same owned type, we deep-copy first so the field
         // gets its own buffer (value semantics).
-        useRuntimeByName(state, owned.structSnippet);
-        useRuntimeByName(state, owned.assign);
+        useSnippet(state, owned.structSnippet);
+        useSnippet(state, owned.assign);
         if (s.rhs.kind === "Var") {
           const copyHelper = owned.copy(s.rhs.ty);
-          useRuntimeByName(state, copyHelper);
-          rhsExpr = `${copyHelper}(${s.rhs.cName})`;
+          useSnippet(state, copyHelper);
+          rhsExpr = `${copyHelper.name}(${s.rhs.cName})`;
         } else {
           rhsExpr = emitExpr(state, s.rhs, 0);
         }
-        pushStmt(state, level, `${owned.assign}(&${lhsAccess}, ${rhsExpr});`);
+        pushStmt(
+          state,
+          level,
+          `${owned.assign.name}(&${lhsAccess}, ${rhsExpr});`
+        );
       } else {
         // Scalar leaf field: plain assignment. The RHS may also need
         // a struct-typed write for a nested field path where the
@@ -577,12 +590,12 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           const o = outputs[i];
           const owned = ownedOps(o.ty);
           if (owned !== null) {
-            useRuntimeByName(state, owned.structSnippet);
-            useRuntimeByName(state, owned.assign);
+            useSnippet(state, owned.structSnippet);
+            useSnippet(state, owned.assign);
             pushStmt(
               state,
               level,
-              `${owned.assign}(_mtoc_o${i}, ${s.outputCNames[i]});`
+              `${owned.assign.name}(_mtoc_o${i}, ${s.outputCNames[i]});`
             );
           } else {
             pushStmt(state, level, `*_mtoc_o${i} = ${s.outputCNames[i]};`);
@@ -682,9 +695,13 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           const tmp = `_mtoc_discard_${callIdx}_${i}`;
           const owned = ownedOps(slot.ty);
           if (owned !== null) {
-            useRuntimeByName(state, owned.structSnippet);
-            useRuntimeByName(state, owned.empty);
-            pushStmt(state, level + 1, `${cTy} ${tmp} = ${owned.empty}();`);
+            useSnippet(state, owned.structSnippet);
+            useSnippet(state, owned.empty);
+            pushStmt(
+              state,
+              level + 1,
+              `${cTy} ${tmp} = ${owned.empty.name}();`
+            );
             ownedDiscards.push({ cName: tmp, owned });
           } else {
             pushStmt(state, level + 1, `${cTy} ${tmp};`);
@@ -703,8 +720,8 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // callee's `mtoc_<kind>_assign` consumed the empty handle and
       // installed a fresh buffer; we free it here so it doesn't leak.
       for (const d of ownedDiscards) {
-        useRuntimeByName(state, d.owned!.free);
-        pushStmt(state, level + 1, `${d.owned!.free}(&${d.cName});`);
+        useSnippet(state, d.owned!.free);
+        pushStmt(state, level + 1, `${d.owned!.free.name}(&${d.cName});`);
       }
       pushStmt(state, level, `}`);
       // Reassigning to an owned LHS via the call clears its freed

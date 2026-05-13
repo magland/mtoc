@@ -20,7 +20,7 @@ import {
 } from "../lowering/types.js";
 import { computeFutureTouches } from "./liveness.js";
 import { ownedOps } from "./ownedKinds.js";
-import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
+import { pushStmt, useSnippet, type EmitState } from "./emitState.js";
 import {
   emitDeclarations,
   emitScopeExitFrees,
@@ -60,9 +60,9 @@ export function emitOwnedAwareSretWrites(
     const o = outputs[i];
     const owned = ownedOps(o.ty);
     if (owned !== null) {
-      useRuntimeByName(state, owned.structSnippet);
-      useRuntimeByName(state, owned.assign);
-      pushStmt(state, level, `${owned.assign}(_mtoc_o${i}, ${o.cName});`);
+      useSnippet(state, owned.structSnippet);
+      useSnippet(state, owned.assign);
+      pushStmt(state, level, `${owned.assign.name}(_mtoc_o${i}, ${o.cName});`);
     } else {
       pushStmt(state, level, `*_mtoc_o${i} = ${o.cName};`);
     }
@@ -214,7 +214,7 @@ export function emitFunction(
     // Activate the owned-kind typedef when the return type needs it so
     // the function's signature is valid C wherever it appears.
     const owned = ownedOps(fn.outputs[0].ty);
-    if (owned !== null) useRuntimeByName(state, owned.structSnippet);
+    if (owned !== null) useSnippet(state, owned.structSnippet);
     if (isNumeric(fn.outputs[0].ty) && fn.outputs[0].ty.isComplex) {
       state.needComplex.value = true;
     }
@@ -243,7 +243,7 @@ export function emitFunction(
     // valid C. Scalar params have no struct typedef; the registry
     // returns null for them.
     const owned = ownedOps(p.ty);
-    if (owned !== null) useRuntimeByName(state, owned.structSnippet);
+    if (owned !== null) useSnippet(state, owned.structSnippet);
     if (isNumeric(p.ty) && p.ty.isComplex) state.needComplex.value = true;
     paramParts.push(`${cTy} ${p.cName}`);
   }
@@ -261,7 +261,7 @@ export function emitFunction(
       }
       // Owned outputs need their typedef visible in the signature.
       const owned = ownedOps(o.ty);
-      if (owned !== null) useRuntimeByName(state, owned.structSnippet);
+      if (owned !== null) useSnippet(state, owned.structSnippet);
       if (isNumeric(o.ty) && o.ty.isComplex) state.needComplex.value = true;
       paramParts.push(`${cTy} *_mtoc_o${i}`);
     }

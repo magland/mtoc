@@ -18,7 +18,7 @@ import { ownedOps } from "./ownedKinds.js";
 import {
   builtinEmitFacade,
   pushStmt,
-  useRuntimeByName,
+  useSnippet,
   type EmitState,
 } from "./emitState.js";
 import { analyzeExpr, emitExpr } from "./emitExpr.js";
@@ -100,8 +100,8 @@ export function emitEarlyFrees(
           `(${typeToString(binding.ty)})`
       );
     }
-    useRuntimeByName(state, owned.free);
-    pushStmt(state, level, `${owned.free}(&${v});`);
+    useSnippet(state, owned.free);
+    pushStmt(state, level, `${owned.free.name}(&${v});`);
     state.freedOwned.add(v);
   }
 }

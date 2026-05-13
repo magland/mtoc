@@ -12,10 +12,11 @@
  * outer-scope local (a "capture") — the rejection points at Phase 2.
  */
 
-import type { Expr, Span, Stmt } from "../parser/index.js";
+import type { Expr, Span } from "../parser/index.js";
 import { getBuiltin } from "../workspace/builtins.js";
 import { getConstant } from "../workspace/constants.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
+import type { FunctionStmt } from "./astAliases.js";
 import type { IRExpr } from "./ir.js";
 import { Lowerer } from "./lower.js";
 import {
@@ -31,11 +32,6 @@ import {
   type HandleType,
   type MType,
 } from "./types.js";
-
-/** AST shape of a `function … end` declaration. Mirrors the type
- *  exported by `workspace.ts`; redeclared locally to avoid the circular
- *  import lowering/types ↔ workspace through this file. */
-type FunctionStmt = Extract<Stmt, { type: "Function" }>;
 
 /** Lower a `@name` AST node to a phantom `HandleLit`. Resolves the
  *  target through the workspace; the result carries the resolved AST

@@ -27,7 +27,7 @@ import {
 } from "../lowering/types.js";
 // `isHandle` is used by `functionFreeOnExitSet`.
 import { ownedOps } from "./ownedKinds.js";
-import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
+import { pushStmt, useSnippet, type EmitState } from "./emitState.js";
 
 /** Emit predeclarations for a {cName → VarBinding} table. Scalars
  *  become `double <cName> = 0.0;` (real) or `double _Complex <cName> = 0.0;`
@@ -57,9 +57,13 @@ export function emitDeclarations(
     // an uninitialized var is a safe no-op.
     const owned = ownedOps(ty);
     if (owned !== null) {
-      useRuntimeByName(state, owned.structSnippet);
-      useRuntimeByName(state, owned.empty);
-      pushStmt(state, level, `${owned.cType} ${cName} = ${owned.empty}();`);
+      useSnippet(state, owned.structSnippet);
+      useSnippet(state, owned.empty);
+      pushStmt(
+        state,
+        level,
+        `${owned.cType} ${cName} = ${owned.empty.name}();`
+      );
       continue;
     }
     if (isCharScalar(ty)) {
@@ -107,8 +111,8 @@ export function emitScopeExitFrees(
     const owned = ownedOps(ty);
     if (owned === null) continue;
     if (alreadyFreed.has(cName)) continue;
-    useRuntimeByName(state, owned.free);
-    pushStmt(state, level, `${owned.free}(&${cName});`);
+    useSnippet(state, owned.free);
+    pushStmt(state, level, `${owned.free.name}(&${cName});`);
     alreadyFreed.add(cName);
   }
 }

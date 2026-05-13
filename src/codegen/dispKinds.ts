@@ -28,7 +28,12 @@ import {
 } from "../lowering/types.js";
 import { wrapTextView } from "./emitExpr.js";
 import { ownedOps } from "./ownedKinds.js";
-import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
+import {
+  pushStmt,
+  useRuntimeByName,
+  useSnippet,
+  type EmitState,
+} from "./emitState.js";
 
 /** Render one `disp(<value>)` call at indentation `level` from the
  *  already-emitted C expression `c`. Implementations activate any
@@ -53,9 +58,9 @@ export function dispEmitterFor(ty: MType): DispEmitter | null {
   if (owned !== null && owned.disp !== undefined) {
     const helper = owned.disp(ty);
     return (state, level, c) => {
-      useRuntimeByName(state, owned.structSnippet);
-      useRuntimeByName(state, helper);
-      pushStmt(state, level, `${helper}(${c});`);
+      useSnippet(state, owned.structSnippet);
+      useSnippet(state, helper);
+      pushStmt(state, level, `${helper.name}(${c});`);
     };
   }
   if (isCharScalar(ty)) {
