@@ -20,7 +20,10 @@
 
 import type { AbstractSyntaxTree, Span, Stmt } from "../parser/index.js";
 import { allBuiltinNames } from "./builtins.js";
-import { LoweringContext } from "../numbl-core/lowering/loweringContext.js";
+import {
+  LoweringContext,
+  type ClassInfo,
+} from "../numbl-core/lowering/loweringContext.js";
 import { resolveFunction } from "../numbl-core/functionResolve.js";
 import type { CallSite } from "../numbl-core/runtime/runtimeHelpers.js";
 import type { ItemType } from "../numbl-core/lowering/itemTypes.js";
@@ -29,6 +32,144 @@ import { UnsupportedConstruct } from "../lowering/errors.js";
 
 import type { FunctionStmt } from "../lowering/astAliases.js";
 export type { FunctionStmt };
+
+/** MATLAB names that are commonly used as operator-overload methods.
+ *  Stage 1 rejects classes that define any of these — operator
+ *  overloads need a different dispatch surface (the `lowerBinary`
+ *  arm), which Stage 1 doesn't wire. Later stages remove this fence. */
+const OPERATOR_OVERLOAD_METHOD_NAMES: ReadonlySet<string> = new Set([
+  "plus",
+  "minus",
+  "uminus",
+  "uplus",
+  "times",
+  "mtimes",
+  "rdivide",
+  "ldivide",
+  "mrdivide",
+  "mldivide",
+  "power",
+  "mpower",
+  "eq",
+  "ne",
+  "lt",
+  "gt",
+  "le",
+  "ge",
+  "and",
+  "or",
+  "not",
+  "xor",
+  "transpose",
+  "ctranspose",
+  "subsref",
+  "subsasgn",
+  "subsindex",
+  "horzcat",
+  "vertcat",
+  "cat",
+  "end",
+  "colon",
+  "numel",
+  "size",
+  "length",
+  "isscalar",
+  "isempty",
+  "display",
+]);
+
+/** Gate Stage 1 unsupported class shapes here so the diagnostic
+ *  surfaces with a span at the call site, not deep in lowering. */
+function validateClassSupported(
+  info: ClassInfo,
+  callName: string,
+  span: Span
+): void {
+  // Handle classes: rejected wholesale. mtoc has no shared-storage /
+  // refcount semantics yet (see docs/limitations.md once Stage 1 ships).
+  if (isHandleClass(info)) {
+    throw new UnsupportedConstruct(
+      `handle classes (\`classdef ${info.qualifiedName} < handle\`) are ` +
+        `not yet supported by mtoc; value classes work`,
+      span
+    );
+  }
+  // Inheritance: deferred to Stage 4.
+  if (info.superClass !== null) {
+    throw new UnsupportedConstruct(
+      `class inheritance (\`${info.qualifiedName} < ${info.superClass}\`) ` +
+        `is not yet supported by mtoc`,
+      span
+    );
+  }
+  // Operator overloads / subsref / subsasgn: any class that defines
+  // one of these names is rejected. Stage 1 only supports the basic
+  // dot-access path.
+  for (const name of info.methodNames) {
+    if (OPERATOR_OVERLOAD_METHOD_NAMES.has(name)) {
+      throw new UnsupportedConstruct(
+        `class '${info.qualifiedName}' defines method '${name}'; ` +
+          `operator overloads / subsref / subsasgn / horzcat / vertcat ` +
+          `are not yet supported by mtoc`,
+        span
+      );
+    }
+  }
+  // External method files (`@Cls/method.m`): not yet supported.
+  if (info.externalMethodFiles.size > 0) {
+    throw new UnsupportedConstruct(
+      `class '${info.qualifiedName}' uses external method files ` +
+        `(\`@${info.qualifiedName}/\` folder); only classdef-inline methods ` +
+        `are supported by mtoc Stage 1`,
+      span
+    );
+  }
+  // Static methods: deferred to Stage 5.
+  if (info.staticMethodNames.size > 0) {
+    throw new UnsupportedConstruct(
+      `class '${info.qualifiedName}' declares static methods; static ` +
+        `method dispatch is not yet supported by mtoc`,
+      span
+    );
+  }
+  void callName;
+}
+
+/** Detect a handle-base class — `classdef X < handle` or any class
+ *  whose superclass chain bottoms out at `handle`. Note: in Stage 1
+ *  with `superClass !== null` already rejected above, only the direct
+ *  `< handle` case can survive — but the check is here for the day
+ *  inheritance lands. */
+function isHandleClass(info: ClassInfo): boolean {
+  return info.superClass === "handle";
+}
+
+/** Look up a class method's AST (with constructor's receiver-output
+ *  param already prepended when applicable) by walking the
+ *  `Methods`-block bodies of the classdef AST. Mirrors the
+ *  `getOrCreateClassFileContext`'s constructor-transform so the AST
+ *  returned here has the same shape as the one the resolver
+ *  effectively dispatches against. */
+function lookupClassMethodAST(
+  info: ClassInfo,
+  methodName: string
+): FunctionStmt | null {
+  for (const member of info.ast.members) {
+    if (member.type !== "Methods") continue;
+    for (const stmt of member.body) {
+      if (stmt.type !== "Function") continue;
+      if (stmt.name !== methodName) continue;
+      if (methodName === info.constructorName) {
+        // Constructor: prepend the output variable as a hidden first
+        // param, matching `getOrCreateClassFileContext`'s transform.
+        const outputName = stmt.outputs.length > 0 ? stmt.outputs[0] : "obj";
+        return { ...stmt, params: [outputName, ...stmt.params] };
+      }
+      return stmt;
+    }
+  }
+  return null;
+}
 
 /**
  * Adapter from mtoc's `MType` to numbl's `ItemType`. Used to feed the
@@ -76,7 +217,40 @@ export type ResolvedTarget =
        *  specialization mangling and to drive subfunction visibility. */
       file: string;
     }
-  | { kind: "builtin"; name: string };
+  | { kind: "builtin"; name: string }
+  | {
+      /** Class constructor call: `MyClass(args)` resolves here when
+       *  `MyClass` is a workspace or local class. The AST is the
+       *  constructor function with the receiver-output param already
+       *  prepended (the vendored ctx's `getOrCreateClassFileContext`
+       *  handles that transform). */
+      kind: "classConstructor";
+      className: string;
+      /** Constructor AST (with `obj` prepended as the first param). */
+      ast: FunctionStmt;
+      /** The class file the constructor was loaded from. Salts the
+       *  specialization key. */
+      file: string;
+    }
+  | {
+      /** Class method call: returned for both `obj.method(args)` and
+       *  `method(obj, args)` forms. The resolver picks the winning
+       *  class (inheritance chain or InferiorClasses precedence); the
+       *  defining class (where the method's AST actually lives) is
+       *  resolved here via `findDefiningClass`. */
+      kind: "classMethod";
+      className: string;
+      methodName: string;
+      /** Method AST (instance methods take the receiver as their
+       *  declared first param; static methods don't). */
+      ast: FunctionStmt;
+      /** The class file the method's AST was loaded from. */
+      file: string;
+      /** Resolver's `stripInstance` flag: when true, the caller MUST
+       *  drop the receiver from the IR-arg list before specializing —
+       *  the static method's signature has no receiver param. */
+      stripInstance: boolean;
+    };
 
 export class Workspace {
   /** Per-file cache: file name → file record (source + AST). The AST
@@ -245,12 +419,74 @@ export class Workspace {
             `supported by mtoc`,
           span
         );
-      case "classMethod":
-      case "workspaceClassConstructor":
-        throw new UnsupportedConstruct(
-          `class methods / constructors are not yet supported by mtoc`,
-          span
+      case "classMethod": {
+        // Use findDefiningClass to walk the inheritance chain rooted
+        // at the verdict's class and locate the AST. The resolver's
+        // verdict (className) already encodes the precedence rules
+        // (single class, inferior-class promotion, targetClassName
+        // short-circuit); findDefiningClass is just an AST lookup.
+        const definingClass = this.ctx.findDefiningClass(
+          target.className,
+          target.methodName
         );
+        const info = this.ctx.getClassInfo(definingClass);
+        if (info === null) {
+          throw new UnsupportedConstruct(
+            `internal: resolver returned classMethod for '${target.className}.${target.methodName}' but no ClassInfo was found`,
+            span
+          );
+        }
+        // Gate Stage 1 unsupported class shapes here (handle base,
+        // external method files, etc.) so the user sees a clear span
+        // at the call site.
+        validateClassSupported(info, target.methodName, span);
+        const ast = lookupClassMethodAST(info, target.methodName);
+        if (ast === null) {
+          throw new UnsupportedConstruct(
+            `internal: class '${definingClass}' has no AST for method '${target.methodName}'`,
+            span
+          );
+        }
+        return {
+          kind: "classMethod",
+          className: definingClass,
+          methodName: target.methodName,
+          ast,
+          file: info.fileName,
+          stripInstance: target.stripInstance,
+        };
+      }
+      case "workspaceClassConstructor": {
+        const info = this.ctx.getClassInfo(target.className);
+        if (info === null) {
+          throw new UnsupportedConstruct(
+            `internal: resolver returned workspaceClassConstructor for '${target.className}' but no ClassInfo was found`,
+            span
+          );
+        }
+        if (info.constructorName === null) {
+          throw new UnsupportedConstruct(
+            `class '${target.className}' has no constructor; mtoc Stage 1 ` +
+              `requires an explicit constructor (the implicit zero-arg form ` +
+              `is not yet supported)`,
+            span
+          );
+        }
+        validateClassSupported(info, info.constructorName, span);
+        const ast = lookupClassMethodAST(info, info.constructorName);
+        if (ast === null) {
+          throw new UnsupportedConstruct(
+            `internal: class '${target.className}' has no AST for constructor '${info.constructorName}'`,
+            span
+          );
+        }
+        return {
+          kind: "classConstructor",
+          className: target.className,
+          ast,
+          file: info.fileName,
+        };
+      }
       case "jsUserFunction":
         throw new UnsupportedConstruct(
           `JS user functions (.numbl.js) are not yet supported by mtoc`,

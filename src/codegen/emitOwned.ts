@@ -19,6 +19,7 @@ import type { IRFunction, VarBinding } from "../lowering/ir.js";
 import {
   isCell,
   isCharScalar,
+  isClass,
   isHandle,
   isMultiElement,
   isScalarComplex,
@@ -185,7 +186,8 @@ export function functionFreeOnExitSet(
       isMultiElement(p.ty) ||
       isStruct(p.ty) ||
       isHandle(p.ty) ||
-      isCell(p.ty)
+      isCell(p.ty) ||
+      isClass(p.ty)
     ) {
       out.set(p.cName, { ty: p.ty, cName: p.cName });
     }

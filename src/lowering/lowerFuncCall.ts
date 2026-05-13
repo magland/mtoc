@@ -19,6 +19,7 @@ import {
   arithResult,
   canonicalizeType,
   isCell,
+  isClass,
   isHandle,
   isMultiElement,
   isOwned,
@@ -41,6 +42,10 @@ import { lowerIndexSlice } from "./lowerIndexSlice.js";
 import { isSliceArg } from "./indexResolve.js";
 import { fnv1a32Hex } from "./hashing.js";
 import { seedStructParamFieldTypes } from "./lowerStruct.js";
+import {
+  lowerClassConstructorCall,
+  lowerClassMethodCallByName,
+} from "./lowerClass.js";
 
 /** Top-level dispatcher for `name(args)` syntax. Splits out the
  *  reserved `disp` (only valid as a stmt) and routes user functions
@@ -60,14 +65,22 @@ export function lowerFuncCall(
     }
     return lowerIndexLoad.call(this, e.name, e.args, e.span);
   }
-  // Args not lowered yet at this point; pass `[]`. When the function-call
-  // form needs to dispatch to a class method (resolver's class-method-
-  // candidate scan), lower the args first and feed their MTypes here.
-  // For now this preserves the legacy behavior: empty argTypes means
-  // the resolver skips the class-method-candidate branch.
+  // Peek at any class-typed args FIRST so the resolver can apply its
+  // class-method-candidate precedence rule. We do a partial-lowering
+  // pass: check whether any arg name is bound to a class instance
+  // in the current env. If so, lower the args fully and pass their
+  // MTypes to the resolver. Otherwise pass `[]` (legacy behavior —
+  // the resolver skips class dispatch).
+  const hasClassArg = anyArgIsClassInstance.call(this, e.args);
+  let preLoweredArgs: IRExpr[] | null = null;
+  let argTypes: MType[] = [];
+  if (hasClassArg) {
+    preLoweredArgs = e.args.map(a => this.lowerExpr(a));
+    argTypes = preLoweredArgs.map(a => a.ty);
+  }
   const target = this.shared.workspace.resolve(
     e.name,
-    [],
+    argTypes,
     this.callSite(),
     e.span
   );
@@ -78,6 +91,41 @@ export function lowerFuncCall(
     );
   }
   if (target.kind === "userFunction") {
+    if (preLoweredArgs !== null) {
+      // Route through the already-lowered specialize path so we
+      // don't re-lower (and re-execute) the arg expressions.
+      const { args, mangledName, spec } = specializeUserCallWithIRArgs.call(
+        this,
+        target.name,
+        target.ast,
+        target.file,
+        preLoweredArgs,
+        e.span
+      );
+      if (spec.outputs.length === 0) {
+        throw new UnsupportedConstruct(
+          `function '${target.name}' has no outputs and cannot be used in an ` +
+            `expression position; call it as a bare statement instead`,
+          e.span
+        );
+      }
+      if (spec.outputs.length !== 1) {
+        throw new UnsupportedConstruct(
+          `function '${target.name}' has ${spec.outputs.length} outputs and ` +
+            `cannot be used in an expression position; assign via ` +
+            `\`[a, b, ...] = ${target.name}(...)\``,
+          e.span
+        );
+      }
+      return {
+        kind: "Call",
+        name: target.name,
+        callee: { kind: "userFunc", mangled: mangledName },
+        args,
+        ty: spec.outputs[0].ty,
+        span: e.span,
+      };
+    }
     return lowerUserCall.call(
       this,
       target.name,
@@ -86,6 +134,16 @@ export function lowerFuncCall(
       e.args,
       e.span
     );
+  }
+  if (target.kind === "classConstructor") {
+    return lowerClassConstructorCall.call(this, target, e.args, e.span);
+  }
+  if (target.kind === "classMethod") {
+    // Function-call form `method(obj, args)`. We pre-lowered the
+    // args above (hasClassArg was true since at least one arg is a
+    // class instance); pass through to the shared dispatch.
+    const irArgs = preLoweredArgs ?? e.args.map(a => this.lowerExpr(a));
+    return lowerClassMethodCallByName.call(this, target, irArgs, e.span);
   }
   // Statement-only builtins (today: `disp`, `error`) cannot appear at
   // expression position. Lowering of `ExprStmt(disp(...))` /
@@ -99,7 +157,27 @@ export function lowerFuncCall(
       e.span
     );
   }
+  if (preLoweredArgs !== null) {
+    return lowerBuiltinCallWithArgs.call(this, e.name, preLoweredArgs, e.span);
+  }
   return lowerBuiltinCall.call(this, e.name, e.args, e.span);
+}
+
+/** True when any arg expression in `args` is a bare `Ident` bound to a
+ *  class-instance MType in the current env. Used as a cheap pre-check
+ *  before deciding whether to lower args eagerly for class dispatch.
+ *  Non-Ident args (FuncCalls, expressions) might also produce class
+ *  values, but lowering them eagerly is more invasive — Stage 1 only
+ *  enables class dispatch when an Ident-typed class instance is at the
+ *  call site, which covers `area(obj)` style. Tighter detection
+ *  (lower-then-resolve) can land later. */
+function anyArgIsClassInstance(this: Lowerer, args: Expr[]): boolean {
+  for (const a of args) {
+    if (a.type !== "Ident") continue;
+    const ty = this.envLookup(a.name);
+    if (ty !== undefined && isClass(ty)) return true;
+  }
+  return false;
 }
 
 /** Lower a builtin call. Walks the builtin's `params` for shape +
@@ -648,11 +726,12 @@ export function specializeUserCallWithIRArgs(
       !isNumeric(a.ty) &&
       !isStruct(a.ty) &&
       !isHandle(a.ty) &&
-      !isCell(a.ty)
+      !isCell(a.ty) &&
+      !isClass(a.ty)
     ) {
       throw new UnsupportedConstruct(
         `function '${name}' only accepts numeric, struct, function-handle, ` +
-          `or cell arguments (got ${typeToString(a.ty)})`,
+          `cell, or class-instance arguments (got ${typeToString(a.ty)})`,
         a.span
       );
     }
@@ -755,6 +834,17 @@ function specialize(
     // without first assigning it).
     for (const p of paramBindings) {
       seedStructParamFieldTypes(inner, p.name, p.ty);
+    }
+    // For class params: seed the class state with the receiver's
+    // class identity + property tuple so member reads / writes on
+    // the param resolve correctly inside the method body. The class
+    // info is looked up from the workspace's class registry by the
+    // param's ClassType.className.
+    for (const p of paramBindings) {
+      if (isClass(p.ty)) {
+        const info = this.shared.workspace.ctx.getClassInfo(p.ty.className);
+        inner.class.seedFromClassType(p.name, p.ty, info);
+      }
     }
     const body = inner.lowerStmts(fnAst.body);
     // After body lowering: every declared output must have an assigned

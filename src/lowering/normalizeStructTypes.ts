@@ -19,10 +19,12 @@ import type {
   VarBinding,
 } from "./ir.js";
 import {
+  isClass,
   isHandle,
   isHomogeneousCell,
   isStruct,
   isTupleCell,
+  type ClassType,
   type HandleType,
   type MType,
   type StructType,
@@ -102,6 +104,8 @@ function rewriteStmt(
       // for the predeclaration vs the assign site.
       let finalTy: MType = s.ty;
       if (isStruct(s.ty) && binds.has(s.cName)) {
+        finalTy = binds.get(s.cName)!.ty;
+      } else if (isClass(s.ty) && binds.has(s.cName)) {
         finalTy = binds.get(s.cName)!.ty;
       } else if (isHandle(s.ty)) {
         // For handle bindings: the binds map's stored HandleType may
@@ -264,6 +268,9 @@ function rewriteExpr(
       if (isStruct(e.ty) && binds.has(e.cName)) {
         return { ...e, ty: binds.get(e.cName)!.ty };
       }
+      if (isClass(e.ty) && binds.has(e.cName)) {
+        return { ...e, ty: binds.get(e.cName)!.ty };
+      }
       if (isHandle(e.ty)) {
         return { ...e, ty: normalizeHandleType(e.ty, binds) };
       }
@@ -271,7 +278,7 @@ function rewriteExpr(
     }
     case "MemberLoad": {
       const newBase = rewriteExpr(e.base, binds);
-      // After base normalization, walk to the field type.
+      // After base normalization, walk to the property/field type.
       const ty = resolveFieldPathType(newBase.ty, [e.field]) ?? e.ty;
       return { ...e, base: newBase, ty };
     }
@@ -397,19 +404,27 @@ function normalizeHandleType(
   return { ...h, captures: newCaptures };
 }
 
-/** Walk a field path through a struct type and return the leaf's
- *  type, or null if the path doesn't exist. */
+/** Walk a field/property path through a struct or class type and
+ *  return the leaf's type, or null if the path doesn't exist. */
 function resolveFieldPathType(
   ty: MType,
   path: ReadonlyArray<string>
 ): MType | null {
   let cur: MType = ty;
   for (const name of path) {
-    if (!isStruct(cur)) return null;
-    const sty: StructType = cur;
-    const f = sty.fields.find(ff => ff.name === name);
-    if (!f) return null;
-    cur = f.type;
+    if (isStruct(cur)) {
+      const sty: StructType = cur;
+      const f = sty.fields.find(ff => ff.name === name);
+      if (!f) return null;
+      cur = f.type;
+    } else if (isClass(cur)) {
+      const cty: ClassType = cur;
+      const p = cty.properties.find(pp => pp.name === name);
+      if (!p) return null;
+      cur = p.type;
+    } else {
+      return null;
+    }
   }
   return cur;
 }

@@ -19,14 +19,17 @@
 
 import type { IRProgram } from "../lowering/ir.js";
 import {
+  classMangledName,
   handleMangledName,
   homogeneousCellMangledName,
+  isClass,
   isHandle,
   isHomogeneousCell,
   isStruct,
   isTupleCell,
   structMangledName,
   tupleCellMangledName,
+  type ClassType,
   type HandleType,
   type HomogeneousCellType,
   type MType,
@@ -38,13 +41,15 @@ import { renderStructBlock } from "./emitStruct.js";
 import { renderHandleBlock } from "./emitHandle.js";
 import { renderTupleCellBlock } from "./emitTupleCell.js";
 import { renderHomogeneousCellBlock } from "./emitHomogeneousCell.js";
+import { renderClassBlock } from "./emitClass.js";
 import { type EmitState } from "./emitState.js";
 
 type AnyOwnedKindShape =
   | { kind: "struct"; ty: StructType }
   | { kind: "handle"; ty: HandleType }
   | { kind: "tupleCell"; ty: TupleCellType }
-  | { kind: "homogeneousCell"; ty: HomogeneousCellType };
+  | { kind: "homogeneousCell"; ty: HomogeneousCellType }
+  | { kind: "class"; ty: ClassType };
 
 /** Single source of truth: walk the program and collect every owned-
  *  typedef shape across all four kinds, keyed by its mangled C name. */
@@ -80,10 +85,19 @@ function collectAllShapes(prog: IRProgram): Map<string, AnyOwnedKindShape> {
     homogeneousCellMangledName,
     (t, v) => v(t.elem)
   );
+  const classes = collectMTypeShapes(
+    prog,
+    isClass,
+    classMangledName,
+    (t, v) => {
+      for (const p of t.properties) v(p.type);
+    }
+  );
   for (const [n, t] of structs) out.set(n, { kind: "struct", ty: t });
   for (const [n, t] of handles) out.set(n, { kind: "handle", ty: t });
   for (const [n, t] of tcells) out.set(n, { kind: "tupleCell", ty: t });
   for (const [n, t] of hcells) out.set(n, { kind: "homogeneousCell", ty: t });
+  for (const [n, t] of classes) out.set(n, { kind: "class", ty: t });
   return out;
 }
 
@@ -97,6 +111,7 @@ function shapeDeps(s: AnyOwnedKindShape): string[] {
     else if (isHandle(t)) out.push(handleMangledName(t));
     else if (isTupleCell(t)) out.push(tupleCellMangledName(t));
     else if (isHomogeneousCell(t)) out.push(homogeneousCellMangledName(t));
+    else if (isClass(t)) out.push(classMangledName(t));
   };
   switch (s.kind) {
     case "struct":
@@ -110,6 +125,9 @@ function shapeDeps(s: AnyOwnedKindShape): string[] {
       break;
     case "homogeneousCell":
       visit(s.ty.elem);
+      break;
+    case "class":
+      for (const p of s.ty.properties) visit(p.type);
       break;
   }
   return out;
@@ -155,6 +173,8 @@ function renderShape(state: EmitState, s: AnyOwnedKindShape): string[] {
       return renderTupleCellBlock(state, s.ty);
     case "homogeneousCell":
       return renderHomogeneousCellBlock(state, s.ty);
+    case "class":
+      return renderClassBlock(state, s.ty);
   }
 }
 

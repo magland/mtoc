@@ -23,9 +23,11 @@
  */
 
 import {
+  classMangledName,
   handleMangledName,
   homogeneousCellMangledName,
   isCharArray,
+  isClass,
   isHandle,
   isHomogeneousCell,
   isMultiElement,
@@ -194,6 +196,23 @@ export function ownedOps(ty: MType): OwnedKindOps | null {
       assign: p(`${name}_assign`),
       copy: () => p(`${name}_copy`),
       disp: () => p(`${name}_disp`),
+    };
+  }
+  if (isClass(ty)) {
+    const name = classMangledName(ty);
+    // Classes follow the struct pattern: helpers emitted by
+    // `emitClass.ts` directly into the output (one set per distinct
+    // class shape). `disp` is intentionally absent for Stage 1 —
+    // class-instance disp matches numbl's `formatClassInstance` but
+    // that formatter isn't ported yet; the Disp IRStmt arm rejects
+    // class-typed args with a clear span until that lands.
+    return {
+      cType: name,
+      structSnippet: p(name),
+      empty: p(`${name}_empty`),
+      free: p(`${name}_free`),
+      assign: p(`${name}_assign`),
+      copy: () => p(`${name}_copy`),
     };
   }
   return null;

@@ -542,16 +542,28 @@ export function isClass(t: MType): t is ClassType {
   return t.kind === "Class";
 }
 
-/** Mangled C typedef name for a class shape.
- *  `_mtoc_class__<className>__<8hex>` where the hex is FNV-1a over the
- *  canonical {className, file, properties} tuple. The `<className>`
- *  segment is purely cosmetic (makes the generated C self-documenting);
- *  uniqueness is guaranteed by the hash. */
+/** Mangled C typedef name for a class shape. The hash is over
+ *  `(className, file, [(propName, cType-string-or-canonical), ...])`.
+ *  Property types are coarsened to their C representation
+ *  (`cTypeFor`) when present so that two class instances of the same
+ *  class whose property types differ only in unify-coarsenable detail
+ *  (sign, etc.) share a single C typedef. Without this coarsening, a
+ *  constructor's `obj` param (initial property type) and its return
+ *  value (post-mutation property type) would have different typedefs
+ *  and `return obj;` would fail to type-check.
+ *
+ *  When `cTypeFor` returns null (unknown / void), fall back to the
+ *  full canonical hash so two distinct "unknown" property positions
+ *  don't accidentally collide. */
 export function classMangledName(t: ClassType): string {
+  const propShard = t.properties.map(p => {
+    const c = cTypeFor(p.type);
+    return [p.name, c ?? canonicalizeType(p.type)];
+  });
   const canonical = JSON.stringify({
     className: t.className,
     file: t.file,
-    properties: t.properties.map(p => [p.name, canonicalizeType(p.type)]),
+    properties: propShard,
   });
   const safeName = t.className.replace(/[^A-Za-z0-9_]/g, "_");
   return `_mtoc_class__${safeName}__${fnv1a32Hex(canonical)}`;

@@ -25,6 +25,7 @@ import { Lowerer } from "./lower.js";
 import { decodeNumblQuotedLexeme } from "./lexerHelpers.js";
 import type { StructShape } from "./structPrePass.js";
 import {
+  isClass,
   isMultiElement,
   isNumeric,
   isScalarReal,
@@ -107,27 +108,19 @@ export function lowerMemberRead(
   } else {
     cur = this.lowerExpr(base);
   }
-  if (!isStruct(cur.ty)) {
+  if (!isStruct(cur.ty) && !isClass(cur.ty)) {
     throw new UnsupportedConstruct(
-      `field access requires a struct base (got ${typeToString(cur.ty)})`,
+      `field access requires a struct or class base (got ${typeToString(cur.ty)})`,
       e.span
     );
   }
   let curTy: MType = cur.ty;
   for (let i = 0; i < path.length; i++) {
     const fieldName = path[i];
-    if (!isStruct(curTy)) {
+    const leafTy = lookupMemberType(curTy, fieldName);
+    if (leafTy === null) {
       throw new TypeError(
-        `'${typeToString(curTy)}' has no field '.${fieldName}'`,
-        e.span
-      );
-    }
-    const field: { name: string; type: MType } | undefined = curTy.fields.find(
-      ff => ff.name === fieldName
-    );
-    if (!field) {
-      throw new TypeError(
-        `struct '${typeToString(curTy)}' has no field '${fieldName}'`,
+        `${describeForMemberError(curTy)} has no member '.${fieldName}'`,
         e.span
       );
     }
@@ -135,12 +128,33 @@ export function lowerMemberRead(
       kind: "MemberLoad",
       base: cur,
       field: fieldName,
-      ty: field.type,
+      ty: leafTy,
       span: e.span,
     };
-    curTy = field.type;
+    curTy = leafTy;
   }
   return cur;
+}
+
+/** Look up a struct field or class property by name on `ty`. Returns
+ *  null when `ty` isn't struct/class or the name isn't declared. */
+function lookupMemberType(ty: MType, name: string): MType | null {
+  if (isStruct(ty)) {
+    const f = ty.fields.find(ff => ff.name === name);
+    return f ? f.type : null;
+  }
+  if (isClass(ty)) {
+    const p = ty.properties.find(pp => pp.name === name);
+    return p ? p.type : null;
+  }
+  return null;
+}
+
+/** Short human-readable description of a type for member-access errors. */
+function describeForMemberError(ty: MType): string {
+  if (isClass(ty)) return `class instance '${ty.className}'`;
+  if (isStruct(ty)) return `struct '${typeToString(ty)}'`;
+  return `value of type '${typeToString(ty)}'`;
 }
 
 /** Lower `s.f = rhs` (possibly chained: `outer.inner.x = rhs`).
@@ -172,6 +186,20 @@ export function lowerMemberStore(
     );
   }
   const rootName = base.name;
+  // Class roots route through the class-specific path: declared
+  // properties come from `ClassInfo`, not from a pre-pass walk, and
+  // the per-property type tracking lives on `Lowerer.class`. Struct
+  // roots take the existing shape-driven path below.
+  if (this.class.roots.has(rootName)) {
+    return lowerClassMemberStore.call(
+      this,
+      rootName,
+      path,
+      base.span,
+      rhsExpr,
+      span
+    );
+  }
   // Verify the pre-pass identified this root as a struct, with this
   // field path. The pre-pass already accumulated the union of fields
   // across the body, so any path that surfaces here must already be
@@ -266,6 +294,70 @@ export function lowerMemberStore(
     kind: "MemberStore",
     base: baseVar,
     fieldPath: path,
+    leafTy: finalTy,
+    rhs,
+    span,
+  };
+}
+
+/** Class-specific member-store path. Used when the root variable is
+ *  already known to be a class instance (its declared property set
+ *  comes from `ClassInfo`, not from a body-walking pre-pass).
+ *
+ *  Only single-step paths (`obj.prop = rhs`) are supported in Stage 1.
+ *  Nested property paths (`obj.inner.prop = rhs`) require nested
+ *  ClassType which Stage 1 doesn't produce. */
+function lowerClassMemberStore(
+  this: Lowerer,
+  rootName: string,
+  path: ReadonlyArray<string>,
+  baseSpan: Span,
+  rhsExpr: Expr,
+  span: Span
+): IRStmt {
+  const info = this.class.roots.get(rootName)!;
+  if (path.length !== 1) {
+    throw new UnsupportedConstruct(
+      `nested property assignment ('${rootName}.${path.join(".")} = …') ` +
+        `is not yet supported for class instances; assign through a single ` +
+        `property at a time`,
+      span
+    );
+  }
+  const propName = path[0];
+  if (!info.propertyNames.includes(propName)) {
+    throw new TypeError(
+      `class '${info.qualifiedName}' has no property '${propName}'`,
+      span
+    );
+  }
+  const rhs = this.lowerExpr(rhsExpr);
+
+  const propTypes = this.class.ensurePropertyTypes(rootName);
+  const prior = propTypes.get(propName);
+  const finalTy: MType = prior === undefined ? rhs.ty : unify(prior, rhs.ty);
+  if (finalTy.kind === "Unknown") {
+    throw new TypeError(
+      `'${rootName}.${propName} = …': cannot unify prior property type ` +
+        `${typeToString(prior!)} with new RHS type ${typeToString(rhs.ty)}`,
+      span
+    );
+  }
+  propTypes.set(propName, finalTy);
+
+  const newRootTy = this.class.lookupClassTypeFor(rootName)!;
+  const cName = this.recordAssignment(rootName, newRootTy, span);
+  const baseVar: Extract<IRExpr, { kind: "Var" }> = {
+    kind: "Var",
+    name: rootName,
+    cName,
+    ty: newRootTy,
+    span: baseSpan,
+  };
+  return {
+    kind: "MemberStore",
+    base: baseVar,
+    fieldPath: [propName],
     leafTy: finalTy,
     rhs,
     span,

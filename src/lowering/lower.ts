@@ -36,6 +36,7 @@ import {
   absentDefaultFor,
   canShareStorage,
   isCell,
+  isClass,
   isHandle,
   isMultiElement,
   isOwned,
@@ -56,6 +57,8 @@ import {
 } from "./types.js";
 
 import { StructLoweringState } from "./structLoweringState.js";
+import { ClassLoweringState } from "./classLoweringState.js";
+import { lowerClassMethodCall } from "./lowerClass.js";
 import {
   lowerMemberRead,
   lowerMemberStore,
@@ -207,6 +210,11 @@ export class Lowerer {
    *  `_mtoc_stmt_discard_<N>` binding. Per-scope so different functions
    *  don't share numbering. */
   private discardCounter = 0;
+  /** Counter for the synthetic `_mtoc_class_init_<N>` bindings created
+   *  at every class-constructor call site (the receiver-as-first-param
+   *  initial value). Per-scope so different functions don't share
+   *  numbering. */
+  private classInitCounter = 0;
   /** Names of params for the current scope (function scope only). */
   private params: ReadonlySet<string>;
   /** Output variables for the current function scope, in declaration
@@ -249,6 +257,19 @@ export class Lowerer {
    *  stays slim and so the future `ClassLoweringState` can slot in
    *  alongside in the same shape. See `structLoweringState.ts`. */
   struct = new StructLoweringState();
+
+  /** Per-scope class-lowering state — root vars whose values are
+   *  class instances, plus per-property type tracking. Mirrors the
+   *  struct state but the declared property set comes from
+   *  `ClassInfo` rather than a body-walking pre-pass. */
+  class_ = new ClassLoweringState();
+
+  /** Alias for `class_`. `class` is a reserved word in TS so the
+   *  field can't be named `class` directly, but a getter under that
+   *  name reads cleanly at call sites (`this.class.roots`, etc.). */
+  get class(): ClassLoweringState {
+    return this.class_;
+  }
 
   /** Per-scope cell-lowering state — pre-pass tuple-vs-homogeneous
    *  decision per root variable that ever appears as a cell. See
@@ -451,7 +472,12 @@ export class Lowerer {
       // assignedVars or env; keeping env in sync here avoids a
       // discrepancy between the at-time captured type and the
       // post-normalize typedef.
-      if (isStruct(merged) || isHandle(merged) || isCell(merged)) {
+      if (
+        isStruct(merged) ||
+        isHandle(merged) ||
+        isCell(merged) ||
+        isClass(merged)
+      ) {
         this.env.set(name, merged);
       }
       return prevBinding.cName;
@@ -468,7 +494,10 @@ export class Lowerer {
     // consistent. Pure numeric → numeric mismatches still fall into
     // the split / error path below since `canShareStorage` rejects
     // them.
-    if (canShareStorage(prevBinding.ty, ty) && (isStruct(ty) || isCell(ty))) {
+    if (
+      canShareStorage(prevBinding.ty, ty) &&
+      (isStruct(ty) || isCell(ty) || isClass(ty))
+    ) {
       this.assignedVars.set(prevBinding.cName, {
         ty,
         cName: prevBinding.cName,
@@ -524,6 +553,24 @@ export class Lowerer {
     const ty = rhs.ty;
     this.assignedVars.set(cName, { ty, cName });
     return { kind: "Assign", name: cName, cName, rhs, ty, span };
+  }
+
+  /** Mint a fresh `_mtoc_class_init_<N>` id. Used by `lowerClass`
+   *  to give each constructor call's synthetic receiver a unique
+   *  binding. */
+  nextClassInitId(): number {
+    return this.classInitCounter++;
+  }
+
+  /** Register a synthetic var (one not referenced by MATLAB-source
+   *  name) in `assignedVars` so the standard predeclaration + free
+   *  walks pick it up. Returns the cName (same as `baseName` today;
+   *  reserved-prefix synthetic names don't go through `cNameFor`).
+   *  Used by `lowerClass` to install the constructor receiver's
+   *  initial empty value. */
+  registerSyntheticBinding(baseName: string, ty: MType): string {
+    this.assignedVars.set(baseName, { cName: baseName, ty });
+    return baseName;
   }
 
   /**
@@ -699,6 +746,22 @@ export class Lowerer {
         // `s.y = 2` both reference the same `Struct{x,y}` typedef.
         let rhsTy = rhs.ty;
         let assignRhs = rhs;
+        // If the RHS is class-typed, register the LHS in the class
+        // state so subsequent `s.<prop>` reads/writes find the
+        // declared property set. This is the analog of the struct
+        // pre-pass: for classes, the shape comes from `ClassInfo`,
+        // not from a body-walking pre-pass, so the registration
+        // happens here at assignment time.
+        if (isClass(rhsTy)) {
+          const info = this.shared.workspace.ctx.getClassInfo(rhsTy.className);
+          if (info !== null) {
+            this.class.registerRoot(s.name, info);
+            const propTypes = this.class.ensurePropertyTypes(s.name);
+            for (const p of rhsTy.properties) {
+              if (!propTypes.has(p.name)) propTypes.set(p.name, p.type);
+            }
+          }
+        }
         if (rhs.kind === "StructLit" && this.struct.shapes.has(s.name)) {
           // Refresh the per-field tracking with the constructor's fields.
           const fieldTypes = this.struct.ensureFieldTypes(s.name);
@@ -1136,15 +1199,37 @@ export class Lowerer {
           e.span
         );
 
-      case "MethodCall":
+      case "MethodCall": {
         // The parser produces `MethodCall { base, name, args }` for
-        // `obj.name(args)`. Today the only shape mtoc accepts is
-        // `<struct>.<tensorField>(<scalar indices>)` — a field-then-
-        // index read — handled by `lowerStructFieldIndex`. When class
-        // support lands, dispatch here will try class-method first and
-        // fall through to the struct-field-index helper for non-class
-        // bases.
+        // `obj.name(args)`. We try class-method dispatch first: if the
+        // base lowers to a `ClassType`, route through
+        // `lowerClassMethodCall`, which calls
+        // `Workspace.resolveForTargetClass`. Otherwise fall through to
+        // `lowerStructFieldIndex`, which handles the legacy
+        // `<struct>.<tensorField>(<scalar indices>)` field-then-index
+        // shape.
+        if (e.base.type === "Ident") {
+          const baseTy = this.envLookup(e.base.name);
+          if (baseTy !== undefined && isClass(baseTy)) {
+            const receiverIR: IRExpr = {
+              kind: "Var",
+              name: e.base.name,
+              cName: this.currentCNameFor(e.base.name),
+              ty: baseTy,
+              span: e.base.span,
+            };
+            return lowerClassMethodCall.call(
+              this,
+              baseTy,
+              receiverIR,
+              e.name,
+              e.args,
+              e.span
+            );
+          }
+        }
         return lowerStructFieldIndex.call(this, e);
+      }
 
       case "Range":
         return this.lowerBareRange(e);
@@ -1280,10 +1365,12 @@ export function lower(
       workspace.registerLocalFunction(s);
       functionStmts.push(s);
     } else if (s.type === "ClassDef") {
-      throw new UnsupportedConstruct(
-        `top-level 'classdef' in the entry file is not yet supported by mtoc`,
-        s.span
-      );
+      // Local class: register on the vendored ctx so the resolver
+      // sees it. The actual class lowering (constructor / method
+      // specialization) happens lazily when a call to the class
+      // resolves through Workspace.resolve. Local classdefs don't
+      // emit any direct IR — they're metadata for the resolver.
+      workspace.ctx.registerLocalClass(s);
     } else if (s.type === "Import") {
       throw new UnsupportedConstruct(
         `'import' statements are not yet supported by mtoc`,

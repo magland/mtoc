@@ -300,8 +300,9 @@ workaround or a roadmap note.
   - **Char function parameters and char return types.** User
     functions still require scalar-numeric returns.
   - **Most char builtins**: `upper`, `lower`, `num2str`, etc.
-- **No classes.** (Cell arrays are supported — see the dedicated
-  "Cell arrays" section below.)
+- **Classes are partial.** Value-semantics classdef with a constructor
+  and instance methods is supported — see the dedicated "Classes"
+  section below for the precise gaps.
 - **`fprintf` and `sprintf` partial**: the format engine
   (`runtime/format_engine.h`) mirrors numbl's `sprintfFormat`
   byte-for-byte (spec set `d i u f e E g s c x X o %`, flags
@@ -426,6 +427,57 @@ The cross-kind typedef ordering is handled by a unified topological sort
   decided by the pre-pass at "first sign of homogeneity wins" — any
   non-literal index or empty literal flips the variable to
   homogeneous for its entire scope.
+
+## Classes
+
+mtoc supports value-semantics `classdef` with constructors, instance
+methods, and property reads/writes. Dispatch is fully delegated to
+numbl's vendored `resolveFunction` — mtoc never decides which method
+is called; it adapts MType to ItemType, calls the resolver, and
+consumes the verdict. Both call syntaxes work:
+
+- `obj.method(args)` — `Workspace.resolveForTargetClass` pins
+  dispatch into `obj`'s class.
+- `method(obj, args)` — the resolver runs its full precedence walk
+  (local function > private > class method > workspace function >
+  builtin); class dispatch wins only if the class declares the
+  method AND no higher-precedence rule fires first.
+
+### Out of scope for v1 (documented gaps)
+
+- **Handle classes** (`classdef X < handle`) — reference semantics
+  need a different ABI (refcount or arena allocation); rejected at
+  call sites with a span.
+- **Inheritance** — `classdef Child < Parent` is rejected. Super-
+  calls and method override are deferred to Stage 4.
+- **Static methods** — `ClassName.method(args)` syntax and `Static`
+  attribute methods rejected at class-info validation.
+- **Operator overloads** — `plus`, `minus`, `mtimes`, `eq`,
+  `subsref`, `subsasgn`, `horzcat`, `vertcat`, `numel`, `size`,
+  `length`, etc. defined as methods cause the class to reject at
+  the call site.
+- **External method files** (`@ClassName/method.m`) rejected; only
+  classdef-inline methods work.
+- **`disp(obj)`** — `formatClassInstance` matching numbl
+  byte-for-byte isn't ported yet; the `Disp` IR arm rejects
+  class-typed args with a span. Use `disp(obj.<prop>)` per
+  property.
+- **Constructor with no explicit constructor function** — Stage 1
+  requires a user-declared constructor. The implicit zero-arg form
+  is not yet supported.
+- **Class arrays** — `obj(i)`, indexed construction, etc.
+  Scalar-only.
+- **Nested class properties** — assigning through
+  `obj.inner.prop = ...` where `inner` is itself a class instance
+  is not yet supported; assign through one property at a time.
+- **Branch-divergent class identity** for a single variable —
+  rejected by the same storage-category rule structs / handles
+  enforce.
+- **Constant / Dependent properties**, `get.X` / `set.X` accessor
+  methods.
+- **Introspection builtins**: `isa`, `class(obj)`, `isobject`,
+  `isstruct(obj)`, `properties(obj)`, `methods(obj)`, etc.
+- **`Constant` class properties** as `ClassName.NAME` reads.
 
 ## Codegen
 
