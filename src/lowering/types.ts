@@ -85,7 +85,19 @@ export interface NumericType {
   dims: readonly DimInfo[];
   /** Meaningful only when `isComplex === false`; "unknown" otherwise. */
   sign: Sign;
+  /** Statically-known exact value for SCALAR types only. Carrier:
+   *    - real double scalar           → `number`
+   *    - complex double scalar        → `{ re: number; im: number }`
+   *    - scalar char                  → one-character `string`
+   *  Non-scalar types and tensors MUST leave this undefined.
+   *  Stage A: literal lowering sites auto-fill it; no consumers
+   *  (constant folding, predictor tightening, spec-key effects) read
+   *  it yet — those land in follow-ups. */
+  exact?: NumericExact;
 }
+
+/** The shape of `NumericType.exact`. See the field doc. */
+export type NumericExact = number | { re: number; im: number } | string;
 
 /** Normalize a dims array to satisfy the `length >= 2` invariant by
  *  padding with `{kind: "one"}`, and strip trailing singletons above
@@ -126,9 +138,21 @@ function normalizeComplexSign(t: NumericType): NumericType {
  */
 export interface StringType {
   kind: "String";
+  /** Statically-known exact string value, when the type came from a
+   *  string literal (or any future producer that can pin the value).
+   *  Stage A: auto-filled at literal lowering; no consumers read it
+   *  yet. `unify` drops it when two strings carry different exacts. */
+  exact?: string;
 }
 
+/** Canonical "unknown-value" string type. Use `stringType(value)`
+ *  when you have a statically-known exact value. */
 export const STRING: StringType = { kind: "String" };
+
+/** Construct a string type, optionally pinned to an exact value. */
+export function stringType(exact?: string): StringType {
+  return exact === undefined ? STRING : { kind: "String", exact };
+}
 
 /**
  * Scalar struct type. mtoc supports scalar structs (no struct arrays):
@@ -598,9 +622,11 @@ export const SCALAR_CHAR: NumericType = {
   sign: "unknown",
 };
 
-/** Construct a scalar char type. */
-export function scalarChar(): NumericType {
-  return SCALAR_CHAR;
+/** Construct a scalar char type. Pass `exact` (a single-char string)
+ *  when the value is statically known from a literal. */
+export function scalarChar(exact?: string): NumericType {
+  if (exact === undefined) return SCALAR_CHAR;
+  return { ...SCALAR_CHAR, exact };
 }
 
 /** Construct a 1×N char-array type with the given cols DimInfo. */
@@ -614,21 +640,27 @@ export function charArrayType(cols: DimInfo): NumericType {
   };
 }
 
-export function scalarDouble(sign: Sign = "unknown"): NumericType {
-  return { ...SCALAR_DOUBLE, sign };
+export function scalarDouble(
+  sign: Sign = "unknown",
+  exact?: number
+): NumericType {
+  if (exact === undefined) return { ...SCALAR_DOUBLE, sign };
+  return { ...SCALAR_DOUBLE, sign, exact };
 }
 
 /** Construct a complex scalar (1×1 complex double). Sign is forced to
  *  "unknown" to honor the invariant that sign is meaningless on
- *  complex types. */
-export function scalarComplex(): NumericType {
-  return {
+ *  complex types. Pass `exact` when both the real and imaginary parts
+ *  are statically known. */
+export function scalarComplex(exact?: { re: number; im: number }): NumericType {
+  const base: NumericType = {
     kind: "Numeric",
     elem: "double",
     isComplex: true,
     dims: [DIM_ONE, DIM_ONE],
     sign: "unknown",
   };
+  return exact === undefined ? base : { ...base, exact };
 }
 
 /** Construct a row-vector type. The cols dim is `notOne` (i.e.
@@ -1358,9 +1390,13 @@ export function unify(a: MType, b: MType): MType {
   // categories, and `recordAssignment` will pick that up at the
   // first such reassignment.
   if (a.kind === "String" || b.kind === "String") {
-    return a.kind === "String" && b.kind === "String"
-      ? STRING
-      : { kind: "Unknown" };
+    if (a.kind !== "String" || b.kind !== "String") return { kind: "Unknown" };
+    // Preserve exact iff both sides agree; otherwise widen to the
+    // unspecific STRING handle.
+    if (a.exact !== undefined && b.exact !== undefined && a.exact === b.exact) {
+      return stringType(a.exact);
+    }
+    return STRING;
   }
   // Handle: two handles unify iff both their target identity AND
   // their capture shape match — the C struct layout depends on the
@@ -1464,7 +1500,37 @@ export function unify(a: MType, b: MType): MType {
   for (const f of NUMERIC_FIELDS) {
     if (!f.joinInto(a, b, out)) return { kind: "Unknown" };
   }
-  return normalizeComplexSign(out as unknown as NumericType);
+  let result = normalizeComplexSign(out as unknown as NumericType);
+  // Preserve `exact` only when both sides agree AND the unified
+  // shape is still a scalar. A scalar+tensor merge widens shape so
+  // the result is no longer a scalar — and `exact` is invariantly
+  // scalar-only. Two scalars with different exact values drop it.
+  if (
+    a.exact !== undefined &&
+    b.exact !== undefined &&
+    isScalar(result) &&
+    numericExactsEqual(a.exact, b.exact)
+  ) {
+    result = { ...result, exact: a.exact };
+  }
+  return result;
+}
+
+/** Structural equality for two `NumericExact` carriers. Used by
+ *  `unify` to decide whether to preserve the exact value across a
+ *  join. Treats `{re, im}` as a pair (NaN is never equal to NaN —
+ *  matches numbl's "no exact for NaN" rule). */
+function numericExactsEqual(a: NumericExact, b: NumericExact): boolean {
+  if (typeof a === "number" && typeof b === "number") {
+    return a === b;
+  }
+  if (typeof a === "string" && typeof b === "string") {
+    return a === b;
+  }
+  if (typeof a === "object" && typeof b === "object") {
+    return a.re === b.re && a.im === b.im;
+  }
+  return false;
 }
 
 export type ArithKind = "Add" | "Sub" | "Mul" | "Div";
@@ -1673,7 +1739,11 @@ function dimToString(d: DimInfo): string {
 export function typeToString(t: MType): string {
   if (t.kind === "Unknown") return "Unknown";
   if (t.kind === "Void") return "Void";
-  if (t.kind === "String") return "String";
+  if (t.kind === "String") {
+    return t.exact === undefined
+      ? "String"
+      : `String(=${JSON.stringify(t.exact)})`;
+  }
   if (t.kind === "Handle") {
     let label: string;
     switch (t.target.kind) {
@@ -1713,5 +1783,14 @@ export function typeToString(t: MType): string {
   // NUMERIC_FIELDS entries for rows/cols contribute empty fragments.
   const dims = t.dims.map(dimToString).join("x");
   const fragments = NUMERIC_FIELDS.map(f => f.format(t)).filter(s => s !== "");
+  if (t.exact !== undefined) {
+    fragments.push(`exact=${formatNumericExact(t.exact)}`);
+  }
   return `Numeric<${cat}(${dims}), ${fragments.join(", ")}>`;
+}
+
+function formatNumericExact(v: NumericExact): string {
+  if (typeof v === "number") return String(v);
+  if (typeof v === "string") return JSON.stringify(v);
+  return `${v.re}${v.im >= 0 ? "+" : ""}${v.im}i`;
 }

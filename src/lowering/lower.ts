@@ -50,7 +50,7 @@ import {
   scalarComplex,
   scalarDouble,
   signFromValue,
-  STRING,
+  stringType,
   typeToString,
   unify,
   type DimInfo,
@@ -1021,7 +1021,7 @@ export class Lowerer {
         return {
           kind: "NumLit",
           value: n,
-          ty: scalarDouble(signFromValue(n)),
+          ty: scalarDouble(signFromValue(n), n),
           span: e.span,
         };
       }
@@ -1043,7 +1043,7 @@ export class Lowerer {
         return {
           kind: "StringLit",
           value: inner,
-          ty: STRING,
+          ty: stringType(inner),
           span: e.span,
         };
       }
@@ -1071,7 +1071,10 @@ export class Lowerer {
         }
         const n = inner.length;
         const cols: DimInfo = n === 1 ? { kind: "one" } : { kind: "notOne" };
-        const ty: NumericType = n === 1 ? scalarChar() : charArrayType(cols);
+        // Scalar char literals carry the exact byte; multi-char
+        // arrays don't (`exact` is scalar-only by invariant).
+        const ty: NumericType =
+          n === 1 ? scalarChar(inner) : charArrayType(cols);
         return { kind: "CharLit", value: inner, ty, span: e.span };
       }
 
@@ -1108,7 +1111,7 @@ export class Lowerer {
         return {
           kind: "ImagLit",
           value: 1,
-          ty: scalarComplex(),
+          ty: scalarComplex({ re: 0, im: 1 }),
           span: e.span,
         };
       }

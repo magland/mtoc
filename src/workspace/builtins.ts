@@ -2058,6 +2058,24 @@ function lowerComplexCtor(
     }
     resultTy = numericTypeND(broadcasted.dims, true, "unknown", "double");
   }
+  // Pin the result's exact value when both arg expressions are
+  // numeric literals (so `complex(3, 4)` types as scalar complex
+  // exact=3+4i). Only scalar shapes can carry exact, and the
+  // result must be scalar — both checks below.
+  if (isScalar(resultTy)) {
+    if (
+      args.length === 2 &&
+      args[0].kind === "NumLit" &&
+      args[1].kind === "NumLit"
+    ) {
+      resultTy = {
+        ...resultTy,
+        exact: { re: args[0].value, im: args[1].value },
+      };
+    } else if (args.length === 1 && args[0].kind === "NumLit") {
+      resultTy = { ...resultTy, exact: { re: args[0].value, im: 0 } };
+    }
+  }
   const params: ParamConstraint[] = args.map(() => ({
     shape: "scalar" as const,
     domain: null,

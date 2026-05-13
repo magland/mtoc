@@ -79,6 +79,24 @@ and the N-D factory `numericTypeND(dims, …)`) keeps lowering call sites
 short. The vec/scalar variants no longer take a numeric `n` — dims are
 categorical and each axis is `one`, `notOne`, or `unknown`.
 
+### Exact value tracking (scalar only)
+
+`NumericType.exact` is an optional carrier for a statically-known scalar
+value. It is invariantly scalar-only — non-scalar shapes must leave it
+unset. Three carriers depending on `elem`/`isComplex`:
+
+- real double scalar (`elem: "double"`, `!isComplex`) → `number`
+- complex double scalar (`elem: "double"`, `isComplex`) → `{re, im}`
+- scalar char (`elem: "char"`, scalar shape) → one-character `string`
+
+Today the field is filled in only at literal lowering sites (number /
+string / char / `1i` / `complex(re, im)` with literal args) and
+threaded through `unify` (preserve when both sides agree, drop when they
+differ or when the merged shape is no longer scalar). `canonicalizeType`
+deliberately ignores it so spec keys are unaffected — current consumers
+treat it as a witness available for future use (constant folding,
+predictor tightening, spec-key effects).
+
 ## DimInfo
 
 ```
@@ -120,8 +138,10 @@ StringType { kind: "String" }
 
 A scalar handle to a UTF-8 byte buffer. There are no shape fields — mtoc
 treats string as scalar-only; arrays of strings (numbl's `["a", "b"]` form)
-are deferred. The `STRING` constant is the singleton instance every string
-expression carries.
+are deferred. The `STRING` constant is the no-`exact` singleton; use the
+`stringType(value)` factory when you have a statically-known exact value
+(see the "Exact value tracking" note under NumericType — strings carry
+exact via the `StringType.exact?: string` field on the same plumbing).
 
 Codegen picks `mtoc_string_t` for any `StringType` (see `cTypeFor`). The
 struct is `{ const char *data; long len; int owned; }`: literals point at

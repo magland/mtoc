@@ -118,7 +118,7 @@ export function lowerBinary(
     return {
       kind: "ImagLit",
       value: left.value,
-      ty: scalarComplex(),
+      ty: scalarComplex({ re: 0, im: left.value }),
       span: e.span,
     };
   }
