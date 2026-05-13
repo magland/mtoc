@@ -141,6 +141,13 @@ key for the IDE to reconnect.
 The `mode` argument switches between the native SSE path
 (`utils/remoteExecution.ts`) and the wasm path (`utils/wasmExecution.ts`).
 
+`status` covers both phases of the wasm path: it flips to `"compiling"`
+while the C is in flight to the wasm service (and back to `"running"`
+once we hand the artifact to the worker), so the console pill and the
+Run/Stop button can reflect "we're waiting on the network, not on your
+program." On a cache hit the compile leg is skipped and `status` stays
+on `"running"` the whole way through.
+
 ### WASM mode — public compile service
 
 The wasm path is intentionally out-of-process for compilation. mtoc
@@ -161,12 +168,22 @@ The flow:
 3. The service shells out to `emcc` and returns `{ok: true, wasm: <base64>,
 glue: <text>, meta: {...}}` on success, or `{ok: false, phase: "compile",
 stderr}` on emcc failure.
-4. Browser decodes the wasm bytes, builds a Blob URL for the Emscripten
-   ES-module glue, dynamically imports it, and calls
+4. Browser hands the wasm bytes + glue text to a dedicated Web Worker
+   (`src/utils/wasmRunner.worker.ts`). The worker builds a Blob URL for
+   the Emscripten ES-module glue, dynamically imports it, and calls
    `createMtocModule({wasmBinary, locateFile, print, printErr, onExit,
-onAbort})`. `print` / `printErr` route into the same `ConsoleLine[]`
-   the SSE path feeds. `_main` runs at instantiation time (Emscripten's
-   `-sINVOKE_RUN=1` default) and the factory resolves once it exits.
+onAbort})`. `print` / `printErr` `postMessage` back to the main thread,
+   which routes them into the same `ConsoleLine[]` the SSE path feeds.
+   `_main` runs at instantiation time (Emscripten's `-sINVOKE_RUN=1`
+   default) and the factory resolves once it exits.
+
+Running off the main thread is what makes the Stop button actually work
+for long-running numbl programs. A tight loop in the wasm would otherwise
+block the main thread (including the UI's own click handler), so any
+cooperative cancel flag is useless. With the worker, Stop translates to
+`worker.terminate()`, which kills the wasm regardless of what it's
+doing. (Stop during the compile-service fetch instead aborts the
+`AbortController` shared with `fetch`.)
 
 `locateFile` is required because the glue otherwise tries
 `new URL("out.wasm", import.meta.url)` against a `blob:` base, which

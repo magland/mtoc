@@ -19,6 +19,8 @@ function statusLabel(status: RunStatus): string {
   switch (status) {
     case "idle":
       return "Console — click Run to compile and execute";
+    case "compiling":
+      return "Compiling WASM…";
     case "running":
       return "Running…";
     case "success":

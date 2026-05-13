@@ -19,6 +19,12 @@ export type ConnectionStatus =
 
 export type RunStatus =
   | "idle"
+  /** Wasm-mode only: the translated C is in flight to the public
+   *  compile service and we're waiting on the wasm bytes back.
+   *  Separate from "running" so the UI can tell the user that the
+   *  current latency is the network round trip, not anything the
+   *  program itself is doing. */
+  | "compiling"
   | "running"
   | "success"
   | "error"
@@ -122,7 +128,7 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
       mode: ExecutionMode,
       opts: RunOptions = {}
     ) => {
-      if (status === "running") return;
+      if (status === "running" || status === "compiling") return;
 
       setLines([]);
       setStatus("running");
@@ -147,7 +153,17 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
             optLevel: opts.optLevel ?? "O3",
           },
           wasmUrl,
-          abort.signal
+          abort.signal,
+          {
+            // Flip to "compiling" only when the build actually goes to
+            // the network. On a cache hit this never fires and we stay
+            // on "running" — the worker will be spawned almost
+            // instantly so the user never sees the intermediate state.
+            onCompileStart: () => {
+              setStatus("compiling");
+              append({ channel: "info", text: "[compiling WASM…]\n" });
+            },
+          }
         );
         if (!build.ok) {
           if (build.kind === "aborted") {
@@ -180,6 +196,10 @@ export function useRemoteExecution(): UseRemoteExecutionResult {
           return;
         }
 
+        // Compile leg done (or skipped on cache hit). Back to the
+        // "running" pill while the worker drives the wasm — important
+        // for the cache-miss path where status is currently "compiling".
+        setStatus("running");
         const result = await runWasm(
           build.artifact,
           { onEvent: handleEvent },
