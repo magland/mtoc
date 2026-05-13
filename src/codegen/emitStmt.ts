@@ -38,7 +38,12 @@ import {
   useSnippet,
   type EmitState,
 } from "./emitState.js";
-import { emitScopeExitFrees } from "./emitOwned.js";
+import {
+  emitOwnedAssign,
+  emitOwnedAwareSretWrites,
+  emitOwnedEmptyDecl,
+  emitScopeExitFrees,
+} from "./emitOwned.js";
 import {
   emitExpr,
   emitNdScalarOffset,
@@ -208,8 +213,6 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           emitEarlyFrees(state, level, deadAfterStmt(state, s));
           break;
         }
-        useSnippet(state, owned.structSnippet);
-        useSnippet(state, owned.assign);
         let rhsExpr: string;
         if (s.rhs.kind === "Var") {
           const copyHelper = owned.copy(s.rhs.ty);
@@ -227,11 +230,7 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         } else {
           rhsExpr = emitExpr(state, s.rhs, 0);
         }
-        pushStmt(
-          state,
-          level,
-          `${owned.assign.name}(&${s.cName}, ${rhsExpr});`
-        );
+        emitOwnedAssign(state, level, owned, `&${s.cName}`, rhsExpr);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
@@ -278,8 +277,6 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         // value via the kind's `assign` helper. If the RHS is a `Var`
         // of the same owned type, we deep-copy first so the field
         // gets its own buffer (value semantics).
-        useSnippet(state, owned.structSnippet);
-        useSnippet(state, owned.assign);
         if (s.rhs.kind === "Var") {
           const copyHelper = owned.copy(s.rhs.ty);
           useSnippet(state, copyHelper);
@@ -287,11 +284,7 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         } else {
           rhsExpr = emitExpr(state, s.rhs, 0);
         }
-        pushStmt(
-          state,
-          level,
-          `${owned.assign.name}(&${lhsAccess}, ${rhsExpr});`
-        );
+        emitOwnedAssign(state, level, owned, `&${lhsAccess}`, rhsExpr);
       } else {
         // Scalar leaf field: plain assignment. The RHS may also need
         // a struct-typed write for a nested field path where the
@@ -584,23 +577,15 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // Multi-output: write sret slots BEFORE the free walk. Owned
       // slots route through `mtoc_<kind>_assign` so the caller's
       // prior buffer at the lvalue is consumed; scalar slots use a
-      // plain pointer store.
+      // plain pointer store. The cName per slot is the LIVE
+      // post-body binding captured on the IR node (which may differ
+      // from outputs[i].cName after a top-level reassignment split).
       if (outputs.length >= 2) {
-        for (let i = 0; i < outputs.length; i++) {
-          const o = outputs[i];
-          const owned = ownedOps(o.ty);
-          if (owned !== null) {
-            useSnippet(state, owned.structSnippet);
-            useSnippet(state, owned.assign);
-            pushStmt(
-              state,
-              level,
-              `${owned.assign.name}(_mtoc_o${i}, ${s.outputCNames[i]});`
-            );
-          } else {
-            pushStmt(state, level, `*_mtoc_o${i} = ${s.outputCNames[i]};`);
-          }
-        }
+        emitOwnedAwareSretWrites(
+          state,
+          level,
+          outputs.map((o, i) => ({ ty: o.ty, cName: s.outputCNames[i] }))
+        );
       }
       emitScopeExitFrees(
         state,
@@ -695,13 +680,7 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           const tmp = `_mtoc_discard_${callIdx}_${i}`;
           const owned = ownedOps(slot.ty);
           if (owned !== null) {
-            useSnippet(state, owned.structSnippet);
-            useSnippet(state, owned.empty);
-            pushStmt(
-              state,
-              level + 1,
-              `${cTy} ${tmp} = ${owned.empty.name}();`
-            );
+            emitOwnedEmptyDecl(state, level + 1, owned, tmp);
             ownedDiscards.push({ cName: tmp, owned });
           } else {
             pushStmt(state, level + 1, `${cTy} ${tmp};`);

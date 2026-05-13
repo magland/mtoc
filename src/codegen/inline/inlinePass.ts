@@ -100,7 +100,11 @@
 
 import type { IRExpr, IRStmt, IRProgram } from "../../lowering/ir.js";
 import { isMultiElement, isNumeric } from "../../lowering/types.js";
-import { forEachStmtInTree, forEachSubExpr } from "../../lowering/walk.js";
+import {
+  forEachStmtInTree,
+  forEachSubExpr,
+  forEachTopLevelExpr,
+} from "../../lowering/walk.js";
 import { renderStmt } from "../irRender.js";
 
 /** Map from a SURVIVING consumer Assign's IRStmt to the ordered
@@ -349,8 +353,11 @@ function inlineOnePass(
 /** Walk a body's stmts (this level only — NOT into If/While/For
  *  bodies; nested inlining is handled separately) and count Var
  *  occurrences per cName. Function output cNames get a +1 bump
- *  so they are never inlined out. */
-function computeUseCounts(
+ *  so they are never inlined out.
+ *
+ *  Exported for unit tests; in normal codegen there's only one
+ *  caller (`inlineOnePass`). */
+export function computeUseCounts(
   stmts: ReadonlyArray<IRStmt>,
   protectedNames: ReadonlySet<string>
 ): Map<string, number> {
@@ -364,130 +371,30 @@ function computeUseCounts(
   return counts;
 }
 
-/** Count Var occurrences for `s` — including expressions inside
- *  nested If/While/For bodies, since a variable defined at this
- *  level is "used" if it's read in any nested scope. */
+/** Count Var occurrences reachable from `s` — including expressions
+ *  inside nested If/While/For bodies (a variable defined at this level
+ *  is "used" if any nested scope reads it).
+ *
+ *  Implemented over the shared walkers (`forEachStmtInTree` +
+ *  `forEachTopLevelExpr` + `forEachSubExpr`) so adding a new IRStmt
+ *  variant means updating one switch (in `walk.ts`) instead of also
+ *  patching this counter. The bug this rewrite fixes: the prior
+ *  hand-rolled switch had no `MemberStore` arm — Var reads in struct-
+ *  field-write RHS slipped past, undercounting them and causing the
+ *  inliner to silently skip opportunities crossing a property write. */
 function countVarRefsInStmt(s: IRStmt, bump: (cName: string) => void): void {
-  switch (s.kind) {
-    case "Assign":
-      forEachSubExpr(s.rhs, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      return;
-    case "ExprStmt":
-      forEachSubExpr(s.expr, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      return;
-    case "Disp":
-    case "Error":
-      forEachSubExpr(s.arg, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      return;
-    case "Assert":
-      forEachSubExpr(s.cond, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      if (s.msg !== null) {
-        forEachSubExpr(s.msg, e => {
-          if (e.kind === "Var") bump(e.cName);
-        });
-      }
-      return;
-    case "Fprintf":
-      forEachSubExpr(s.fmt, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      for (const a of s.args) {
-        forEachSubExpr(a, e => {
-          if (e.kind === "Var") bump(e.cName);
-        });
-      }
-      return;
-    case "If":
-      forEachSubExpr(s.cond, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      for (const eif of s.elseifs) {
-        forEachSubExpr(eif.cond, e => {
-          if (e.kind === "Var") bump(e.cName);
-        });
-        for (const t of eif.body) countVarRefsInStmt(t, bump);
-      }
-      for (const t of s.thenBody) countVarRefsInStmt(t, bump);
-      if (s.elseBody) {
-        for (const t of s.elseBody) countVarRefsInStmt(t, bump);
-      }
-      return;
-    case "While":
-      forEachSubExpr(s.cond, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      for (const t of s.body) countVarRefsInStmt(t, bump);
-      return;
-    case "For":
-      forEachSubExpr(s.start, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      forEachSubExpr(s.step, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      forEachSubExpr(s.end, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      for (const t of s.body) countVarRefsInStmt(t, bump);
-      return;
-    case "MultiAssignCall":
-      for (const a of s.args) {
-        forEachSubExpr(a, e => {
-          if (e.kind === "Var") bump(e.cName);
-        });
-      }
-      return;
-    case "IndexStore":
-      // Base is a Var read (read of struct handle) — count it.
-      bump(s.base.cName);
-      for (const idx of s.indices) {
-        forEachSubExpr(idx, e => {
-          if (e.kind === "Var") bump(e.cName);
-        });
-      }
-      forEachSubExpr(s.rhs, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      return;
-    case "IndexSliceStore":
-      bump(s.base.cName);
-      for (const slot of s.index) {
-        if (slot.kind === "Range") {
-          forEachSubExpr(slot.start, e => {
-            if (e.kind === "Var") bump(e.cName);
-          });
-          forEachSubExpr(slot.step, e => {
-            if (e.kind === "Var") bump(e.cName);
-          });
-          forEachSubExpr(slot.end, e => {
-            if (e.kind === "Var") bump(e.cName);
-          });
-        } else if (slot.kind === "Scalar") {
-          forEachSubExpr(slot.expr, e => {
-            if (e.kind === "Var") bump(e.cName);
-          });
-        }
-      }
-      forEachSubExpr(s.rhs, e => {
-        if (e.kind === "Var") bump(e.cName);
-      });
-      return;
-    case "Break":
-    case "Continue":
-      return;
-    case "ReturnFromFunction":
-      // Each output cName is read by the return.
-      for (const c of s.outputCNames) bump(c);
-      return;
-  }
+  forEachStmtInTree([s], stmt => {
+    forEachTopLevelExpr(stmt, e =>
+      forEachSubExpr(e, sub => {
+        if (sub.kind === "Var") bump(sub.cName);
+      })
+    );
+    // `ReturnFromFunction` carries cNames directly (not via an
+    // IRExpr), so `forEachTopLevelExpr` doesn't surface them.
+    if (stmt.kind === "ReturnFromFunction") {
+      for (const c of stmt.outputCNames) bump(c);
+    }
+  });
 }
 
 /** Predicate (gate 1+2): the producer is a multi-element real-double

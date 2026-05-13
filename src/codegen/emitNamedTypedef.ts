@@ -16,13 +16,9 @@
  * cell, …) meant a third file with the same shape.
  */
 
-import type { IRProgram, IRStmt } from "../lowering/ir.js";
+import type { IRProgram } from "../lowering/ir.js";
 import { cTypeFor, typeToString, type MType } from "../lowering/types.js";
-import {
-  forEachStmtInTree,
-  forEachSubExpr,
-  forEachTopLevelExpr,
-} from "../lowering/walk.js";
+import { collectMTypeShapes } from "../lowering/walk.js";
 import { ownedOps } from "./ownedKinds.js";
 import { useSnippet, type EmitState } from "./emitState.js";
 
@@ -100,41 +96,20 @@ export interface NamedTypedefSpec<T extends MType> {
 }
 
 /** Walk the whole program and collect every distinct shape of the
- *  named-typedef kind described by `spec`, indexed by mangled name. */
+ *  named-typedef kind described by `spec`, indexed by mangled name.
+ *  Thin wrapper over `collectMTypeShapes` (which lives alongside the
+ *  IR walkers in `walk.ts`); the spec supplies the predicate,
+ *  mangler, and per-shape nested-recurse hook. */
 function collectShapes<T extends MType>(
   prog: IRProgram,
   spec: NamedTypedefSpec<T>
 ): Map<string, T> {
-  const out: Map<string, T> = new Map();
-  const visit = (t: MType): void => {
-    if (!spec.isKind(t)) return;
-    const name = spec.mangledName(t);
-    if (!out.has(name)) {
-      out.set(name, t);
-      // Recurse into nested fields/captures so a struct-of-struct or
-      // handle-with-handle-capture also registers.
-      spec.visitNested(t, visit);
-    }
-  };
-  const visitExpr = (e: { ty: MType }): void => visit(e.ty);
-  const visitStmtTypes = (s: IRStmt): void => {
-    forEachTopLevelExpr(s, sub => forEachSubExpr(sub, visitExpr));
-    if (s.kind === "Assign") visit(s.ty);
-    if (s.kind === "MemberStore") {
-      visit(s.base.ty);
-      visit(s.leafTy);
-      visit(s.rhs.ty);
-    }
-  };
-  for (const fn of prog.functions) {
-    for (const p of fn.params) visit(p.ty);
-    for (const o of fn.outputs) visit(o.ty);
-    for (const v of fn.assignedVars.values()) visit(v.ty);
-    forEachStmtInTree(fn.body, visitStmtTypes);
-  }
-  for (const v of prog.assignedVars.values()) visit(v.ty);
-  forEachStmtInTree(prog.stmts, visitStmtTypes);
-  return out;
+  return collectMTypeShapes(
+    prog,
+    spec.isKind,
+    spec.mangledName,
+    spec.visitNested
+  );
 }
 
 /** Render one header-comment block: shape label, mangled name, and

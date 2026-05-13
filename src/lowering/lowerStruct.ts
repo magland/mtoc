@@ -25,138 +25,40 @@ import { Lowerer } from "./lower.js";
 import { decodeNumblQuotedLexeme } from "./lexerHelpers.js";
 import type { StructShape } from "./structPrePass.js";
 import {
+  isMultiElement,
+  isNumeric,
+  isScalarReal,
   isStruct,
+  scalarComplex,
   scalarDouble,
   structType,
   typeToString,
   unify,
   type MType,
-  type StructType,
 } from "./types.js";
 
 /** When a function parameter is a struct, seed the inner lowerer's
  *  per-root field-type tracking so member reads on the param work
  *  even before the body has assigned through it. Also augment the
  *  pre-pass struct-shape map to reflect the param's call-site shape.
- *  Recurses into nested-struct fields. No-op for non-struct types so
- *  callers can hand any param type through. */
+ *  No-op for non-struct types so callers can hand any param type
+ *  through. Thin wrapper over `StructLoweringState.seedFromStructType`. */
 export function seedStructParamFieldTypes(
   inner: Lowerer,
   rootName: string,
   ty: MType
 ): void {
-  if (!isStruct(ty)) return;
-  let shape = inner.structShapes.get(rootName);
-  if (shape === undefined) {
-    shape = { fields: new Map(), firstSpan: { file: "", start: 0, end: 0 } };
-    inner.structShapes.set(rootName, shape);
-  }
-  let fieldTypes = inner.structFieldTypes.get(rootName);
-  if (fieldTypes === undefined) {
-    fieldTypes = new Map();
-    inner.structFieldTypes.set(rootName, fieldTypes);
-  }
-  seedShape(shape, fieldTypes, ty, []);
-}
-
-function seedShape(
-  shape: StructShape,
-  fieldTypes: Map<string, MType>,
-  ty: StructType,
-  pathSoFar: string[]
-): void {
-  for (const f of ty.fields) {
-    const newPath = [...pathSoFar, f.name];
-    if (isStruct(f.type)) {
-      let nested = shape.fields.get(f.name);
-      if (nested === undefined || nested === null) {
-        nested = { fields: new Map(), firstSpan: shape.firstSpan };
-        shape.fields.set(f.name, nested);
-      }
-      seedShape(nested, fieldTypes, f.type, newPath);
-    } else {
-      if (!shape.fields.has(f.name)) {
-        shape.fields.set(f.name, null);
-      }
-      if (!fieldTypes.has(newPath.join("."))) {
-        fieldTypes.set(newPath.join("."), f.type);
-      }
-    }
-  }
-}
-
-/** Build the runtime `StructType` from a pre-pass shape, picking the
- *  current field types from `fieldTypes`. Fields the user has assigned
- *  show up as a real MType; fields the pre-pass identified but the
- *  user hasn't assigned yet stand in as `scalarDouble("zero")` so the
- *  struct's typedef can be emitted even when only a subset of fields
- *  has been written. */
-function buildStructType(
-  shape: StructShape,
-  fieldTypes: ReadonlyMap<string, MType>
-): StructType {
-  const fields: { name: string; type: MType }[] = [];
-  for (const [name, nested] of shape.fields) {
-    // If the user has directly recorded a type for this field (via
-    // either `s.<name> = <leaf>` or `s.<name> = <struct value>`),
-    // prefer that recorded type — it's the post-unify canonical
-    // form. Otherwise:
-    //   - if the pre-pass marked this field as nested, recurse into
-    //     the nested shape (filling sub-field types via dotted-path
-    //     lookups);
-    //   - if leaf-marked, fall back to scalarDouble("zero").
-    const direct = fieldTypes.get(name);
-    if (direct !== undefined) {
-      fields.push({ name, type: direct });
-      continue;
-    }
-    if (nested === null) {
-      fields.push({ name, type: scalarDouble("zero") });
-    } else {
-      const subTypes = subFieldMap(fieldTypes, name);
-      fields.push({ name, type: buildStructType(nested, subTypes) });
-    }
-  }
-  return structType(fields);
-}
-
-/** Extract the sub-map of nested-field types whose keys start with
- *  `prefix.` (returns the sub-keys with the prefix stripped). */
-function subFieldMap(
-  flat: ReadonlyMap<string, MType>,
-  prefix: string
-): Map<string, MType> {
-  const dotted = `${prefix}.`;
-  const out = new Map<string, MType>();
-  for (const [k, v] of flat) {
-    if (k.startsWith(dotted)) {
-      out.set(k.slice(dotted.length), v);
-    }
-  }
-  return out;
+  inner.struct.seedFromStructType(rootName, ty);
 }
 
 /** Update the lowerer's per-root field-type tracking so the next
- *  `lookupStructTypeForRoot` reflects the freshly-assigned field. */
+ *  `currentStructTypeFor` reflects the freshly-assigned field. */
 function recordFieldType(
   fieldTypes: Map<string, MType>,
   fieldPath: ReadonlyArray<string>,
   ty: MType
 ): void {
   fieldTypes.set(fieldPath.join("."), ty);
-}
-
-/** Look up the current static type of `rootName` in the lowerer's
- *  env, given the pre-pass shape. */
-export function lookupStructTypeForRoot(
-  this: Lowerer,
-  rootName: string
-): StructType | undefined {
-  const shape = this.structShapes.get(rootName);
-  if (shape === undefined) return undefined;
-  const fieldTypes =
-    this.structFieldTypes.get(rootName) ?? new Map<string, MType>();
-  return buildStructType(shape, fieldTypes);
 }
 
 /** Lower `s.f`, possibly chained (`s.inner.x`). Returns an
@@ -270,7 +172,7 @@ export function lowerMemberStore(
   // field path. The pre-pass already accumulated the union of fields
   // across the body, so any path that surfaces here must already be
   // in the shape.
-  const shape = this.structShapes.get(rootName);
+  const shape = this.struct.shapes.get(rootName);
   if (shape === undefined) {
     throw new TypeError(
       `'${rootName}.${path.join(".")} = …': struct field assignment to a non-struct (or unprepared) variable. ` +
@@ -331,11 +233,7 @@ export function lowerMemberStore(
   // Update the per-root field-type tracking. For nested fields, the
   // rhs.ty IS the field's struct type; for leaf fields it's the
   // value's type.
-  let fieldTypes = this.structFieldTypes.get(rootName);
-  if (fieldTypes === undefined) {
-    fieldTypes = new Map();
-    this.structFieldTypes.set(rootName, fieldTypes);
-  }
+  const fieldTypes = this.struct.ensureFieldTypes(rootName);
   // If this field already has a type, unify with the new one. The
   // unify result becomes the canonical field type.
   const prior = fieldTypes.get(path.join("."));
@@ -351,7 +249,7 @@ export function lowerMemberStore(
   // Rebuild the root struct type with the updated field tracking and
   // re-record the assignment (so `assignedVars` reflects the latest
   // shape).
-  const newRootTy = lookupStructTypeForRoot.call(this, rootName)!;
+  const newRootTy = this.struct.lookupStructTypeFor(rootName)!;
   const cName = this.recordAssignment(rootName, newRootTy, span);
   const baseVar: Extract<IRExpr, { kind: "Var" }> = {
     kind: "Var",
@@ -413,5 +311,93 @@ export function lowerStructConstructor(
     fields,
     ty,
     span: call.span,
+  };
+}
+
+/** Lower a `obj.field(indices...)` `MethodCall` whose base resolves to
+ *  a struct and whose `field` is a tensor-typed property — i.e. a
+ *  field-then-index read. Synthesizes an `IRExpr.IndexLoad` whose base
+ *  is a fake `Var` carrying the dotted C-path as `cName`, so codegen
+ *  renders `<base>.<field1>.<field2>....real[<offset>]` correctly.
+ *
+ *  Today this is the only `MethodCall` shape mtoc accepts: every other
+ *  form (true method dispatch, base that isn't a struct, range/colon
+ *  slot, deep field expressions) rejects with a span. When class
+ *  support lands, the `lowerExpr` `MethodCall` arm will try
+ *  class-method dispatch first and fall through here for the struct-
+ *  field case.
+ *
+ *  Field reads with no args (`obj.field` with zero indices in the
+ *  source) come through as `MemberLoad` and return that directly. */
+export function lowerStructFieldIndex(
+  this: Lowerer,
+  e: Extract<Expr, { type: "MethodCall" }>
+): IRExpr {
+  const memberExpr: Expr = {
+    type: "Member",
+    base: e.base,
+    name: e.name,
+    span: e.span,
+  };
+  const memberIr = lowerMemberRead.call(
+    this,
+    memberExpr as Extract<Expr, { type: "Member" }>
+  );
+  if (e.args.length === 0) return memberIr;
+  if (!isNumeric(memberIr.ty) || !isMultiElement(memberIr.ty)) {
+    throw new UnsupportedConstruct(
+      `indexing into struct field '${e.name}' requires a tensor field (got ${typeToString(memberIr.ty)})`,
+      e.span
+    );
+  }
+  // Walk the MemberLoad chain to gather the path; the C-side base
+  // expression is the dotted concatenation of struct field names.
+  const fieldPath: string[] = [];
+  let cur: IRExpr = memberIr;
+  while (cur.kind === "MemberLoad") {
+    fieldPath.unshift(cur.field);
+    cur = cur.base;
+  }
+  if (cur.kind !== "Var") {
+    throw new UnsupportedConstruct(
+      `indexing into a complex struct-field expression is not yet supported by mtoc`,
+      e.span
+    );
+  }
+  const syntheticBase: IRExpr = {
+    kind: "Var",
+    name: `${cur.name}.${fieldPath.join(".")}`,
+    cName: `${cur.cName}.${fieldPath.join(".")}`,
+    ty: memberIr.ty,
+    span: e.span,
+  };
+  // Range / colon slots on a struct-field expression require a
+  // hoisted name; range writes / reads aren't wired in this form.
+  if (e.args.some(a => a.type === "Range" || a.type === "Colon")) {
+    throw new UnsupportedConstruct(
+      `range / colon indexing on a struct-field expression ('s.field(a:b)') is not yet supported; assign the field to a name first`,
+      e.span
+    );
+  }
+  const indices = e.args.map(a => this.lowerExpr(a));
+  for (let i = 0; i < indices.length; i++) {
+    if (!isScalarReal(indices[i].ty)) {
+      throw new TypeError(
+        `index ${i + 1} of 's.${e.name}(...)' must be a real scalar (got ${typeToString(indices[i].ty)})`,
+        e.args[i].span
+      );
+    }
+  }
+  const baseTy = memberIr.ty;
+  const resultTy: MType =
+    isNumeric(baseTy) && baseTy.isComplex
+      ? scalarComplex()
+      : scalarDouble("unknown");
+  return {
+    kind: "IndexLoad",
+    base: syntheticBase as Extract<IRExpr, { kind: "Var" }>,
+    indices,
+    ty: resultTy,
+    span: e.span,
   };
 }

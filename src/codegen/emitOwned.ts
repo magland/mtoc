@@ -23,11 +23,69 @@ import {
   isScalarComplex,
   isScalarReal,
   isStruct,
+  type MType,
   typeToString,
 } from "../lowering/types.js";
 // `isHandle` is used by `functionFreeOnExitSet`.
-import { ownedOps } from "./ownedKinds.js";
+import { ownedOps, type OwnedKindOps } from "./ownedKinds.js";
 import { pushStmt, useSnippet, type EmitState } from "./emitState.js";
+
+/** Emit `<typedef>_assign(&<lhs>, <rhsExpr>);` for an owned target.
+ *  Activates the kind's typedef + `_assign` helper as a side effect.
+ *  Used by every owned-LHS write site: scalar Assign to an owned name,
+ *  MemberStore to an owned field, ReturnFromFunction's sret writes,
+ *  multi-output-call owned-output writes.
+ *
+ *  Callers can pass either `&<cName>` (local stack handle) or the
+ *  bare sret pointer expression (`_mtoc_o<i>`) as `lhsRef`. The helper
+ *  is symmetric on the LHS shape — it just splices the string in. */
+export function emitOwnedAssign(
+  state: EmitState,
+  level: number,
+  owned: OwnedKindOps,
+  lhsRef: string,
+  rhsExpr: string
+): void {
+  useSnippet(state, owned.structSnippet);
+  useSnippet(state, owned.assign);
+  pushStmt(state, level, `${owned.assign.name}(${lhsRef}, ${rhsExpr});`);
+}
+
+/** Emit `<cType> <cName> = <typedef>_empty();` for an owned-discard
+ *  temporary. Activates the kind's typedef + `_empty` helper. Used at
+ *  multi-output-call sites where an ignored output slot needs a freeable
+ *  starting value the callee's `_assign` can consume. */
+export function emitOwnedEmptyDecl(
+  state: EmitState,
+  level: number,
+  owned: OwnedKindOps,
+  cName: string
+): void {
+  useSnippet(state, owned.structSnippet);
+  useSnippet(state, owned.empty);
+  pushStmt(state, level, `${owned.cType} ${cName} = ${owned.empty.name}();`);
+}
+
+/** Convenience: write each multi-output sret slot from the corresponding
+ *  output's post-body live cName. Owned slots route through
+ *  `emitOwnedAssign(... &_mtoc_oN, cName)` so the caller's prior buffer
+ *  at the lvalue is freed before the new handle lands; scalar slots
+ *  use a plain pointer store. */
+export function emitOwnedAwareSretWrites(
+  state: EmitState,
+  level: number,
+  outputs: ReadonlyArray<{ ty: MType; cName: string }>
+): void {
+  for (let i = 0; i < outputs.length; i++) {
+    const o = outputs[i];
+    const owned = ownedOps(o.ty);
+    if (owned !== null) {
+      emitOwnedAssign(state, level, owned, `_mtoc_o${i}`, o.cName);
+    } else {
+      pushStmt(state, level, `*_mtoc_o${i} = ${o.cName};`);
+    }
+  }
+}
 
 /** Emit predeclarations for a {cName → VarBinding} table. Scalars
  *  become `double <cName> = 0.0;` (real) or `double _Complex <cName> = 0.0;`
@@ -57,13 +115,7 @@ export function emitDeclarations(
     // an uninitialized var is a safe no-op.
     const owned = ownedOps(ty);
     if (owned !== null) {
-      useSnippet(state, owned.structSnippet);
-      useSnippet(state, owned.empty);
-      pushStmt(
-        state,
-        level,
-        `${owned.cType} ${cName} = ${owned.empty.name}();`
-      );
+      emitOwnedEmptyDecl(state, level, owned, cName);
       continue;
     }
     if (isCharScalar(ty)) {

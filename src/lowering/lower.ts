@@ -37,7 +37,6 @@ import {
   canShareStorage,
   isHandle,
   isMultiElement,
-  isNumeric,
   isScalarComplex,
   isScalarReal,
   isString,
@@ -55,12 +54,12 @@ import {
   type DimInfo,
 } from "./types.js";
 
-import { collectStructShapes, type StructShape } from "./structPrePass.js";
+import { StructLoweringState } from "./structLoweringState.js";
 import {
-  lookupStructTypeForRoot,
   lowerMemberRead,
   lowerMemberStore,
   lowerStructConstructor,
+  lowerStructFieldIndex,
 } from "./lowerStruct.js";
 
 import { lowerIf } from "./lowerIf.js";
@@ -232,21 +231,12 @@ export class Lowerer {
     axis: number | "linear";
   }> = [];
 
-  /** Per-root struct shape map computed by `collectStructShapes`
-   *  before body lowering starts. Empty when no struct lvalues or
-   *  `struct(...)` constructors appear in the scope. The lowering
-   *  helpers in `lowerStruct.ts` read this to know the variable's
-   *  static field-set; the storage-category mismatch check in
-   *  `recordAssignment` then keeps the shape stable across the
-   *  variable's lifetime. */
-  structShapes: Map<string, StructShape> = new Map();
-
-  /** Per-root struct field-type tracking. Keyed by root var name,
-   *  each entry maps dotted field paths (`"x"`, `"inner.y"`) to the
-   *  current MType. Updated by `lowerMemberStore` and consulted by
-   *  `lookupStructTypeForRoot` to assemble the variable's current
-   *  `StructType`. */
-  structFieldTypes: Map<string, Map<string, MType>> = new Map();
+  /** Per-scope struct-lowering state — pre-pass shape map and the
+   *  per-root field-type tracking that grows as the body assigns
+   *  through fields. Reified into its own object so the god-object
+   *  stays slim and so the future `ClassLoweringState` can slot in
+   *  alongside in the same shape. See `structLoweringState.ts`. */
+  struct = new StructLoweringState();
 
   /** Function-specialization cache + workspace handle. Helpers in
    *  sibling files reach through this for user-call dispatch. */
@@ -277,19 +267,17 @@ export class Lowerer {
     this.currentFile = currentFile ?? shared.workspace.mainFile;
   }
 
-  /** Populate `structShapes` for the body about to be lowered. Called
-   *  once before the body's stmts are visited. Subsequent calls for
-   *  the same Lowerer are no-ops — only the first scope-level body
-   *  should drive the pre-pass. */
+  /** Populate the struct-state shape map for the body about to be
+   *  lowered. Called once before the body's stmts are visited. */
   primeStructShapes(body: ReadonlyArray<Stmt>): void {
-    this.structShapes = collectStructShapes(body);
+    this.struct.primeFromBody(body);
   }
 
   /** Build a `StructType` for `rootName` reflecting the current
    *  field-type tracking. Returns undefined if the variable is not in
    *  the pre-pass shape map. */
   currentStructTypeFor(rootName: string): MType | undefined {
-    return lookupStructTypeForRoot.call(this, rootName);
+    return this.struct.lookupStructTypeFor(rootName);
   }
 
   /** Run `fn` with `controlDepth` incremented; restored on exit. Used by
@@ -598,13 +586,9 @@ export class Lowerer {
         // `s.y = 2` both reference the same `Struct{x,y}` typedef.
         let rhsTy = rhs.ty;
         let assignRhs = rhs;
-        if (rhs.kind === "StructLit" && this.structShapes.has(s.name)) {
+        if (rhs.kind === "StructLit" && this.struct.shapes.has(s.name)) {
           // Refresh the per-field tracking with the constructor's fields.
-          let fieldTypes = this.structFieldTypes.get(s.name);
-          if (fieldTypes === undefined) {
-            fieldTypes = new Map();
-            this.structFieldTypes.set(s.name, fieldTypes);
-          }
+          const fieldTypes = this.struct.ensureFieldTypes(s.name);
           for (const f of rhs.fields) {
             fieldTypes.set(f.name, f.value.ty);
           }
@@ -1026,89 +1010,15 @@ export class Lowerer {
           e.span
         );
 
-      case "MethodCall": {
+      case "MethodCall":
         // The parser produces `MethodCall { base, name, args }` for
-        // `obj.name(args)`. When the base resolves to a struct and
-        // `name` is one of its fields, this is `(obj.name)(args)` —
-        // an indexed read of the struct's field. mtoc supports that
-        // case as scalar / range index into a numeric-tensor field.
-        // True method dispatch (class-instance methods) is rejected.
-        const memberExpr: Expr = {
-          type: "Member",
-          base: e.base,
-          name: e.name,
-          span: e.span,
-        };
-        const memberIr = lowerMemberRead.call(
-          this,
-          memberExpr as Extract<Expr, { type: "Member" }>
-        );
-        if (e.args.length === 0) return memberIr;
-        if (!isNumeric(memberIr.ty) || !isMultiElement(memberIr.ty)) {
-          throw new UnsupportedConstruct(
-            `indexing into struct field '${e.name}' requires a tensor field (got ${typeToString(memberIr.ty)})`,
-            e.span
-          );
-        }
-        // Build a synthetic Var node whose `cName` is the C-side
-        // path expression `<base>.<field1>.<field2>...` — codegen
-        // emits `<cName>.real[<offset>]` for tensor indexing, which
-        // ends up as `s.vec.real[...]` (right C code).
-        // We walk the MemberLoad chain to gather the path.
-        const fieldPath: string[] = [];
-        let cur: IRExpr = memberIr;
-        while (cur.kind === "MemberLoad") {
-          fieldPath.unshift(cur.field);
-          cur = cur.base;
-        }
-        if (cur.kind !== "Var") {
-          throw new UnsupportedConstruct(
-            `indexing into a complex struct-field expression is not yet supported by mtoc`,
-            e.span
-          );
-        }
-        const syntheticBase: IRExpr = {
-          kind: "Var",
-          name: `${cur.name}.${fieldPath.join(".")}`,
-          cName: `${cur.cName}.${fieldPath.join(".")}`,
-          ty: memberIr.ty,
-          span: e.span,
-        };
-        // Now route the indices through `lowerIndexLoad` by manually
-        // building it: we already have a Var-shape base + the args.
-        // Delegate to lowerIndexLoad via a small shim. To avoid
-        // duplicating the bounds/arity checks, we inline the equivalent
-        // here for the scalar-index case. Range / colon slots aren't
-        // supported on struct fields in v1 — assign to a name first.
-        if (e.args.some(a => a.type === "Range" || a.type === "Colon")) {
-          throw new UnsupportedConstruct(
-            `range / colon indexing on a struct-field expression ('s.field(a:b)') is not yet supported; assign the field to a name first`,
-            e.span
-          );
-        }
-        const indices = e.args.map(a => this.lowerExpr(a));
-        for (let i = 0; i < indices.length; i++) {
-          if (!isScalarReal(indices[i].ty)) {
-            throw new TypeError(
-              `index ${i + 1} of 's.${e.name}(...)' must be a real scalar (got ${typeToString(indices[i].ty)})`,
-              e.args[i].span
-            );
-          }
-        }
-        const baseTy = memberIr.ty;
-        // Result is a scalar of the base's elem / complex.
-        const resultTy: MType =
-          isNumeric(baseTy) && baseTy.isComplex
-            ? scalarComplex()
-            : scalarDouble("unknown");
-        return {
-          kind: "IndexLoad",
-          base: syntheticBase as Extract<IRExpr, { kind: "Var" }>,
-          indices,
-          ty: resultTy,
-          span: e.span,
-        };
-      }
+        // `obj.name(args)`. Today the only shape mtoc accepts is
+        // `<struct>.<tensorField>(<scalar indices>)` — a field-then-
+        // index read — handled by `lowerStructFieldIndex`. When class
+        // support lands, dispatch here will try class-method first and
+        // fall through to the struct-field-index helper for non-class
+        // bases.
+        return lowerStructFieldIndex.call(this, e);
 
       case "Range":
         return this.lowerBareRange(e);

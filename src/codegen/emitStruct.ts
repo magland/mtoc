@@ -23,7 +23,6 @@ import {
   isText,
   structMangledName,
   type StructType,
-  type MType,
 } from "../lowering/types.js";
 import { ownedOps } from "./ownedKinds.js";
 import { useRuntimeByName, useSnippet, type EmitState } from "./emitState.js";
@@ -136,26 +135,4 @@ const STRUCT_SPEC: NamedTypedefSpec<StructType> = {
 /** Emit every struct typedef + helper block, in dependency order. */
 export function emitStructBlocks(state: EmitState, prog: IRProgram): string[] {
   return emitNamedTypedefBlocks(state, prog, STRUCT_SPEC);
-}
-
-/** Re-export the per-program collector for any caller that needs the
- *  raw shape table (currently none outside this file; kept exported
- *  to preserve the legacy module surface). */
-export function collectStructShapes(prog: IRProgram): Map<string, StructType> {
-  const out = new Map<string, StructType>();
-  const visit = (ty: MType): void => {
-    if (!isStruct(ty)) return;
-    const name = structMangledName(ty);
-    if (!out.has(name)) {
-      out.set(name, ty);
-      for (const f of ty.fields) visit(f.type);
-    }
-  };
-  for (const fn of prog.functions) {
-    for (const p of fn.params) visit(p.ty);
-    for (const o of fn.outputs) visit(o.ty);
-    for (const v of fn.assignedVars.values()) visit(v.ty);
-  }
-  for (const v of prog.assignedVars.values()) visit(v.ty);
-  return out;
 }

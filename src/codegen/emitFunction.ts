@@ -23,6 +23,7 @@ import { ownedOps } from "./ownedKinds.js";
 import { pushStmt, useSnippet, type EmitState } from "./emitState.js";
 import {
   emitDeclarations,
+  emitOwnedAwareSretWrites,
   emitScopeExitFrees,
   functionFreeOnExitSet,
 } from "./emitOwned.js";
@@ -44,29 +45,6 @@ export function scopeExitFreeSet(
     if (isOwned(o.ty)) out.delete(o.cName);
   }
   return out;
-}
-
-/** Write each multi-output sret slot from the corresponding output's
- *  post-body live cName. Owned slots route through the kind's
- *  consume-replace `assign` helper so the caller's prior buffer at the
- *  lvalue is freed before the new handle lands; scalar slots use a
- *  plain pointer store. Activates the helpers it depends on. */
-export function emitOwnedAwareSretWrites(
-  state: EmitState,
-  level: number,
-  outputs: ReadonlyArray<IRFunction["outputs"][number]>
-): void {
-  for (let i = 0; i < outputs.length; i++) {
-    const o = outputs[i];
-    const owned = ownedOps(o.ty);
-    if (owned !== null) {
-      useSnippet(state, owned.structSnippet);
-      useSnippet(state, owned.assign);
-      pushStmt(state, level, `${owned.assign.name}(_mtoc_o${i}, ${o.cName});`);
-    } else {
-      pushStmt(state, level, `*_mtoc_o${i} = ${o.cName};`);
-    }
-  }
 }
 
 /** Emit the body of a user-defined function (predeclarations + body

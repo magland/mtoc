@@ -13,7 +13,8 @@
  * inspect the new kind.
  */
 
-import type { IRExpr, IRStmt } from "./ir.js";
+import type { IRExpr, IRProgram, IRStmt } from "./ir.js";
+import type { MType } from "./types.js";
 
 /**
  * Visit every sub-expression of `e` in pre-order, including `e`
@@ -245,4 +246,56 @@ export function forEachStmtInTree(
         break;
     }
   }
+}
+
+/**
+ * Walk every type position reachable from an `IRProgram` (function
+ * params / outputs / assignedVars + every IRExpr's `ty` reached via
+ * `forEachTopLevelExpr` + `forEachSubExpr`, plus the type-bearing
+ * fields of `Assign` and `MemberStore`).
+ *
+ * Generic over a kind predicate `T extends MType`: matching types are
+ * collected by their mangled name; on the first encounter `recurseInto`
+ * is invoked so nested type references (struct field types, handle
+ * captures, future class properties) also register without the caller
+ * rolling its own recursion.
+ *
+ * Single source of truth for per-kind shape collection — consumed by
+ * codegen's `emitNamedTypedef` driver and by any future analysis that
+ * needs "every distinct X-shape in the program."
+ */
+export function collectMTypeShapes<T extends MType>(
+  prog: IRProgram,
+  predicate: (t: MType) => t is T,
+  mangledName: (t: T) => string,
+  recurseInto: (t: T, visit: (sub: MType) => void) => void
+): Map<string, T> {
+  const out: Map<string, T> = new Map();
+  const visit = (t: MType): void => {
+    if (!predicate(t)) return;
+    const name = mangledName(t);
+    if (!out.has(name)) {
+      out.set(name, t);
+      recurseInto(t, visit);
+    }
+  };
+  const visitExpr = (e: { ty: MType }): void => visit(e.ty);
+  const visitStmtTypes = (s: IRStmt): void => {
+    forEachTopLevelExpr(s, sub => forEachSubExpr(sub, visitExpr));
+    if (s.kind === "Assign") visit(s.ty);
+    if (s.kind === "MemberStore") {
+      visit(s.base.ty);
+      visit(s.leafTy);
+      visit(s.rhs.ty);
+    }
+  };
+  for (const fn of prog.functions) {
+    for (const p of fn.params) visit(p.ty);
+    for (const o of fn.outputs) visit(o.ty);
+    for (const v of fn.assignedVars.values()) visit(v.ty);
+    forEachStmtInTree(fn.body, visitStmtTypes);
+  }
+  for (const v of prog.assignedVars.values()) visit(v.ty);
+  forEachStmtInTree(prog.stmts, visitStmtTypes);
+  return out;
 }

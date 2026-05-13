@@ -52,10 +52,14 @@ where upstream parser changes will surface as mtoc compile errors.
 ### Lowering (`src/lowering/`)
 
 This is mtoc's own pass and the bulk of the work. The `Lowerer` class owns
-per-scope state (env, assignedVars, params, output var, output C-name); the
-per-construct logic is split into small `this`-typed helper files
-(`lowerIf`, `lowerFor`, `lowerWhile`, `lowerBinary`, `lowerUnary`,
-`lowerFuncCall`, `lowerTensorLiteral`).
+per-scope state (env, assignedVars, params, output var, output C-name);
+named-type-specific state lives in companion classes that `Lowerer`
+composes — today that's `StructLoweringState` (the per-scope pre-pass
+shape map + the per-root field-type tracking, accessed via
+`lowerer.struct.*`). When `classdef` lands, a `ClassLoweringState` slots
+in alongside in the same shape. The per-construct logic is split into
+small `this`-typed helper files (`lowerIf`, `lowerFor`, `lowerWhile`,
+`lowerBinary`, `lowerUnary`, `lowerFuncCall`, `lowerTensorLiteral`).
 
 Lowering does several jobs in one walk:
 

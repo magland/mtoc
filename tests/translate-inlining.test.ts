@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
 
+import type { IRStmt } from "../src/lowering/ir.js";
+import { computeUseCounts } from "../src/codegen/inline/inlinePass.js";
+import { scalarDouble, structType, type MType } from "../src/lowering/types.js";
 import { translate } from "./_helpers.js";
 
 /**
@@ -186,5 +189,43 @@ describe("tensor-expression inlining", () => {
     );
     // No read of `b` survives.
     expect(inlined).not.toMatch(/b\.real\[/);
+  });
+});
+
+describe("inlinePass.computeUseCounts", () => {
+  it("counts Var reads inside MemberStore RHS", () => {
+    // Regression: the prior hand-rolled `countVarRefsInStmt` switch
+    // had no MemberStore arm — Var reads in `s.f = <rhs>` were
+    // silently undercounted, so a producer whose only consumer was a
+    // field write could be miscategorized as use=0 (skip-inline,
+    // benign) or, worse, an additional MemberStore use could go
+    // unseen and the inliner would substitute over a still-live read.
+    const span = { file: "test", start: 0, end: 0 };
+    const numTy: MType = scalarDouble("unknown");
+    const sTy: MType = structType([{ name: "f", type: numTy }]);
+    const memberStore: IRStmt = {
+      kind: "MemberStore",
+      base: {
+        kind: "Var",
+        name: "s",
+        cName: "s",
+        ty: sTy,
+        span,
+      },
+      fieldPath: ["f"],
+      leafTy: numTy,
+      rhs: {
+        kind: "Var",
+        name: "b",
+        cName: "b",
+        ty: numTy,
+        span,
+      },
+      span,
+    };
+    const counts = computeUseCounts([memberStore], new Set());
+    expect(counts.get("b")).toBe(1);
+    // The struct base itself is also read.
+    expect(counts.get("s")).toBe(1);
   });
 });
