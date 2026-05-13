@@ -399,6 +399,57 @@ export function lowerClassMethodCall(
   );
 }
 
+/** Lower `ClassName.method(args)` — the static-method-call syntax,
+ *  where the base of the MethodCall AST node is an Ident that names a
+ *  registered class (not an in-scope variable). Routes through
+ *  `Workspace.resolveForTargetClass` with the named class pinned;
+ *  the resolver's `stripInstance` logic does the right thing because
+ *  no class-instance arg is in the argTypes list — i.e. the resolver
+ *  returns `stripInstance=false`, so we pass the user's args
+ *  through unchanged. */
+export function lowerStaticClassMethodCall(
+  this: Lowerer,
+  className: string,
+  methodName: string,
+  argExprs: ReadonlyArray<Expr>,
+  span: Span
+): IRExpr {
+  const userArgs: IRExpr[] = argExprs.map(a => this.lowerExpr(a));
+  const argTypes: MType[] = userArgs.map(a => a.ty);
+  const target = this.shared.workspace.resolveForTargetClass(
+    methodName,
+    argTypes,
+    className,
+    this.callSite(),
+    span
+  );
+  if (target === null) {
+    throw new TypeError(
+      `class '${className}' has no method '${methodName}'`,
+      span
+    );
+  }
+  if (target.kind !== "classMethod") {
+    throw new UnsupportedConstruct(
+      `internal: targetClassName-pinned resolve for '${className}.` +
+        `${methodName}' returned non-classMethod target '${target.kind}'`,
+      span
+    );
+  }
+  // For `ClassName.method(args)` the resolver returns stripInstance=false
+  // (no class-instance in argTypes). The user args go straight through
+  // to specialize — no receiver to prepend.
+  const irArgs = target.stripInstance ? userArgs.slice() : userArgs.slice();
+  return finishClassCall.call(
+    this,
+    classMethodSpecName(target.className, target.methodName),
+    target.ast,
+    target.file,
+    irArgs,
+    span
+  );
+}
+
 /** Lower `method(obj, args)`: the resolver returned `classMethod` for
  *  a function-call-syntax site. The receiver is already in the IR-arg
  *  list (first slot); pass through to the shared dispatch helper. */

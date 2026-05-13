@@ -134,14 +134,11 @@ function validateOneClass(info: ClassInfo, span: Span): void {
       span
     );
   }
-  // Static methods: deferred to Stage 5.
-  if (info.staticMethodNames.size > 0) {
-    throw new UnsupportedConstruct(
-      `class '${info.qualifiedName}' declares static methods; static ` +
-        `method dispatch is not yet supported by mtoc`,
-      span
-    );
-  }
+  // Static methods are supported: ClassName.method(args) dispatches
+  // via the resolver's targetClassName short-circuit + stripInstance
+  // flag. obj.staticMethod(args) (instance-style call to a static
+  // method) also flows through the same path with the receiver
+  // dropped per stripInstance=true.
 }
 
 /** Detect a handle-base class — `classdef X < handle` or any class

@@ -58,7 +58,11 @@ import {
 
 import { StructLoweringState } from "./structLoweringState.js";
 import { ClassLoweringState } from "./classLoweringState.js";
-import { lowerClassMethodCall, lowerSuperCall } from "./lowerClass.js";
+import {
+  lowerClassMethodCall,
+  lowerStaticClassMethodCall,
+  lowerSuperCall,
+} from "./lowerClass.js";
 import {
   lowerMemberRead,
   lowerMemberStore,
@@ -1204,13 +1208,17 @@ export class Lowerer {
 
       case "MethodCall": {
         // The parser produces `MethodCall { base, name, args }` for
-        // `obj.name(args)`. We try class-method dispatch first: if the
-        // base lowers to a `ClassType`, route through
-        // `lowerClassMethodCall`, which calls
-        // `Workspace.resolveForTargetClass`. Otherwise fall through to
-        // `lowerStructFieldIndex`, which handles the legacy
-        // `<struct>.<tensorField>(<scalar indices>)` field-then-index
-        // shape.
+        // `obj.name(args)` AND `ClassName.name(args)`. Dispatch order:
+        //   1. base is an in-scope class-typed Var → instance method
+        //      call (`lowerClassMethodCall`).
+        //   2. base is an Ident that names a registered class (not
+        //      in env) → static method call
+        //      (`lowerStaticClassMethodCall`). Numbl's resolver
+        //      decides whether the named method actually exists on
+        //      the class (static or otherwise); mtoc just routes.
+        //   3. Otherwise → fall through to `lowerStructFieldIndex`,
+        //      the legacy `<struct>.<tensorField>(<scalar indices>)`
+        //      shape.
         if (e.base.type === "Ident") {
           const baseTy = this.envLookup(e.base.name);
           if (baseTy !== undefined && isClass(baseTy)) {
@@ -1225,6 +1233,18 @@ export class Lowerer {
               this,
               baseTy,
               receiverIR,
+              e.name,
+              e.args,
+              e.span
+            );
+          }
+          if (
+            baseTy === undefined &&
+            this.shared.workspace.ctx.isClass(e.base.name)
+          ) {
+            return lowerStaticClassMethodCall.call(
+              this,
+              e.base.name,
               e.name,
               e.args,
               e.span

@@ -442,14 +442,20 @@ consumes the verdict. Both call syntaxes work:
   (local function > private > class method > workspace function >
   builtin); class dispatch wins only if the class declares the
   method AND no higher-precedence rule fires first.
+- `ClassName.method(args)` — static-method call syntax. Routes
+  through `resolveForTargetClass` with no class-instance in the
+  arg list, so the resolver's `stripInstance` flag returns false
+  and the user's args are forwarded unchanged.
+- `obj.staticMethod(args)` — instance-style call to a `Static`
+  method. The resolver detects the `Static` attribute and sets
+  `stripInstance=true`; mtoc drops the receiver before
+  specialization.
 
 ### Out of scope for v1 (documented gaps)
 
 - **Handle classes** (`classdef X < handle`) — reference semantics
   need a different ABI (refcount or arena allocation); rejected at
   call sites with a span.
-- **Static methods** — `ClassName.method(args)` syntax and `Static`
-  attribute methods rejected at class-info validation.
 - **Complex constructor RHS expressions stay at the conservative
   default.** mtoc's constructor pre-pass
   (`predictConstructorPropertyTypes`) statically derives each

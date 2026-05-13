@@ -396,10 +396,14 @@ method@Parent(obj)` for super-method, `obj = obj@Parent(args)`
   (`predictConstructorPropertyTypes`) walks each `obj.<prop> =
   <RHS>` statement plus super-constructor calls and commits the
   receiver's typedef to the post-body shape ahead of
-  specialization. What's deferred — handle classes, static
-  methods, operator overloads, `subsref` / `subsasgn`, external
-  method files, `disp(obj)`, class arrays, and constructor writes
-  whose RHS the pre-pass can't statically type — see
+  specialization. Static methods (`methods (Static)` blocks)
+  work with both `ClassName.method(args)` and
+  `obj.staticMethod(args)` syntaxes — the resolver's
+  `stripInstance` flag drives the receiver-drop for the latter.
+  What's deferred — handle classes, operator overloads,
+  `subsref` / `subsasgn`, external method files, `disp(obj)`,
+  class arrays, and constructor writes whose RHS the pre-pass
+  can't statically type — see
   [docs/limitations.md](docs/limitations.md#classes).
 - Text view (`mtoc_text_view_t`): a non-owning `{data, len}` adapter
   every "accepts text" runtime helper consumes. `disp`, `error`,
