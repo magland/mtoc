@@ -32,9 +32,11 @@ import {
   charArrayType,
   classType,
   scalarChar,
+  scalarComplex,
   scalarDouble,
   signFromValue,
   STRING,
+  stringType,
   unify,
   type ClassType,
   type DimInfo,
@@ -97,10 +99,16 @@ function initialClassType(
  *  RHS is something we can confidently type without full lowering.
  *  Specifically:
  *
- *   - Number literal → `scalarDouble(signFromValue)`.
- *   - String literal → `STRING`.
- *   - Char literal → `scalarChar()` or `charArrayType(notOne)`.
- *   - Ident referring to a constructor param → that param's type.
+ *   - Number literal → `scalarDouble(signFromValue, exact=n)`.
+ *   - String literal → `stringType(exact)` (decoded value pinned).
+ *   - Char literal → `scalarChar(exact=byte)` for 1-char; multi-char
+ *     stays at `charArrayType(notOne)` (exact is scalar-only).
+ *   - `1i` / `2.5i` (parsed as bare `ImagUnit` or `Binary(Mul,
+ *     NumLit, ImagUnit)`) → `scalarComplex(exact={re:0, im})`.
+ *   - `complex(re)` / `complex(re, im)` with numeric-literal args
+ *     → `scalarComplex` with the exact `{re, im}` pinned.
+ *   - Ident referring to a constructor param → that param's type
+ *     (already carries its caller's exact, if any).
  *   - SuperMethodCall to the parent's constructor (super-ctor form)
  *     → recursively predict the parent's property types and merge
  *     into the result.
@@ -204,22 +212,67 @@ function predictConstructorPropertyTypes(
     switch (e.type) {
       case "Number": {
         const n = Number(e.value);
-        return scalarDouble(signFromValue(n));
+        if (Number.isNaN(n)) return scalarDouble("unknown");
+        return scalarDouble(signFromValue(n), n);
       }
-      case "String":
-        return STRING;
+      case "String": {
+        const raw = e.value;
+        if (raw.length < 2 || raw[0] !== '"') return STRING;
+        return stringType(decodeNumblQuotedLexeme(raw));
+      }
       case "Char": {
         const raw = e.value;
         if (raw.length < 2 || raw[0] !== "'") return scalarDouble("unknown");
         const inner = decodeNumblQuotedLexeme(raw);
         if (inner.length === 0) return scalarDouble("unknown");
-        if (inner.length === 1) return scalarChar();
+        if (inner.length === 1) return scalarChar(inner);
         const cols: DimInfo = { kind: "notOne" };
         return charArrayType(cols);
       }
       case "Ident": {
         const t = paramTypes.get(e.name);
         if (t !== undefined) return t;
+        return scalarDouble("unknown");
+      }
+      case "ImagUnit":
+        // Bare `1i` — purely imaginary unit.
+        return scalarComplex({ re: 0, im: 1 });
+      case "Binary": {
+        // The parser shape for `2.5i` is `Binary(Mul, NumLit, ImagUnit)`.
+        // Recognize that fold so the property type pins the exact
+        // complex value. Other Binary forms fall through to the
+        // conservative default below.
+        if (
+          e.op === "Mul" &&
+          e.left.type === "Number" &&
+          e.right.type === "ImagUnit"
+        ) {
+          const im = Number(e.left.value);
+          if (!Number.isNaN(im)) return scalarComplex({ re: 0, im });
+        }
+        return scalarDouble("unknown");
+      }
+      case "FuncCall": {
+        // `complex(re)` / `complex(re, im)` with numeric-literal args
+        // pin an exact value on the predicted complex scalar. Any
+        // other call shape (or non-literal args) falls through.
+        if (e.name === "complex") {
+          if (e.args.length === 1 && e.args[0].type === "Number") {
+            const re = Number(e.args[0].value);
+            if (!Number.isNaN(re)) return scalarComplex({ re, im: 0 });
+          }
+          if (
+            e.args.length === 2 &&
+            e.args[0].type === "Number" &&
+            e.args[1].type === "Number"
+          ) {
+            const re = Number(e.args[0].value);
+            const im = Number(e.args[1].value);
+            if (!Number.isNaN(re) && !Number.isNaN(im)) {
+              return scalarComplex({ re, im });
+            }
+          }
+        }
         return scalarDouble("unknown");
       }
       case "SuperMethodCall": {
