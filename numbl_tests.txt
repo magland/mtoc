@@ -1,6 +1,6 @@
 # numbl tests that mtoc can currently translate and run end-to-end.
 #
-# Paths are relative to ../numbl/numbl_test_scripts/. Each listed
+# Paths are relative to . Each listed
 # script must print "SUCCESS" as its final line of stdout when run
 # through `npx tsx src/cli.ts run <path>`. The runner in
 # scripts/run_numbl_tests.ts validates that.
@@ -10,8 +10,9 @@
 # Lines starting with `#` and blank lines are ignored.
 
 arithmetic/basic_ops.m
-arithmetic/test_colon_endpoint.m
 arithmetic/fortran_exponent_literal.m
+arithmetic/complex_advanced.m
+arithmetic/test_colon_endpoint.m
 arithmetic/test_complex_div_zero.m
 arithmetic/test_complex_scalar_transpose.m
 arithmetic/test_negative_base_power.m
@@ -27,12 +28,16 @@ arrays/vectors.m
 builtins/test_angle_nan.m
 builtins/test_block_comment_syntax.m
 builtins/test_fprintf_extended.m
+builtins/test_isnan_isinf_complex.m
 builtins/test_realmin.m
+classes/value_class_mutation.m
 control_flow/for_loop_nested_funcall.m
 control_flow/break_continue.m
 control_flow/if_else.m
 control_flow/test_for_loop_var_value.m
 control_flow/while_loops.m
+functions/closure_from_function.m
+functions/function_handles.m
 functions/main_local_scope/test_main_local_scope.m
 functions/prototype_name_functions.m
 indexing/test_loop_indexed_assign.m
@@ -42,10 +47,11 @@ math/complex_log2_log10.m
 math/rounding.m
 math/test_angle_tensor.m
 math/test_mod_inf_large.m
+memory/test_lambda_captures_tensor.m
 reduction/test_max_min_nan_twoarg.m
 reduction/test_sum_logical.m
 strings/sprintf_array_args.m
-strings/test_sprintf_width_padding.m
-strings/test_sprintf_width_flags.m
 strings/test_sprintf_exponent_pad.m
+strings/test_sprintf_width_flags.m
+strings/test_sprintf_width_padding.m
 variables/assignment.m
