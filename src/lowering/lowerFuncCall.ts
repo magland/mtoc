@@ -60,9 +60,15 @@ export function lowerFuncCall(
     }
     return lowerIndexLoad.call(this, e.name, e.args, e.span);
   }
+  // Args not lowered yet at this point; pass `[]`. When the function-call
+  // form needs to dispatch to a class method (resolver's class-method-
+  // candidate scan), lower the args first and feed their MTypes here.
+  // For now this preserves the legacy behavior: empty argTypes means
+  // the resolver skips the class-method-candidate branch.
   const target = this.shared.workspace.resolve(
     e.name,
-    { file: this.currentFile },
+    [],
+    this.callSite(),
     e.span
   );
   if (!target) {

@@ -489,6 +489,74 @@ export function homogeneousCellMangledName(t: HomogeneousCellType): string {
  *  instead of a runtime abort. */
 export const MTOC_MAX_NDIM = 8;
 
+/**
+ * Class instance type. Structurally a struct with class identity baked
+ * in: two class instances of different classes never share a single C
+ * variable even when their property shapes coincide, and the resolver
+ * sees them as `ClassInstance<className>` so its precedence rules
+ * (cross-class dispatch, InferiorClasses promotion, static-method
+ * detection) work correctly.
+ *
+ * The `properties` list is sorted by name and carries the per-property
+ * MTypes; it grows incrementally as the constructor / methods assign
+ * through `obj.<prop>`, exactly like StructType. The `file` shard salts
+ * the mangled C typedef so two same-named classes in different
+ * packages stay distinct.
+ *
+ * mtoc supports value-semantics classes only — assignment makes a
+ * deep copy via the same `mtoc_<typedef>_copy` machinery struct uses.
+ * Handle classes (`classdef X < handle`) are rejected at lowering
+ * with a clear span.
+ */
+export interface ClassType {
+  kind: "Class";
+  /** Resolved class name. May be qualified ("pkg.Foo") for class
+   *  inside a `+pkg/` namespace. */
+  className: string;
+  /** Source file (.m) the classdef was declared in. Used to salt the
+   *  canonical hash so two classes with the same simple name but
+   *  different declaring files stay distinct typedefs. */
+  file: string;
+  /** Sorted-by-name property list. Property types fill in as the
+   *  constructor body assigns through `obj.<prop>`. */
+  properties: ReadonlyArray<{ name: string; type: MType }>;
+}
+
+export function classType(opts: {
+  className: string;
+  file: string;
+  properties: ReadonlyArray<{ name: string; type: MType }>;
+}): ClassType {
+  const sorted = [...opts.properties].sort((a, b) =>
+    a.name < b.name ? -1 : a.name > b.name ? 1 : 0
+  );
+  return {
+    kind: "Class",
+    className: opts.className,
+    file: opts.file,
+    properties: sorted,
+  };
+}
+
+export function isClass(t: MType): t is ClassType {
+  return t.kind === "Class";
+}
+
+/** Mangled C typedef name for a class shape.
+ *  `_mtoc_class__<className>__<8hex>` where the hex is FNV-1a over the
+ *  canonical {className, file, properties} tuple. The `<className>`
+ *  segment is purely cosmetic (makes the generated C self-documenting);
+ *  uniqueness is guaranteed by the hash. */
+export function classMangledName(t: ClassType): string {
+  const canonical = JSON.stringify({
+    className: t.className,
+    file: t.file,
+    properties: t.properties.map(p => [p.name, canonicalizeType(p.type)]),
+  });
+  const safeName = t.className.replace(/[^A-Za-z0-9_]/g, "_");
+  return `_mtoc_class__${safeName}__${fnv1a32Hex(canonical)}`;
+}
+
 export type MType =
   | NumericType
   | StringType
@@ -496,6 +564,7 @@ export type MType =
   | HandleType
   | TupleCellType
   | HomogeneousCellType
+  | ClassType
   | { kind: "Unknown" }
   | { kind: "Void" };
 
@@ -734,8 +803,18 @@ export function isOwned(t: MType): boolean {
   // helpers are trivial (no heap fields) but routing through the
   // owned-kind pipeline keeps every declaration / assign / scope-
   // exit-free dispatch site identical across handle shapes.
+  //
+  // Class instances are always owned: like structs they may carry
+  // transitively-owned property values (tensors, strings, nested
+  // structs, nested classes), so even an all-scalar class goes
+  // through the owned-kind pipeline for uniformity.
   return (
-    isMultiElement(t) || isString(t) || isStruct(t) || isHandle(t) || isCell(t)
+    isMultiElement(t) ||
+    isString(t) ||
+    isStruct(t) ||
+    isHandle(t) ||
+    isCell(t) ||
+    isClass(t)
   );
 }
 
@@ -775,6 +854,7 @@ export function cTypeFor(t: MType): string | null {
   if (t.kind === "Handle") return handleMangledName(t);
   if (t.kind === "TupleCell") return tupleCellMangledName(t);
   if (t.kind === "HomogeneousCell") return homogeneousCellMangledName(t);
+  if (t.kind === "Class") return classMangledName(t);
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
     if (isScalar(t)) return "char";
@@ -826,7 +906,8 @@ export type CategoryKind =
   | "struct"
   | "handle"
   | "tuple-cell"
-  | "homogeneous-cell";
+  | "homogeneous-cell"
+  | "class";
 
 /** Stable identity for a C storage slot. `kind` is the coarse category
  *  used by dispatchers; `id` carries enough additional detail to
@@ -891,6 +972,18 @@ export function storageCategory(t: MType): StorageCategory | null {
     return {
       kind: "homogeneous-cell",
       id: `homogeneous-cell:${elemKey}`,
+    };
+  }
+  if (t.kind === "Class") {
+    // Storage category is keyed on the class identity (file + name)
+    // only — not on the property types. Two ClassType values for the
+    // same class share a single C variable; their property types
+    // widen via `unify`, just like struct fields. Two different
+    // classes never share storage even when their property shapes
+    // happen to coincide.
+    return {
+      kind: "class",
+      id: `class:${t.file}:${t.className}`,
     };
   }
   if (t.kind !== "Numeric") return null;
@@ -991,6 +1084,12 @@ export function absentDefaultFor(present: ReadonlyArray<MType>): MType {
       // default is one of the present types (an empty homogeneous
       // cell of that elem shape) — predeclaration zero-inits
       // `{data=NULL, len=0}` which the free helper handles.
+      return present[0];
+    case "class":
+      // Every arm carries the same class identity (storage-category
+      // equality above guaranteed it). The absent default is that
+      // shape — its predeclared empty handle is a zero-init struct
+      // that frees cleanly at scope exit.
       return present[0];
     case "scalar-real":
     case "scalar-complex":
@@ -1297,6 +1396,34 @@ export function unify(a: MType, b: MType): MType {
     }
     return tupleCellType(merged);
   }
+  // Class sibling variant. Two ClassTypes unify iff they have the
+  // same class identity (file + className) AND every pairwise
+  // property type unifies. Different classes never unify even when
+  // their property shapes coincide — distinct typedefs, distinct C
+  // storage. Property-level unify→Unknown collapses the whole
+  // result to Unknown so `recordAssignment` reports a clear
+  // category mismatch.
+  if (a.kind === "Class" || b.kind === "Class") {
+    if (a.kind !== "Class" || b.kind !== "Class") return { kind: "Unknown" };
+    if (a.className !== b.className || a.file !== b.file) {
+      return { kind: "Unknown" };
+    }
+    if (a.properties.length !== b.properties.length) return { kind: "Unknown" };
+    const merged: { name: string; type: MType }[] = [];
+    for (let i = 0; i < a.properties.length; i++) {
+      const ap = a.properties[i];
+      const bp = b.properties[i];
+      if (ap.name !== bp.name) return { kind: "Unknown" };
+      const u = unify(ap.type, bp.type);
+      if (u.kind === "Unknown") return { kind: "Unknown" };
+      merged.push({ name: ap.name, type: u });
+    }
+    return classType({
+      className: a.className,
+      file: a.file,
+      properties: merged,
+    });
+  }
   // HomogeneousCell sibling variant. Two homogeneous cells unify iff
   // their element types unify; the runtime length joins via the same
   // DimInfo lattice as tensor dims. An Unknown elem (produced by an
@@ -1497,6 +1624,17 @@ export function canonicalizeType(t: MType): unknown {
       elem: canonicalizeType(t.elem),
     };
   }
+  if (t.kind === "Class") {
+    // Class identity (file + name) plus the canonicalized property
+    // tuple. Higher-order callers / method specializations key on
+    // this shard via `canonicalizeType` of every arg type.
+    return {
+      kind: "Class",
+      className: t.className,
+      file: t.file,
+      properties: t.properties.map(p => [p.name, canonicalizeType(p.type)]),
+    };
+  }
   // Normalize before serializing so two complex types differing only
   // in a leftover `sign` field hash to the same specialization key.
   const normalized = normalizeComplexSign(t);
@@ -1553,6 +1691,10 @@ export function typeToString(t: MType): string {
   }
   if (t.kind === "HomogeneousCell") {
     return `HomogeneousCell<${typeToString(t.elem)}, len=${dimToString(t.len)}>`;
+  }
+  if (t.kind === "Class") {
+    const parts = t.properties.map(p => `${p.name}:${typeToString(p.type)}`);
+    return `Class<${t.className}, {${parts.join(", ")}}>`;
   }
   const cat = shapeCategory(t);
   // dims is array-valued so rendered into the framing prefix; the

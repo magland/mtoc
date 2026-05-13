@@ -266,12 +266,27 @@ export class Lowerer {
    *  function visibility rules apply correctly. */
   readonly currentFile: string;
 
+  /** Enclosing class name when lowering inside a class method body —
+   *  used to populate `CallSite.className` so the resolver's
+   *  class-file local-function precedence rule (which scopes
+   *  `classFileSubfunctions` per className) works correctly. Undefined
+   *  at script scope and inside ordinary (non-method) functions. */
+  readonly currentClassName?: string;
+
+  /** Enclosing method name when lowering inside a class method body —
+   *  used to populate `CallSite.methodName`. Lets the resolver scope
+   *  external-method-file local helpers to the right method. Undefined
+   *  outside class-method bodies. */
+  readonly currentMethodName?: string;
+
   constructor(
     shared: SharedSpecState,
     paramBindings: Array<{ name: string; cName: string; ty: MType }> = [],
     outputVars: string[] = [],
     isInsideFunction = false,
-    currentFile?: string
+    currentFile?: string,
+    currentClassName?: string,
+    currentMethodName?: string
   ) {
     this.shared = shared;
     this.params = new Set(paramBindings.map(p => p.name));
@@ -282,6 +297,8 @@ export class Lowerer {
     this.outputVars = outputVars;
     this.isInsideFunction = isInsideFunction;
     this.currentFile = currentFile ?? shared.workspace.mainFile;
+    this.currentClassName = currentClassName;
+    this.currentMethodName = currentMethodName;
   }
 
   /** Populate the struct-state shape map for the body about to be
@@ -324,6 +341,27 @@ export class Lowerer {
    *  references see the post-split cName. */
   currentCNameFor(name: string): string {
     return this.currentBindingCName.get(name) ?? cNameFor(name);
+  }
+
+  /** Build a `CallSite` for the vendored resolver. Fills in `file`
+   *  plus the optional `className` / `methodName` lexical-scope fields
+   *  when this `Lowerer` is specializing a class method body. Helpers
+   *  use this instead of constructing a `{ file: this.currentFile }`
+   *  literal so a new resolver-relevant field added later only needs
+   *  to be added in one place. */
+  callSite(): {
+    file: string;
+    className?: string;
+    methodName?: string;
+  } {
+    const cs: { file: string; className?: string; methodName?: string } = {
+      file: this.currentFile,
+    };
+    if (this.currentClassName !== undefined)
+      cs.className = this.currentClassName;
+    if (this.currentMethodName !== undefined)
+      cs.methodName = this.currentMethodName;
+    return cs;
   }
 
   // ── Statements ────────────────────────────────────────────────────────
@@ -759,9 +797,12 @@ export class Lowerer {
             const u = handleUserCallable(envTy, s.span);
             userTarget = { ast: u.ast, file: u.file, callName: u.name };
           } else if (envTy === undefined) {
+            // Args not lowered yet; pass `[]`. See the parallel comment
+            // in `lowerFuncCall.ts`.
             const target = this.shared.workspace.resolve(
               s.expr.name,
-              { file: this.currentFile },
+              [],
+              this.callSite(),
               s.expr.span
             );
             if (target?.kind === "userFunction") {
@@ -860,9 +901,12 @@ export class Lowerer {
             s.span
           );
         }
+        // Args not lowered yet; pass `[]`. See parallel comment in
+        // `lowerFuncCall.ts`.
         const target = this.shared.workspace.resolve(
           s.expr.name,
-          { file: this.currentFile },
+          [],
+          this.callSite(),
           s.expr.span
         );
         if (target?.kind !== "userFunction") {

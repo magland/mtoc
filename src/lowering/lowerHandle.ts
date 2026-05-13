@@ -54,9 +54,12 @@ export function lowerFuncHandle(
     );
   }
   let ty: HandleType;
+  // Handles never carry arg types at the @-site (no call is happening
+  // here); pass `[]` and let the resolver run with empty args.
   const target = this.shared.workspace.resolve(
     e.name,
-    { file: this.currentFile },
+    [],
+    this.callSite(),
     e.span
   );
   if (target?.kind === "userFunction") {

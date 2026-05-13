@@ -23,10 +23,41 @@ import { allBuiltinNames } from "./builtins.js";
 import { LoweringContext } from "../numbl-core/lowering/loweringContext.js";
 import { resolveFunction } from "../numbl-core/functionResolve.js";
 import type { CallSite } from "../numbl-core/runtime/runtimeHelpers.js";
+import type { ItemType } from "../numbl-core/lowering/itemTypes.js";
+import type { MType } from "../lowering/types.js";
 import { UnsupportedConstruct } from "../lowering/errors.js";
 
 import type { FunctionStmt } from "../lowering/astAliases.js";
 export type { FunctionStmt };
+
+/**
+ * Adapter from mtoc's `MType` to numbl's `ItemType`. Used to feed the
+ * vendored `resolveFunction` enough information to apply its full
+ * precedence rules — most importantly the class-instance branch that
+ * decides class-method dispatch.
+ *
+ * The conversion is intentionally lossy: the resolver inspects
+ * `kind === "ClassInstance"` and (only there) `className`. Every other
+ * MType kind is observationally equivalent to `Unknown` from the
+ * resolver's perspective, so we collapse them. If a future resolver
+ * patch adds (say) a `Struct`-aware branch, this is the single
+ * adapter that needs upgrading.
+ */
+export function mtypeToItemType(t: MType): ItemType {
+  switch (t.kind) {
+    case "Class":
+      return { kind: "ClassInstance", className: t.className };
+    case "Numeric":
+    case "String":
+    case "Struct":
+    case "Handle":
+    case "TupleCell":
+    case "HomogeneousCell":
+    case "Unknown":
+    case "Void":
+      return { kind: "Unknown" };
+  }
+}
 
 export interface WorkspaceFile {
   name: string;
@@ -121,10 +152,30 @@ export class Workspace {
    *  rich tagged target (`workspaceFunction`, `localFunction`,
    *  `privateFunction`, `classMethod`, …); mtoc translates it back into
    *  its own narrow `ResolvedTarget`. Unsupported kinds raise
-   *  `UnsupportedConstruct` at the call site. */
-  resolve(name: string, callSite: CallSite, span: Span): ResolvedTarget | null {
+   *  `UnsupportedConstruct` at the call site.
+   *
+   *  `argTypes` carries the mtoc-side types of the call's arguments,
+   *  in declaration order. They're converted to numbl's ItemType via
+   *  `mtypeToItemType` and fed to the resolver so its precedence rules
+   *  (class-method-vs-workspace-function-vs-local-function,
+   *  InferiorClasses promotion, static-method `stripInstance`) all
+   *  apply correctly. Pass `[]` when the args haven't been lowered yet
+   *  — the resolver's behavior on empty `argTypes` matches the legacy
+   *  call sites' behavior exactly. */
+  resolve(
+    name: string,
+    argTypes: ReadonlyArray<MType>,
+    callSite: CallSite,
+    span: Span
+  ): ResolvedTarget | null {
     this.finalize();
-    const target = resolveFunction(name, [], callSite, this.ctx.functionIndex);
+    const itemTypes = argTypes.map(t => mtypeToItemType(t));
+    const target = resolveFunction(
+      name,
+      itemTypes,
+      callSite,
+      this.ctx.functionIndex
+    );
     if (!target) return null;
     switch (target.kind) {
       case "builtin":
@@ -214,6 +265,23 @@ export class Workspace {
         );
       }
     }
+  }
+
+  /** Resolve a call against a specific class — sets `targetClassName`
+   *  on the CallSite before delegating to `resolve`. Use for the
+   *  method-call-syntax (`obj.method(args)`) and super-call
+   *  (`obj@Parent(args)`) paths: the resolver's `targetClassName`
+   *  short-circuit ([functionResolve.ts:174-192]) forces dispatch
+   *  into the named class while still honoring the static-method
+   *  detection / `stripInstance` flip. */
+  resolveForTargetClass(
+    name: string,
+    argTypes: ReadonlyArray<MType>,
+    targetClassName: string,
+    callSite: CallSite,
+    span: Span
+  ): ResolvedTarget | null {
+    return this.resolve(name, argTypes, { ...callSite, targetClassName }, span);
   }
 
   hasBuiltin(name: string): boolean {
