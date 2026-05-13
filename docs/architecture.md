@@ -147,7 +147,12 @@ if(_mtoc_n > 1024)` above the outermost loop of both the flat-iter
   `helper(helper(x))`, `bump(helper(x), 7)`, `sum(helper(x))`,
   `disp(a + b)`, `sum(sqrt(a + b))`, `[1 2] + 1`, `v(1:3) + 1`,
   `(a + b) + c` (strings), etc. all decompose into a sequence of
-  well-formed Assigns automatically.
+  well-formed Assigns automatically. The sibling case of a bare
+  statement-scope owned expression (`foo(x);`, `[1,2,3];`) is handled
+  inline by the `ExprStmt` lowering: the result is bound to a synthetic
+  `_mtoc_stmt_discard_<N>` registered in `assignedVars` so the buffer
+  is released by the same scope-exit free walk, with no ANF lifting
+  needed (there is no consumer to lift out of).
 - **Function-file entry**: when the source has no top-level script
   statements but at least one function definition, `lower()` adopts
   the first function's body as the script body. The function still

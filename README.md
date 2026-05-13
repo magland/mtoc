@@ -182,9 +182,13 @@ The subset is growing iteratively. Roughly:
   per output (owned slots use `mtoc_<kind>_assign` so the caller's
   prior buffer is consumed cleanly). Multi-output calls use the
   `[a, b] = foo(x);` syntax (with `~` to drop a slot — owned discard
-  slots are freed right after the call so they don't leak); 0-output
-  and N-output functions can also be invoked as bare statements
-  `foo(x);`. Tensor / char / string params are owned by the callee
+  slots are freed right after the call so they don't leak); 0-output,
+  1-output, and N-output functions can all be invoked as bare
+  statements `foo(x);`. For a 1-output owned return, lowering binds
+  the result to a synthetic `_mtoc_stmt_discard_<N>` so the heap
+  buffer is freed at scope exit by the standard owned-LHS free walk;
+  the same path covers any owned-typed bare expression like
+  `[1,2,3];`. Tensor / char / string params are owned by the callee
   under copy-on-arg-pass — the body can reassign them freely
 - Function-file entry: a `.m` file with only function definitions
   (no top-level script statements) is translated by treating the

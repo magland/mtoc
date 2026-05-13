@@ -37,9 +37,9 @@ import {
   canShareStorage,
   isHandle,
   isMultiElement,
+  isOwned,
   isScalarComplex,
   isScalarReal,
-  isString,
   isStruct,
   MType,
   NumericType,
@@ -195,6 +195,11 @@ export class Lowerer {
    *  incompatible reassignment. Per-scope so different functions don't
    *  share numbering. */
   private splitCounter = 0;
+  /** Counter for the synthetic suffix used by `synthesizeDiscardAssign`
+   *  to give each bare-statement-scope owned expression a unique
+   *  `_mtoc_stmt_discard_<N>` binding. Per-scope so different functions
+   *  don't share numbering. */
+  private discardCounter = 0;
   /** Names of params for the current scope (function scope only). */
   private params: ReadonlySet<string>;
   /** Output variables for the current function scope, in declaration
@@ -425,6 +430,22 @@ export class Lowerer {
         `reassignment outside the surrounding if/while/for.`,
       span
     );
+  }
+
+  /** Allocate a fresh `_mtoc_stmt_discard_<N>` binding and return an
+   *  `Assign` of `rhs` into it. Used by the `ExprStmt` lowering to give
+   *  a bare statement-scope owned expression (tensor / string /
+   *  char-array / struct / handle-with-captures) a name to take
+   *  ownership of, so the heap buffer is released at scope exit by the
+   *  standard owned-LHS predeclare + free walk. The synthetic cName is
+   *  never user-visible — it lives only in `assignedVars`, with no
+   *  matching MATLAB-name entry in `currentBindingCName` (so no user
+   *  read can target it). */
+  private synthesizeDiscardAssign(rhs: IRExpr, span: Span): IRStmt {
+    const cName = `_mtoc_stmt_discard_${this.discardCounter++}`;
+    const ty = rhs.ty;
+    this.assignedVars.set(cName, { ty, cName });
+    return { kind: "Assign", name: cName, cName, rhs, ty, span };
   }
 
   /**
@@ -712,26 +733,18 @@ export class Lowerer {
           }
         }
         const expr = this.lowerExpr(s.expr);
-        // A bare tensor-valued expression at statement scope can't be
-        // emitted today — there's no target buffer to write into. Reject
-        // here so the user sees a span instead of a codegen stack trace.
-        if (isMultiElement(expr.ty)) {
-          throw new UnsupportedConstruct(
-            `tensor-valued expression at statement scope is not yet ` +
-              `supported (assign it to a variable first)`,
-            s.span
-          );
-        }
-        // String-valued bare expressions at statement scope have the
-        // same problem — the owned result has no name to be released
-        // through. Reject with a span; the user can drop the value
-        // into a variable to take ownership.
-        if (isString(expr.ty)) {
-          throw new UnsupportedConstruct(
-            `string-valued expression at statement scope is not yet ` +
-              `supported (assign it to a variable first)`,
-            s.span
-          );
+        // Owned-valued bare expression at statement scope (tensor /
+        // string / char-array / struct / handle-with-captures): bind
+        // the result to a synthetic `_mtoc_stmt_discard_<N>` so the
+        // returned heap buffer has a name to take ownership of. The
+        // discard binding lives in `assignedVars`, so the standard
+        // scope-exit free walk releases it; the standard owned-LHS
+        // `Assign` codegen consumes the producer's handle directly
+        // (no extra copy). A bare `Var` of an owned name would deep-
+        // copy, so short-circuit that to a value-discarding `ExprStmt`
+        // — reading a Var has no side effect and no buffer to free.
+        if (isOwned(expr.ty) && expr.kind !== "Var") {
+          return this.synthesizeDiscardAssign(expr, s.span);
         }
         return { kind: "ExprStmt", expr, span: s.span };
       }

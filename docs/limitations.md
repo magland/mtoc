@@ -142,12 +142,14 @@ workaround or a roadmap note.
   `y = foo(x) .* bar(z)`, `y = foo(foo(x))`, `y = bump(foo(x), 7)`,
   `s = sum(foo(x))`, `disp(foo(x))` all decompose to a sequence of
   synthetic `_mtoc_anf_<N> = <producer>;` Assigns whose temps are
-  predeclared and freed by the standard liveness machinery. What's
-  still deferred:
-  - **Bare statement form for owned-returning 1-output functions.**
-    `foo(x);` (where `foo` returns a tensor) still rejects with
-    "tensor-valued expression at statement scope"; capture into a name
-    if you want the buffer freed automatically at scope exit.
+  predeclared and freed by the standard liveness machinery. The bare
+  statement form `foo(x);` (where `foo` returns an owned value —
+  tensor / string / char-array / struct / handle-with-captures) is
+  also supported: lowering synthesizes a `_mtoc_stmt_discard_<N>`
+  binding for the result so the side effect runs and the heap buffer
+  is freed at scope exit by the standard owned-LHS predeclare + free
+  walk. The same path covers any owned-typed bare expression
+  (`[1,2,3];`, `[1,2,3] + [4,5,6];`).
 
 - **Reductions (`sum` / `min` / `max`) require a statically-known
   scalar-or-vector vs matrix shape.** mtoc dispatches on the argument's
