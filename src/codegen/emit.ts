@@ -35,8 +35,7 @@ import { analyzeStmts } from "./emitAnalysis.js";
 import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
-import { emitStructBlocks } from "./emitStruct.js";
-import { emitHandleBlocks } from "./emitHandle.js";
+import { emitOwnedTypedefBlocks } from "./emitOwnedTypedefs.js";
 import { inlinePass } from "./inline/inlinePass.js";
 import { isParallelThreadsOption } from "../build.js";
 
@@ -109,19 +108,13 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   for (const fn of prog.functions) analyzeStmts(state, fn.body);
   analyzeStmts(state, prog.stmts);
 
-  // Emit per-struct-type typedefs and helpers (empty/free/copy/assign/disp).
-  // These need to be above the user-function bodies and main, so users
-  // can declare struct-typed locals.
-  const structBlocks = emitStructBlocks(state, prog);
-
-  // Per-handle-shape typedefs + helpers (empty/free/copy/assign). One
-  // shared `_mtoc_handle_empty_t` typedef covers every no-capture
-  // handle; with-capture handles get one typedef per distinct
-  // capture-tuple shape. Emitted AFTER struct blocks so a handle
-  // whose capture references a struct typedef sees that typedef in
-  // scope; emitted BEFORE user-function bodies so a function param
-  // declared with the typedef can reference it.
-  const handleBlocks = emitHandleBlocks(state, prog);
+  // Per-shape typedefs + helpers for every owned kind (struct,
+  // handle, tuple cell, homogeneous cell), unified by a cross-kind
+  // topological sort so a struct field holding a homogeneous-cell
+  // value precedes the cell's typedef AND a cell elem holding a
+  // struct precedes the struct's typedef. Emitted ahead of the user-
+  // function bodies and main.
+  const typedefBlocks = emitOwnedTypedefBlocks(state, prog);
 
   // Emit user-function bodies first into separate buffers; we paste
   // them into the output below, before main.
@@ -181,11 +174,8 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   for (const block of runtimeBlocks) {
     out.push(block, "");
   }
-  if (structBlocks.length > 0) {
-    out.push(...structBlocks);
-  }
-  if (handleBlocks.length > 0) {
-    out.push(...handleBlocks);
+  if (typedefBlocks.length > 0) {
+    out.push(...typedefBlocks);
   }
   for (const fnLines of functionBlocks) {
     out.push(...fnLines, "");

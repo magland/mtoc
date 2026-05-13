@@ -35,6 +35,7 @@ import type {
 import {
   absentDefaultFor,
   canShareStorage,
+  isCell,
   isHandle,
   isMultiElement,
   isOwned,
@@ -61,6 +62,12 @@ import {
   lowerStructConstructor,
   lowerStructFieldIndex,
 } from "./lowerStruct.js";
+import { CellLoweringState } from "./cellLoweringState.js";
+import {
+  lowerCellIndexRead,
+  lowerCellIndexStore,
+  lowerCellLiteral,
+} from "./lowerCell.js";
 
 import { lowerIf } from "./lowerIf.js";
 import { lowerFor } from "./lowerFor.js";
@@ -243,6 +250,11 @@ export class Lowerer {
    *  alongside in the same shape. See `structLoweringState.ts`. */
   struct = new StructLoweringState();
 
+  /** Per-scope cell-lowering state — pre-pass tuple-vs-homogeneous
+   *  decision per root variable that ever appears as a cell. See
+   *  `cellLoweringState.ts`. */
+  cell = new CellLoweringState();
+
   /** Function-specialization cache + workspace handle. Helpers in
    *  sibling files reach through this for user-call dispatch. */
   readonly shared: SharedSpecState;
@@ -276,6 +288,13 @@ export class Lowerer {
    *  lowered. Called once before the body's stmts are visited. */
   primeStructShapes(body: ReadonlyArray<Stmt>): void {
     this.struct.primeFromBody(body);
+  }
+
+  /** Populate the cell-state shape map for the body about to be
+   *  lowered. Called once before the body's stmts are visited,
+   *  alongside `primeStructShapes`. */
+  primeCellShapes(body: ReadonlyArray<Stmt>): void {
+    this.cell.primeFromBody(body);
   }
 
   /** Build a `StructType` for `rootName` reflecting the current
@@ -387,15 +406,36 @@ export class Lowerer {
         ty: merged,
         cName: prevBinding.cName,
       });
-      // For struct and handle types, also widen env to the merged
-      // type. The codegen pipeline (normalizeStructTypes,
-      // handle-capture snapshot in `lowerAnonFunc`) reads the
-      // widened type from assignedVars or env; keeping env in sync
-      // here avoids a discrepancy between the at-time captured type
-      // and the post-normalize struct/handle typedef.
-      if (isStruct(merged) || isHandle(merged)) {
+      // For struct, handle, and cell types, also widen env to the
+      // merged type. The codegen pipeline (normalizeStructTypes,
+      // handle-capture snapshot in `lowerAnonFunc`, cell post-
+      // widening typedef collapse) reads the widened type from
+      // assignedVars or env; keeping env in sync here avoids a
+      // discrepancy between the at-time captured type and the
+      // post-normalize typedef.
+      if (isStruct(merged) || isHandle(merged) || isCell(merged)) {
         this.env.set(name, merged);
       }
+      return prevBinding.cName;
+    }
+    // Struct / cell types: when the storage category matches (same
+    // field-name set for struct, same arity for tuple cell, same elem
+    // storage for homogeneous cell) but field-wise unify produced
+    // Unknown, the conflict is almost always an unassigned-field
+    // placeholder (scalarDouble("zero") from `buildStructType`) vs
+    // the field's first real assignment of an incompatible category
+    // (e.g. cell, string). Take the NEW type wholesale — the
+    // normalize pass at the end of lowering already propagates the
+    // final widened type to every reference, so the typedef stays
+    // consistent. Pure numeric → numeric mismatches still fall into
+    // the split / error path below since `canShareStorage` rejects
+    // them.
+    if (canShareStorage(prevBinding.ty, ty) && (isStruct(ty) || isCell(ty))) {
+      this.assignedVars.set(prevBinding.cName, {
+        ty,
+        cName: prevBinding.cName,
+      });
+      this.env.set(name, ty);
       return prevBinding.cName;
     }
 
@@ -598,7 +638,21 @@ export class Lowerer {
         );
 
       case "Assign": {
-        const rhs = this.lowerExpr(s.expr);
+        // Cell-array literal RHS: consult the pre-pass shape decision
+        // for the LHS to decide whether to lower as a tuple or
+        // homogeneous cell. The pre-pass guarantees the LHS shape is
+        // pinned for the variable's lifetime — `recordAssignment`'s
+        // storage-category machinery then refuses a later assignment
+        // that crosses category.
+        let rhs: IRExpr;
+        if (s.expr.type === "Cell") {
+          const shape = this.cell.shapes.get(s.name);
+          const shapeKind = shape?.kind ?? null;
+          const expectedArity = shape?.kind === "tuple" ? shape.arity : null;
+          rhs = lowerCellLiteral(this, s.expr, shapeKind, expectedArity);
+        } else {
+          rhs = this.lowerExpr(s.expr);
+        }
         // If the RHS is a StructLit and the LHS is in the pre-pass
         // struct-shape map, widen the RHS to the full struct shape
         // for the variable (other fields stay as their previously-
@@ -650,6 +704,9 @@ export class Lowerer {
         }
         if (s.lvalue.type === "Member") {
           return lowerMemberStore.call(this, s.lvalue, s.expr, s.span);
+        }
+        if (s.lvalue.type === "IndexCell") {
+          return lowerCellIndexStore(this, s.lvalue, s.expr, s.span);
         }
         throw new UnsupportedConstruct(
           `assignment to a ${s.lvalue.type} lvalue is not yet supported`,
@@ -985,6 +1042,18 @@ export class Lowerer {
       case "Tensor":
         return lowerTensorLiteral.call(this, e);
 
+      case "Cell":
+        // `{e1, …, eN}` literal in expression position (NOT the
+        // direct RHS of an Assign — that case is handled in the
+        // Assign arm of lowerStmt so we can consult the LHS's pre-
+        // pass shape). Without a target binding, we have to decide
+        // tuple-vs-homogeneous from the literal alone — homogeneous
+        // when slot types unify, else reject.
+        return lowerCellLiteral(this, e, null, null);
+
+      case "IndexCell":
+        return lowerCellIndexRead(this, e);
+
       case "FuncCall":
         // Special-case the `struct(...)` constructor before generic
         // function-call dispatch — it shouldn't go through the
@@ -1126,6 +1195,9 @@ function validateStmt(s: IRStmt): void {
     } else if (top === "struct-lit") {
       const lit = s.rhs as Extract<IRExpr, { kind: "StructLit" }>;
       for (const f of lit.fields) rejectNestedOwnedExpr(f.value);
+    } else if (top === "cell-lit") {
+      const lit = s.rhs as Extract<IRExpr, { kind: "CellLit" }>;
+      for (const el of lit.elements) rejectNestedOwnedExpr(el);
     } else {
       rejectNestedOwnedExpr(s.rhs);
       if (isMultiElement(s.rhs.ty)) {
@@ -1211,6 +1283,7 @@ export function lower(
   };
   const top = new Lowerer(shared);
   top.primeStructShapes(bodyToLower);
+  top.primeCellShapes(bodyToLower);
   const stmts = top.lowerStmts(bodyToLower);
   const prog: IRProgram = {
     assignedVars: top.getAssignedVars(),

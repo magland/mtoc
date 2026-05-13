@@ -21,10 +21,12 @@
 import type { Expr, Span } from "../parser/index.js";
 import { UnsupportedConstruct } from "../lowering/errors.js";
 import type { IRExpr, IRStmt } from "../lowering/ir.js";
+import { cellDispSupported } from "../codegen/emitTupleCell.js";
 import {
   arithResult,
   charArrayType,
   dimIsOne,
+  isCell,
   isCharArray,
   isCharScalar,
   isHigherDim,
@@ -488,6 +490,16 @@ const BUILTINS: BuiltinSig[] = [
       // expression at this consume site into a synthetic
       // `_mtoc_anf_<N>` Assign, so codegen ultimately sees a Var or
       // literal regardless of what shape the user wrote here.
+      if (isCell(arg.ty) && !cellDispSupported(arg.ty)) {
+        throw new UnsupportedConstruct(
+          `disp of a cell with this slot/elem shape is not yet supported ` +
+            `by mtoc (cells holding tensors, structs, or other cells need ` +
+            `multi-line inline rendering that mtoc doesn't yet emit). ` +
+            `Disp individual slots via 'disp(c{i})' or 'disp(c{i}.field)' ` +
+            `instead.`,
+          span
+        );
+      }
       return { kind: "Disp", arg, span };
     },
   },

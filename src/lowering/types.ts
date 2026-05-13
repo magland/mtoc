@@ -369,6 +369,118 @@ export function structMangledName(t: StructType): string {
   return `_mtoc_struct__${fnv1a32Hex(canonical)}`;
 }
 
+/**
+ * Tuple cell — fixed-shape heterogeneous container.
+ *
+ * A 1×N cell array whose slot count is fixed for the lifetime of a
+ * variable and whose per-slot MTypes may differ. Used when a `{e1, e2,
+ * …, eN}` literal is the sole pattern of assignment and every `c{i}` /
+ * `c{i} = …` reference uses a constant integer index — the cell pre-
+ * pass walks the body and decides between this variant and
+ * `HomogeneousCellType` based on those observed patterns.
+ *
+ * C representation: one typedef per distinct slot-type tuple shape
+ * (`_mtoc_tcell__<8hex>`) with one named field per slot (`slot_0`,
+ * `slot_1`, …) — exactly the structure `StructType` uses, just with
+ * positional rather than named members. Nested owned slots compose
+ * through `ownedKinds` recursively.
+ *
+ * Two tuple cells unify iff they have the same slot count and every
+ * pairwise slot type unifies; the merged shape pulls through the
+ * widened types per slot (same rule as struct field merging).
+ */
+export interface TupleCellType {
+  kind: "TupleCell";
+  /** One entry per slot, in declaration (1-based source) order. The
+   *  C-side field name is `slot_<index>` (0-based) — see
+   *  `tupleCellSlotFieldName`. */
+  slots: ReadonlyArray<MType>;
+}
+
+export function tupleCellType(slots: ReadonlyArray<MType>): TupleCellType {
+  return { kind: "TupleCell", slots };
+}
+
+/** True when `t` is a fixed-shape heterogeneous cell. */
+export function isTupleCell(t: MType): t is TupleCellType {
+  return t.kind === "TupleCell";
+}
+
+/** Mangled C typedef name for a tuple-cell shape. Two `TupleCellType`s
+ *  with the same canonicalized slot-type list produce the same name. */
+export function tupleCellMangledName(t: TupleCellType): string {
+  const canonical = JSON.stringify({
+    slots: t.slots.map(s => canonicalizeType(s)),
+  });
+  return `_mtoc_tcell__${fnv1a32Hex(canonical)}`;
+}
+
+/** C field identifier for the k-th slot of a tuple cell (0-based). */
+export function tupleCellSlotFieldName(k: number): string {
+  return `slot_${k}`;
+}
+
+/**
+ * Homogeneous cell — variable-length container of one element type.
+ *
+ * A 1×N cell array whose length may vary at runtime and whose every
+ * slot carries the same MType. Used when the source program contains
+ * dynamic-index access (`c{i}` with `i` not a constant integer literal),
+ * the empty-literal pattern (`c = {}` followed by growth), or simply a
+ * `{...}` literal whose slot types all agree.
+ *
+ * C representation: one typedef per distinct element MType
+ * (`_mtoc_hcell__<8hex>`) with two fields:
+ *   - `data` — pointer to `len` consecutive elements of the element's
+ *     C type
+ *   - `len` — current element count (`long`)
+ * The buffer is heap-allocated; `_assign` consume-replaces; `_copy`
+ * deep-copies (per-element via the element kind's `_copy` helper for
+ * owned elements).
+ *
+ * Length is categorical (`one`/`notOne`/`unknown`) — the same lattice
+ * used for tensor dims — so two homogeneous cells with the same elem
+ * MType but different runtime lengths share one specialization key.
+ */
+export interface HomogeneousCellType {
+  kind: "HomogeneousCell";
+  /** The MType every slot carries. Any supported MType (numeric,
+   *  string, struct, handle, tuple/homogeneous cell, …) is admissible;
+   *  the owned-kind machinery recurses through `elem`'s helpers. */
+  elem: MType;
+  /** Length lattice: `one` means statically 1-element (rare —
+   *  collapses into a tuple cell in most pre-pass paths but kept as
+   *  the lattice for uniformity); `notOne` means provably ≥0 but ≠1
+   *  (admits empty and any n≥2); `unknown` means nothing known. */
+  len: DimInfo;
+}
+
+export function homogeneousCellType(
+  elem: MType,
+  len: DimInfo
+): HomogeneousCellType {
+  return { kind: "HomogeneousCell", elem, len };
+}
+
+/** True when `t` is a variable-length homogeneous cell. */
+export function isHomogeneousCell(t: MType): t is HomogeneousCellType {
+  return t.kind === "HomogeneousCell";
+}
+
+/** True when `t` is any kind of cell — tuple or homogeneous. */
+export function isCell(t: MType): t is TupleCellType | HomogeneousCellType {
+  return isTupleCell(t) || isHomogeneousCell(t);
+}
+
+/** Mangled C typedef name for a homogeneous-cell shape. Two
+ *  `HomogeneousCellType`s with the same canonicalized element type
+ *  produce the same name; length is NOT part of the hash (it's
+ *  runtime data on the struct, like tensor dims). */
+export function homogeneousCellMangledName(t: HomogeneousCellType): string {
+  const canonical = JSON.stringify({ elem: canonicalizeType(t.elem) });
+  return `_mtoc_hcell__${fnv1a32Hex(canonical)}`;
+}
+
 /** Maximum tensor dimensionality mtoc emits. MUST match
  *  `MTOC_MAX_NDIM` in `runtime/tensor.h`; the runtime allocator helpers
  *  (`mtoc_tensor_alloc_nd` / `mtoc_tensor_alloc_nd_complex`) `abort()`
@@ -382,6 +494,8 @@ export type MType =
   | StringType
   | StructType
   | HandleType
+  | TupleCellType
+  | HomogeneousCellType
   | { kind: "Unknown" }
   | { kind: "Void" };
 
@@ -620,7 +734,9 @@ export function isOwned(t: MType): boolean {
   // helpers are trivial (no heap fields) but routing through the
   // owned-kind pipeline keeps every declaration / assign / scope-
   // exit-free dispatch site identical across handle shapes.
-  return isMultiElement(t) || isString(t) || isStruct(t) || isHandle(t);
+  return (
+    isMultiElement(t) || isString(t) || isStruct(t) || isHandle(t) || isCell(t)
+  );
 }
 
 export function isScalarReal(t: MType): boolean {
@@ -657,6 +773,8 @@ export function cTypeFor(t: MType): string | null {
   // capture-tuple shape. The function dispatch is still static —
   // the struct only carries captures.
   if (t.kind === "Handle") return handleMangledName(t);
+  if (t.kind === "TupleCell") return tupleCellMangledName(t);
+  if (t.kind === "HomogeneousCell") return homogeneousCellMangledName(t);
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
     if (isScalar(t)) return "char";
@@ -706,7 +824,9 @@ export type CategoryKind =
   | "char-array"
   | "string"
   | "struct"
-  | "handle";
+  | "handle"
+  | "tuple-cell"
+  | "homogeneous-cell";
 
 /** Stable identity for a C storage slot. `kind` is the coarse category
  *  used by dispatchers; `id` carries enough additional detail to
@@ -748,6 +868,31 @@ export function storageCategory(t: MType): StorageCategory | null {
       id: `struct:{${t.fields.map(f => f.name).join(",")}}`,
     };
   }
+  if (t.kind === "TupleCell") {
+    // Tuple-cell storage category is keyed on the slot count only;
+    // per-slot types may widen across assignments under the same
+    // rule that lets struct fields widen. Two tuple cells with the
+    // same arity share one C variable; their final per-slot types
+    // come from `unify`, which widens compatibly.
+    return {
+      kind: "tuple-cell",
+      id: `tuple-cell:${t.slots.length}`,
+    };
+  }
+  if (t.kind === "HomogeneousCell") {
+    // Homogeneous-cell storage category is keyed on the element
+    // type's STORAGE CATEGORY (not the full type). That way two
+    // homogeneous cells whose elem types share a C slot (e.g. two
+    // double scalars with different signs) share one C cell binding;
+    // their final elem type comes from `unify`. The runtime length
+    // lives on the struct, like tensor dims.
+    const elemCat = storageCategory(t.elem);
+    const elemKey = elemCat === null ? "unknown" : elemCat.id;
+    return {
+      kind: "homogeneous-cell",
+      id: `homogeneous-cell:${elemKey}`,
+    };
+  }
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
     if (isScalar(t)) return { kind: "scalar-char", id: "scalar-char" };
@@ -773,11 +918,31 @@ export function storageCategory(t: MType): StorageCategory | null {
  *  binding, and a real-tensor predecl can't hold a complex-tensor
  *  value. Specific runtime size is NOT part of the category; tensor
  *  reassignments at the same coarse shape free and realloc the
- *  backing buffer in place. */
+ *  backing buffer in place.
+ *
+ *  One special case: a `HomogeneousCell<Unknown>` (the type of an
+ *  empty `c = {}` literal before any slot is written) widens to any
+ *  concrete-elem homogeneous cell. This is what makes the "empty
+ *  cell, then grow inside a loop" pattern legal — the storage slot
+ *  is decided by the eventual concrete elem, and the prior empty
+ *  handle was zero-valued anyway. */
 export function canShareStorage(prev: MType, next: MType): boolean {
   const pc = storageCategory(prev);
   const nc = storageCategory(next);
-  return pc !== null && nc !== null && pc.id === nc.id;
+  if (pc === null || nc === null) return false;
+  if (pc.id === nc.id) return true;
+  if (
+    pc.kind === "homogeneous-cell" &&
+    nc.kind === "homogeneous-cell" &&
+    (homogeneousCellElemIsUnknown(prev) || homogeneousCellElemIsUnknown(next))
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function homogeneousCellElemIsUnknown(t: MType): boolean {
+  return isHomogeneousCell(t) && t.elem.kind === "Unknown";
 }
 
 /** The "absent default" type a control-flow branch merge picks when
@@ -815,6 +980,17 @@ export function absentDefaultFor(present: ReadonlyArray<MType>): MType {
       // absent arm produces no codegen issue: handles' C declarations
       // are zero-init structs whose only liability is the per-shape
       // typedef being in scope (which the predeclaration ensures).
+      return present[0];
+    case "tuple-cell":
+      // Same arity across every arm (category-id guaranteed it). The
+      // absent default is that shape — its predeclared empty handle
+      // is a zero-init struct that frees cleanly at scope exit.
+      return present[0];
+    case "homogeneous-cell":
+      // Same elem-storage-category across every arm. The absent
+      // default is one of the present types (an empty homogeneous
+      // cell of that elem shape) — predeclaration zero-inits
+      // `{data=NULL, len=0}` which the free helper handles.
       return present[0];
     case "scalar-real":
     case "scalar-complex":
@@ -1104,6 +1280,42 @@ export function unify(a: MType, b: MType): MType {
     }
     return structType(merged);
   }
+  // TupleCell sibling variant. Two tuple cells unify iff they have
+  // the same slot count AND every pairwise slot type unifies. The
+  // arity rule mirrors struct's field-name-set rule — different
+  // arities are different shapes and produce different C typedefs.
+  if (a.kind === "TupleCell" || b.kind === "TupleCell") {
+    if (a.kind !== "TupleCell" || b.kind !== "TupleCell") {
+      return { kind: "Unknown" };
+    }
+    if (a.slots.length !== b.slots.length) return { kind: "Unknown" };
+    const merged: MType[] = [];
+    for (let i = 0; i < a.slots.length; i++) {
+      const u = unify(a.slots[i], b.slots[i]);
+      if (u.kind === "Unknown") return { kind: "Unknown" };
+      merged.push(u);
+    }
+    return tupleCellType(merged);
+  }
+  // HomogeneousCell sibling variant. Two homogeneous cells unify iff
+  // their element types unify; the runtime length joins via the same
+  // DimInfo lattice as tensor dims. An Unknown elem (produced by an
+  // empty `c = {}` literal before the first slot write fills in the
+  // type) is treated as bottom — it loses to any concrete elem so
+  // the canonical "empty cell, then grow" pattern widens cleanly.
+  if (a.kind === "HomogeneousCell" || b.kind === "HomogeneousCell") {
+    if (a.kind !== "HomogeneousCell" || b.kind !== "HomogeneousCell") {
+      return { kind: "Unknown" };
+    }
+    let elemU: MType;
+    if (a.elem.kind === "Unknown") elemU = b.elem;
+    else if (b.elem.kind === "Unknown") elemU = a.elem;
+    else {
+      elemU = unify(a.elem, b.elem);
+      if (elemU.kind === "Unknown") return { kind: "Unknown" };
+    }
+    return homogeneousCellType(elemU, joinDim(a.len, b.len));
+  }
   // Build a fresh NumericType. Shape is array-valued so it's joined
   // separately; the template walks only the scalar fields.
   const out: Record<string, unknown> = {
@@ -1270,6 +1482,21 @@ export function canonicalizeType(t: MType): unknown {
       fields: t.fields.map(f => [f.name, canonicalizeType(f.type)]),
     };
   }
+  if (t.kind === "TupleCell") {
+    return {
+      kind: "TupleCell",
+      slots: t.slots.map(s => canonicalizeType(s)),
+    };
+  }
+  if (t.kind === "HomogeneousCell") {
+    // Length is runtime data on the struct (not part of the typedef
+    // hash), so it's excluded here. The element type's canonical
+    // form is what makes two homogeneous cells share a specialization.
+    return {
+      kind: "HomogeneousCell",
+      elem: canonicalizeType(t.elem),
+    };
+  }
   // Normalize before serializing so two complex types differing only
   // in a leftover `sign` field hash to the same specialization key.
   const normalized = normalizeComplexSign(t);
@@ -1319,6 +1546,13 @@ export function typeToString(t: MType): string {
   if (t.kind === "Struct") {
     const parts = t.fields.map(f => `${f.name}:${typeToString(f.type)}`);
     return `Struct<{${parts.join(", ")}}>`;
+  }
+  if (t.kind === "TupleCell") {
+    const parts = t.slots.map(s => typeToString(s));
+    return `TupleCell<{${parts.join(", ")}}>`;
+  }
+  if (t.kind === "HomogeneousCell") {
+    return `HomogeneousCell<${typeToString(t.elem)}, len=${dimToString(t.len)}>`;
   }
   const cat = shapeCategory(t);
   // dims is array-valued so rendered into the framing prefix; the

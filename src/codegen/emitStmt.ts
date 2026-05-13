@@ -60,6 +60,7 @@ import {
 import { emitTensorAssignFromExpr, emitTensorLitAssign } from "./emitTensor.js";
 import { emitIndexSliceAssign, emitIndexSliceStore } from "./emitSlice.js";
 import { emitMakeRangeAssign } from "./emitRange.js";
+import { emitCellIndexStore, emitCellLitAssign } from "./emitCell.js";
 
 export { analyzeStmts } from "./emitAnalysis.js";
 
@@ -166,6 +167,11 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       }
       if (s.rhs.kind === "MakeRange") {
         emitMakeRangeAssign(state, level, s.cName, s.rhs);
+        emitEarlyFrees(state, level, deadAfterStmt(state, s));
+        break;
+      }
+      if (s.rhs.kind === "CellLit") {
+        emitCellLitAssign(state, level, s.cName, s.rhs);
         emitEarlyFrees(state, level, deadAfterStmt(state, s));
         break;
       }
@@ -292,6 +298,16 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
         rhsExpr = emitExpr(state, s.rhs, 0);
         pushStmt(state, level, `${lhsAccess} = ${rhsExpr};`);
       }
+      emitEarlyFrees(state, level, deadAfterStmt(state, s));
+      break;
+    }
+
+    case "CellIndexStore": {
+      // `c{k} = rhs;` — write one slot of a cell. Tuple cells write
+      // the slot's typed field directly; homogeneous cells write
+      // `data[idx-1]` in place. For owned slot types the per-kind
+      // `_assign` helper frees the prior content before installing.
+      emitCellIndexStore(state, level, s);
       emitEarlyFrees(state, level, deadAfterStmt(state, s));
       break;
     }

@@ -129,6 +129,12 @@ export function renderExpr(e: IRExpr, parentPrec = 0): string {
     }
     case "HandleCaptureLoad":
       return `${renderExpr(e.base, 0)}.${e.captureName}`;
+    case "CellLit": {
+      const els = e.elements.map(el => renderExpr(el, 0)).join(", ");
+      return `{${els}}`;
+    }
+    case "CellIndexLoad":
+      return `${renderExpr(e.base, 0)}{${renderExpr(e.index, 0)}}`;
   }
 }
 
@@ -160,6 +166,8 @@ export function renderStmt(s: IRStmt): string | null {
       return `${s.base.name}(${s.index.map(renderSliceArg).join(", ")}) = ${renderExpr(s.rhs, 0)}`;
     case "MemberStore":
       return `${s.base.name}.${s.fieldPath.join(".")} = ${renderExpr(s.rhs, 0)}`;
+    case "CellIndexStore":
+      return `${s.base.name}{${renderExpr(s.index, 0)}} = ${renderExpr(s.rhs, 0)}`;
     case "Disp":
       return `disp(${renderExpr(s.arg, 0)})`;
     case "Error":

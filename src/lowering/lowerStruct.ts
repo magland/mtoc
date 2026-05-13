@@ -71,7 +71,11 @@ export function lowerMemberRead(
   this: Lowerer,
   e: Extract<Expr, { type: "Member" }>
 ): IRExpr {
-  // Walk to the root variable, accumulating the field path.
+  // Walk to the root non-Member expression, accumulating the field
+  // path. Members chain through other Members directly; any other
+  // base (Ident, IndexCell, …) is lowered as an IRExpr and the field
+  // chain rides on top via MemberLoad nodes. This enables patterns
+  // like `c{1}.x` (Member on a CellIndexLoad base).
   const path: string[] = [e.name];
   let base: Expr = e.base;
   while (base.type === "Member") {
@@ -84,37 +88,37 @@ export function lowerMemberRead(
       e.span
     );
   }
-  if (base.type !== "Ident") {
+  // Lower the root expression to IR. For an Ident this picks up the
+  // env type; for an IndexCell / nested expression the regular
+  // lowerExpr path applies (with its own type-resolution).
+  let cur: IRExpr;
+  if (base.type === "Ident") {
+    const rootTy = this.envLookup(base.name);
+    if (rootTy === undefined) {
+      throw new TypeError(`use of undefined variable '${base.name}'`, e.span);
+    }
+    cur = {
+      kind: "Var",
+      name: base.name,
+      cName: this.currentCNameFor(base.name),
+      ty: rootTy,
+      span: base.span,
+    };
+  } else {
+    cur = this.lowerExpr(base);
+  }
+  if (!isStruct(cur.ty)) {
     throw new UnsupportedConstruct(
-      `field access on a non-variable base is not yet supported`,
+      `field access requires a struct base (got ${typeToString(cur.ty)})`,
       e.span
     );
   }
-  // Look up the root in env; if it's a struct, traverse its fields.
-  const rootTy = this.envLookup(base.name);
-  if (rootTy === undefined) {
-    throw new TypeError(`use of undefined variable '${base.name}'`, e.span);
-  }
-  if (!isStruct(rootTy)) {
-    throw new UnsupportedConstruct(
-      `'${base.name}' is ${typeToString(rootTy)}, not a struct; cannot read field '.${path[0]}'`,
-      e.span
-    );
-  }
-  // Build the IR chain: Var → MemberLoad → MemberLoad → …
-  let cur: IRExpr = {
-    kind: "Var",
-    name: base.name,
-    cName: this.currentCNameFor(base.name),
-    ty: rootTy,
-    span: base.span,
-  };
-  let curTy: MType = rootTy;
+  let curTy: MType = cur.ty;
   for (let i = 0; i < path.length; i++) {
     const fieldName = path[i];
     if (!isStruct(curTy)) {
       throw new TypeError(
-        `'${base.name}.${path.slice(0, i).join(".")}' is ${typeToString(curTy)}, not a struct; cannot read field '.${fieldName}'`,
+        `'${typeToString(curTy)}' has no field '.${fieldName}'`,
         e.span
       );
     }
@@ -123,7 +127,7 @@ export function lowerMemberRead(
     );
     if (!field) {
       throw new TypeError(
-        `struct '${base.name}${path.slice(0, i).length > 0 ? "." + path.slice(0, i).join(".") : ""}' has no field '${fieldName}'`,
+        `struct '${typeToString(curTy)}' has no field '${fieldName}'`,
         e.span
       );
     }

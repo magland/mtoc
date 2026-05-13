@@ -60,7 +60,8 @@ export type OwnedExprKind =
   | "make-range"
   | "user-call"
   | "builtin-call"
-  | "struct-lit";
+  | "struct-lit"
+  | "cell-lit";
 
 /** Classify `e` as an "owned producer" — an expression that, when
  *  evaluated, returns a freshly-allocated heap-backed value (tensor /
@@ -75,6 +76,7 @@ export function classifyOwnedExpr(e: IRExpr): OwnedExprKind | null {
   if (e.kind === "IndexSlice") return "index-slice";
   if (e.kind === "MakeRange") return "make-range";
   if (e.kind === "StructLit") return "struct-lit";
+  if (e.kind === "CellLit") return "cell-lit";
   if (e.kind === "Call" && isOwned(e.ty)) {
     if (e.callee.kind === "userFunc") return "user-call";
     // Builtin calls flagged `producesOwnedDirectly` (e.g. `size(t)`,
@@ -153,6 +155,11 @@ export function ownedExprMessage(kind: OwnedExprKind): string {
     case "struct-lit":
       return (
         "internal: struct literal still nested inside another " +
+        "expression after ANF; ANF pass should have hoisted it"
+      );
+    case "cell-lit":
+      return (
+        "internal: cell literal still nested inside another " +
         "expression after ANF; ANF pass should have hoisted it"
       );
   }
@@ -305,6 +312,18 @@ function anfStmt(
       const newRhs = anfRequireHandle(s.rhs, pre, av, c);
       return [...pre, { ...s, rhs: newRhs }];
     }
+    case "CellIndexStore": {
+      // Same consume-site treatment as MemberStore: the RHS may be
+      // an owned producer (tensor/struct/cell literal, owned-
+      // returning call) that needs hoisting before it can land in
+      // the per-slot `_assign` helper. The index expression is a
+      // scalar real (tuple cells require a NumLit; homogeneous
+      // cells accept any scalar real); recurse for ANF symmetry.
+      const pre: IRStmt[] = [];
+      const newIndex = anfExpr(s.index, pre, av, c);
+      const newRhs = anfRequireHandle(s.rhs, pre, av, c);
+      return [...pre, { ...s, index: newIndex, rhs: newRhs }];
+    }
     case "MultiAssignCall": {
       // User-function multi-output call: every tensor arg lands in
       // the callee via copy-on-arg-pass, which requires a full
@@ -407,6 +426,24 @@ function anfExprChildren(
       };
     case "HandleCaptureLoad":
       return { ...e, base: anfExpr(e.base, pre, av, c) as typeof e.base };
+    case "CellLit":
+      // Each element gets the standard ANF treatment — owned
+      // producers get lifted to a temp; multi-element expressions
+      // that aren't owned producers get hoisted via the handle-lift
+      // path so codegen can consume an addressable Var per slot.
+      return {
+        ...e,
+        elements: e.elements.map(el => anfRequireHandle(el, pre, av, c)),
+      };
+    case "CellIndexLoad":
+      // The base is a stable struct-handle read (Var, MemberLoad,
+      // HandleCaptureLoad, or another CellIndexLoad); the index is
+      // a scalar expression. Recurse for ANF symmetry.
+      return {
+        ...e,
+        base: anfExpr(e.base, pre, av, c),
+        index: anfExpr(e.index, pre, av, c),
+      };
   }
 }
 

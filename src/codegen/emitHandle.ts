@@ -24,6 +24,7 @@ import {
 import { type EmitState } from "./emitState.js";
 import {
   emitNamedTypedefBlocks,
+  renderNamedTypedefBlock,
   type NamedTypedefSpec,
 } from "./emitNamedTypedef.js";
 
@@ -74,4 +75,11 @@ const HANDLE_SPEC: NamedTypedefSpec<HandleType> = {
  *  ahead of the user-function bodies. */
 export function emitHandleBlocks(state: EmitState, prog: IRProgram): string[] {
   return emitNamedTypedefBlocks(state, prog, HANDLE_SPEC);
+}
+
+/** Render a single handle shape's typedef + helpers. Exposed for the
+ *  cross-kind unified emitter; the empty-handle placeholder is still
+ *  spliced first by the unified driver before regular shapes. */
+export function renderHandleBlock(state: EmitState, t: HandleType): string[] {
+  return renderNamedTypedefBlock(state, HANDLE_SPEC, t);
 }

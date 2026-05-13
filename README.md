@@ -339,6 +339,30 @@ The subset is growing iteratively. Roughly:
   `s = []; s.x = v` empty-promo idiom, and branch-divergent
   field-set assignments are deferred — see
   [docs/limitations.md](docs/limitations.md) for the full list.
+- 1-D cell arrays (`{e1, e2, …}`) in two flavors picked by a pre-pass
+  over each variable's access pattern (`src/lowering/cellPrePass.ts`):
+  - **Tuple cells**: fixed arity, per-slot types may differ, every
+    `c{k}` / `c{k} = …` uses a literal integer index. Codegen emits
+    one `_mtoc_tcell__<8hex>` typedef per distinct slot-type tuple
+    with named fields `slot_0…slot_(N-1)`; `c{k}` resolves to a typed
+    field access at compile time, no allocation.
+  - **Homogeneous cells**: variable length, uniform element type.
+    Triggered by any non-literal index access OR an empty `c = {}`
+    literal somewhere in the variable's lifetime. Codegen emits one
+    `_mtoc_hcell__<8hex>` typedef per element MType as a
+    `{Elem *data; long len;}` struct; `c{k} = v` calls a `_grow`
+    helper that extends the buffer as needed and then stores the
+    slot. The Unknown elem on a fresh `c = {}` widens to the
+    concrete type on the first slot write.
+    Nesting composes via the existing owned-kind machinery: cells of
+    cells, cells in struct fields, and structs in cells all work. The
+    cross-kind typedef ordering is solved by a unified topological
+    sort (`src/codegen/emitOwnedTypedefs.ts`) so a struct holding a
+    cell precedes the cell's typedef and vice versa. Deferred: N-D
+    cells, `cell(n)` / `cell(m, n)` constructor, cell concatenation
+    `[c1, c2]`, `iscell` / `numel(c)` / `length(c)` builtins, and
+    `disp(c)` for cells whose slots include tensors, structs, or
+    other cells (use `disp(c{i})` for those).
 - Text view (`mtoc_text_view_t`): a non-owning `{data, len}` adapter
   every "accepts text" runtime helper consumes. `disp`, `error`,
   `assert(_, msg)`, `strcmp`, and `string_concat` each route through

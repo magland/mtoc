@@ -453,6 +453,8 @@ function isPureElementwiseExpr(e: IRExpr): boolean {
     case "CharLit":
     case "MemberLoad":
     case "StructLit":
+    case "CellLit":
+    case "CellIndexLoad":
       return false;
   }
 }
@@ -709,6 +711,23 @@ function appearsInNonSlotPosition(e: IRExpr, cName: string): boolean {
       }
       return found;
     }
+    case "CellLit": {
+      // Cell literals don't feed elementwise iter loops; any inner
+      // reference is a non-slot use.
+      let found = false;
+      for (const el of e.elements) {
+        if (el.kind === "Var" && el.cName === cName) found = true;
+        if (appearsInNonSlotPosition(el, cName)) found = true;
+      }
+      return found;
+    }
+    case "CellIndexLoad":
+      // Cell indexing reads a slot — the base position is a struct-
+      // handle read (non-slot). Treat any match on the base, or
+      // inside the index expression, as a non-slot use.
+      if (e.base.kind === "Var" && e.base.cName === cName) return true;
+      if (appearsInNonSlotPosition(e.base, cName)) return true;
+      return appearsInNonSlotPosition(e.index, cName);
   }
 }
 
@@ -735,6 +754,8 @@ function substituteVar(e: IRExpr, target: string, replacement: IRExpr): IRExpr {
     case "MakeRange":
     case "MemberLoad":
     case "StructLit":
+    case "CellLit":
+    case "CellIndexLoad":
       return e;
     case "Binary": {
       const left = substituteVar(e.left, target, replacement);

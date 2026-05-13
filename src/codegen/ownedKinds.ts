@@ -24,13 +24,17 @@
 
 import {
   handleMangledName,
+  homogeneousCellMangledName,
   isCharArray,
   isHandle,
+  isHomogeneousCell,
   isMultiElement,
   isNumeric,
   isString,
   isStruct,
+  isTupleCell,
   structMangledName,
+  tupleCellMangledName,
   type MType,
 } from "../lowering/types.js";
 
@@ -157,6 +161,39 @@ export function ownedOps(ty: MType): OwnedKindOps | null {
       free: p(`${name}_free`),
       assign: p(`${name}_assign`),
       copy: () => p(`${name}_copy`),
+    };
+  }
+  if (isTupleCell(ty)) {
+    const name = tupleCellMangledName(ty);
+    // Tuple cells follow the struct pattern: helpers emitted by
+    // `emitTupleCell.ts` directly into the output (one set per
+    // distinct slot-type tuple shape). `disp` matches numbl's
+    // `formatCell` byte-for-byte (single line `{e1, e2, ...}`).
+    return {
+      cType: name,
+      structSnippet: p(name),
+      empty: p(`${name}_empty`),
+      free: p(`${name}_free`),
+      assign: p(`${name}_assign`),
+      copy: () => p(`${name}_copy`),
+      disp: () => p(`${name}_disp`),
+    };
+  }
+  if (isHomogeneousCell(ty)) {
+    const name = homogeneousCellMangledName(ty);
+    // Homogeneous cells follow the per-elem-shape pattern: helpers
+    // emitted by `emitHomogeneousCell.ts` directly into the output
+    // (one set per distinct element MType). The struct holds
+    // `{data, len}`; helpers free the buffer, deep-copy the
+    // elements, etc. `disp` also matches numbl's `formatCell`.
+    return {
+      cType: name,
+      structSnippet: p(name),
+      empty: p(`${name}_empty`),
+      free: p(`${name}_free`),
+      assign: p(`${name}_assign`),
+      copy: () => p(`${name}_copy`),
+      disp: () => p(`${name}_disp`),
     };
   }
   return null;

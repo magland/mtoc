@@ -20,7 +20,9 @@ import type {
 } from "./ir.js";
 import {
   isHandle,
+  isHomogeneousCell,
   isStruct,
+  isTupleCell,
   type HandleType,
   type MType,
   type StructType,
@@ -125,6 +127,21 @@ function rewriteStmt(
       if (newRhs.kind === "StructLit" && isStruct(finalTy)) {
         newRhs = { ...newRhs, ty: finalTy };
       }
+      // Same widening rule for cell literals: the LHS binding's
+      // post-widening type may have updated per-slot types (tuple)
+      // or elem (homogeneous), and the literal's `ty` needs to
+      // match so the emitted typedef name agrees with the predecl.
+      if (isTupleCell(s.ty) && binds.has(s.cName)) {
+        finalTy = binds.get(s.cName)!.ty;
+      } else if (isHomogeneousCell(s.ty) && binds.has(s.cName)) {
+        finalTy = binds.get(s.cName)!.ty;
+      }
+      if (
+        newRhs.kind === "CellLit" &&
+        (isTupleCell(finalTy) || isHomogeneousCell(finalTy))
+      ) {
+        newRhs = { ...newRhs, ty: finalTy };
+      }
       return { ...s, rhs: newRhs, ty: finalTy };
     }
     case "MemberStore": {
@@ -195,6 +212,25 @@ function rewriteStmt(
         index: s.index.map(slot => rewriteSliceArg(slot, binds)),
         rhs: rewriteExpr(s.rhs, binds),
       };
+    case "CellIndexStore": {
+      const newBase = rewriteExpr(s.base, binds) as Extract<
+        IRExpr,
+        { kind: "Var" }
+      >;
+      const newRhs = rewriteExpr(s.rhs, binds);
+      const newIndex = rewriteExpr(s.index, binds);
+      // Re-derive the slot type from the (possibly widened) base
+      // type so the consume-site `_assign` helper picks up the
+      // canonical typedef.
+      const slotTy = resolveCellSlotType(newBase.ty, s.index) ?? s.slotTy;
+      return {
+        ...s,
+        base: newBase,
+        index: newIndex,
+        rhs: newRhs,
+        slotTy,
+      };
+    }
     case "MultiAssignCall":
       return { ...s, args: s.args.map(a => rewriteExpr(a, binds)) };
     case "Break":
@@ -321,6 +357,22 @@ function rewriteExpr(
       }
       return { ...e, base: newBase, ty: newTy };
     }
+    case "CellLit": {
+      // Rewrite each element; if the LHS binding's type widened, the
+      // surrounding Assign's `ty` carries that widening — `rewriteStmt`
+      // re-applies it to the CellLit's `ty` similarly to the StructLit
+      // path. Here we only normalize the children.
+      const elements = e.elements.map(el => rewriteExpr(el, binds));
+      return { ...e, elements };
+    }
+    case "CellIndexLoad": {
+      // Re-derive the slot type from the (possibly widened) base
+      // type so consume-site dispatch picks up the canonical typedef.
+      const newBase = rewriteExpr(e.base, binds);
+      const newIndex = rewriteExpr(e.index, binds);
+      const newTy = resolveCellSlotType(newBase.ty, newIndex) ?? e.ty;
+      return { ...e, base: newBase, index: newIndex, ty: newTy };
+    }
   }
 }
 
@@ -360,4 +412,21 @@ function resolveFieldPathType(
     cur = f.type;
   }
   return cur;
+}
+
+/** Resolve the slot MType of a `c{idx}` access against the (possibly
+ *  widened) cell type `ty`. Tuple cells consult `slots[k-1]` from the
+ *  literal-index expression; homogeneous cells return the cell's
+ *  `elem` regardless of the index expression. Returns null when the
+ *  base type isn't a cell, when a tuple-cell index isn't a NumLit, or
+ *  when the index is out of range. */
+function resolveCellSlotType(ty: MType, index: IRExpr): MType | null {
+  if (isTupleCell(ty)) {
+    if (index.kind !== "NumLit") return null;
+    const k = index.value;
+    if (!Number.isInteger(k) || k < 1 || k > ty.slots.length) return null;
+    return ty.slots[k - 1];
+  }
+  if (isHomogeneousCell(ty)) return ty.elem;
+  return null;
 }

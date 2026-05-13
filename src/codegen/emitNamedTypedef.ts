@@ -256,6 +256,18 @@ function renderBlock<T extends MType>(
   return lines;
 }
 
+/** Render a single shape's typedef + helper block. Exposed so the
+ *  cross-kind unified emitter (`emitOwnedTypedefs.ts`) can splice
+ *  per-shape blocks in topological order across kinds (struct,
+ *  handle, tuple-cell, homogeneous-cell). */
+export function renderNamedTypedefBlock<T extends MType>(
+  state: EmitState,
+  spec: NamedTypedefSpec<T>,
+  t: T
+): string[] {
+  return renderBlock(state, spec, t);
+}
+
 /** Emit every shape's typedef + helper block, in dependency order,
  *  appending them to the caller's output. */
 export function emitNamedTypedefBlocks<T extends MType>(

@@ -208,6 +208,59 @@ export type IRExpr =
       span: Span;
     }
   | {
+      /** Cell-array constructor literal `{e1, e2, …, eN}`. The
+       *  `cellKind` discriminator selects between the two variants
+       *  the pre-pass decided on:
+       *    - `tuple`: per-slot expressions land in named fields
+       *      `slot_0`, `slot_1`, … of a per-shape struct typedef.
+       *      Codegen emits a C99 compound literal `(typedef){.slot_0
+       *      = e1, .slot_1 = e2, …}`. The `ty` is `TupleCellType`
+       *      with `slots.length === elements.length`.
+       *    - `homogeneous`: per-slot expressions are written into a
+       *      heap-allocated buffer of the element MType. Codegen
+       *      allocates `len * sizeof(elem)`, fills slot-by-slot, and
+       *      hands the resulting struct `{data, len}` to the LHS via
+       *      the per-elem `_assign` helper. The `ty` is
+       *      `HomogeneousCellType` with `elem` matching every
+       *      element's MType (after pre-pass unification). Element-
+       *      valued sub-expressions follow the same ANF rules as
+       *      TensorLit cells — owned producers and multi-element
+       *      non-Var expressions get hoisted before the literal
+       *      consumes them. */
+      kind: "CellLit";
+      cellKind: "tuple" | "homogeneous";
+      elements: IRExpr[];
+      ty: MType;
+      span: Span;
+    }
+  | {
+      /** Curly-brace read of one element of a cell: `c{k}` (or for
+       *  homogeneous cells, `c{idx-expr}`). For a TupleCell base,
+       *  `index` is required to be a `NumLit` integer between 1 and
+       *  the cell's slot count (the lowerer enforces this); codegen
+       *  emits `<base>.slot_<k-1>`. For a HomogeneousCell base,
+       *  `index` is any scalar real expression (1-based MATLAB
+       *  index); codegen emits `<base>.data[<idx>-1]`.
+       *
+       *  `ty` is the slot's static type (TupleCell: the type at the
+       *  named slot; HomogeneousCell: the cell's `elem` type). For
+       *  owned slot types codegen routes through the kind's `_copy`
+       *  helper at consume sites that need value semantics (e.g.
+       *  passing through `disp`, struct field assignment, etc.).
+       *
+       *  `base` is an `IRExpr` so chains like `c{1}.field` (Member on
+       *  a CellIndexLoad) and `s.items{1}` (CellIndexLoad on a
+       *  MemberLoad) compose cleanly. After ANF the base is always a
+       *  "stable" form — `Var`, `MemberLoad`, `HandleCaptureLoad`, or
+       *  another `CellIndexLoad`; an owned producer base is hoisted
+       *  to a synthetic temp by the ANF pass first. */
+      kind: "CellIndexLoad";
+      base: IRExpr;
+      index: IRExpr;
+      ty: MType;
+      span: Span;
+    }
+  | {
       /** Function-handle literal — produced by `@name` (named handle to
        *  a user function or builtin) and by `@(...) ...` (anonymous
        *  function). The lowerer resolves the target identity at the
@@ -371,6 +424,36 @@ export type IRStmt =
       base: Extract<IRExpr, { kind: "Var" }>;
       index: readonly IndexSliceArg[];
       rhs: IRExpr;
+      span: Span;
+    }
+  | {
+      /** In-place curly-brace write of one slot of a cell:
+       *  `c{k} = rhs` (TupleCell, constant `k`) or
+       *  `c{idx-expr} = rhs` (HomogeneousCell, any scalar real idx).
+       *
+       *  TupleCell semantics: the slot's static type must already
+       *  match `rhs.ty` after the pre-pass widening; codegen emits
+       *  one of:
+       *    - scalar slot: `<base>.slot_<k-1> = rhs;`
+       *    - owned slot: `mtoc_<kind>_assign(&<base>.slot_<k-1>, rhs);`
+       *  When `rhs` is a `Var` of an owned type, codegen wraps with
+       *  the kind's `_copy` so value semantics are preserved.
+       *
+       *  HomogeneousCell semantics: the buffer slot is overwritten
+       *  in place using the elem-kind's `_assign` helper (for owned
+       *  elems) or a bare store (for scalar elems). The buffer is
+       *  reused — this is NOT an owned re-assignment of the cell as
+       *  a whole. A static bound check is emitted only when the
+       *  index isn't provably in-range; the pre-pass marks bases
+       *  that need that check via the index's static analysis. */
+      kind: "CellIndexStore";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      index: IRExpr;
+      rhs: IRExpr;
+      /** Static MType of the slot being written. For TupleCell
+       *  this is `base.ty.slots[k-1]`; for HomogeneousCell it's
+       *  `base.ty.elem`. */
+      slotTy: MType;
       span: Span;
     }
   | {

@@ -18,6 +18,7 @@ import type { IRExpr, IRFunction } from "./ir.js";
 import {
   arithResult,
   canonicalizeType,
+  isCell,
   isHandle,
   isMultiElement,
   isOwned,
@@ -628,10 +629,19 @@ export function specializeUserCallWithIRArgs(
     // is encoded in `canonicalizeType` so each `(handle-target+captures, ...)`
     // arg tuple lands in its own specialization. The handle's struct
     // value (carrying captures) passes through as a real C value.
-    if (!isNumeric(a.ty) && !isStruct(a.ty) && !isHandle(a.ty)) {
+    // Cell args (tuple or homogeneous) follow the same pattern as
+    // struct: a per-shape typedef, value-by-copy at the call boundary
+    // (copy-on-arg-pass via the cell's `_copy` helper), and a slot in
+    // the specialization key via `canonicalizeType`.
+    if (
+      !isNumeric(a.ty) &&
+      !isStruct(a.ty) &&
+      !isHandle(a.ty) &&
+      !isCell(a.ty)
+    ) {
       throw new UnsupportedConstruct(
-        `function '${name}' only accepts numeric, struct, or function-handle ` +
-          `arguments (got ${typeToString(a.ty)})`,
+        `function '${name}' only accepts numeric, struct, function-handle, ` +
+          `or cell arguments (got ${typeToString(a.ty)})`,
         a.span
       );
     }
@@ -727,6 +737,7 @@ function specialize(
     // shape (from the call-site type) and a pre-pass shape — they
     // must agree, which is checked in `lowerMemberStore`.
     inner.primeStructShapes(fnAst.body);
+    inner.primeCellShapes(fnAst.body);
     // For struct params: seed the per-root field-type tracking with
     // the call-site param types so a member-load on an unassigned
     // field still works (you can read a struct field of a parameter

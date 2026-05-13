@@ -17,6 +17,7 @@
 
 import type { IRFunction, VarBinding } from "../lowering/ir.js";
 import {
+  isCell,
   isCharScalar,
   isHandle,
   isMultiElement,
@@ -180,7 +181,12 @@ export function functionFreeOnExitSet(
 ): ReadonlyMap<string, VarBinding> {
   const out = new Map<string, VarBinding>(fn.assignedVars);
   for (const p of fn.params) {
-    if (isMultiElement(p.ty) || isStruct(p.ty) || isHandle(p.ty)) {
+    if (
+      isMultiElement(p.ty) ||
+      isStruct(p.ty) ||
+      isHandle(p.ty) ||
+      isCell(p.ty)
+    ) {
       out.set(p.cName, { ty: p.ty, cName: p.cName });
     }
   }

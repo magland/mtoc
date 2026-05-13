@@ -29,6 +29,7 @@ import { useRuntimeByName, useSnippet, type EmitState } from "./emitState.js";
 import { formatStringLit } from "./emitFormat.js";
 import {
   emitNamedTypedefBlocks,
+  renderNamedTypedefBlock,
   type NamedTypedefSpec,
 } from "./emitNamedTypedef.js";
 
@@ -135,4 +136,11 @@ const STRUCT_SPEC: NamedTypedefSpec<StructType> = {
 /** Emit every struct typedef + helper block, in dependency order. */
 export function emitStructBlocks(state: EmitState, prog: IRProgram): string[] {
   return emitNamedTypedefBlocks(state, prog, STRUCT_SPEC);
+}
+
+/** Render a single struct shape's typedef + helpers. Exposed so the
+ *  cross-kind unified emitter can splice struct blocks in topo order
+ *  alongside handle / cell blocks. */
+export function renderStructBlock(state: EmitState, t: StructType): string[] {
+  return renderNamedTypedefBlock(state, STRUCT_SPEC, t);
 }

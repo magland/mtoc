@@ -99,6 +99,13 @@ export function forEachSubExpr(
     case "MemberLoad":
       forEachSubExpr(e.base, visit);
       return;
+    case "CellLit":
+      for (const el of e.elements) forEachSubExpr(el, visit);
+      return;
+    case "CellIndexLoad":
+      forEachSubExpr(e.base, visit);
+      forEachSubExpr(e.index, visit);
+      return;
   }
 }
 
@@ -201,6 +208,11 @@ export function forEachTopLevelExpr(s: IRStmt, fn: (e: IRExpr) => void): void {
       fn(s.base);
       fn(s.rhs);
       return;
+    case "CellIndexStore":
+      fn(s.base);
+      fn(s.index);
+      fn(s.rhs);
+      return;
     case "Break":
     case "Continue":
     case "ReturnFromFunction":
@@ -240,6 +252,7 @@ export function forEachStmtInTree(
       case "IndexStore":
       case "IndexSliceStore":
       case "MemberStore":
+      case "CellIndexStore":
       case "Break":
       case "Continue":
       case "ReturnFromFunction":
@@ -286,6 +299,11 @@ export function collectMTypeShapes<T extends MType>(
     if (s.kind === "MemberStore") {
       visit(s.base.ty);
       visit(s.leafTy);
+      visit(s.rhs.ty);
+    }
+    if (s.kind === "CellIndexStore") {
+      visit(s.base.ty);
+      visit(s.slotTy);
       visit(s.rhs.ty);
     }
   };

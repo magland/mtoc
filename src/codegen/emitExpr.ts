@@ -23,6 +23,7 @@ import {
   isString,
   isStruct,
   structMangledName,
+  tupleCellSlotFieldName,
   typeToString,
   type MType,
   type NumericType,
@@ -201,6 +202,7 @@ export function emitExpr(
     e.kind !== "CharLit" &&
     e.kind !== "MemberLoad" &&
     e.kind !== "HandleCaptureLoad" &&
+    e.kind !== "CellIndexLoad" &&
     !isDirectOwnedCall(e) &&
     isMultiElement(e.ty)
   ) {
@@ -552,6 +554,39 @@ export function emitExpr(
         return `(${name}){0}`;
       }
       return `(${name}){${inits.join(", ")}}`;
+    }
+
+    case "CellLit":
+      // Cell literals are owned-allocating producers — the same legal
+      // position as TensorLit / IndexSlice / MakeRange / StructLit
+      // (top of Assign.rhs). The dedicated emitter handles it; arriving
+      // here means the lowerer let one through.
+      throw new Error(
+        "codegen internal: CellLit reached emitExpr; should have been " +
+          "rejected at lowering"
+      );
+
+    case "CellIndexLoad": {
+      // Tuple cell: `c{k}` (k is a literal int) → `<base>.slot_<k-1>`.
+      // Homogeneous cell: `c{idx}` → `<base>.data[<idx-expr>-1]` (1-based).
+      const baseTy = e.base.ty;
+      const baseStr = emitExpr(state, e.base, 0);
+      if (baseTy.kind === "TupleCell") {
+        if (e.index.kind !== "NumLit") {
+          throw new Error(
+            "codegen internal: TupleCell CellIndexLoad with non-NumLit index; " +
+              "should have been rejected at lowering"
+          );
+        }
+        return `${baseStr}.${tupleCellSlotFieldName(e.index.value - 1)}`;
+      }
+      if (baseTy.kind === "HomogeneousCell") {
+        const idx = emitExpr(state, e.index, 0);
+        return `${baseStr}.data[(long)(${idx}) - 1]`;
+      }
+      throw new Error(
+        `codegen internal: CellIndexLoad on non-cell type ${typeToString(baseTy)}`
+      );
     }
 
     case "Unary": {

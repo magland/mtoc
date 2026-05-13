@@ -29,8 +29,8 @@ describe("CLI translate + run", () => {
     const tmp = mkdtempSync(join(tmpdir(), "mtoc-test-"));
     const inputM = join(tmp, "bad.m");
     const outC = join(tmp, "bad.c");
-    // Cell arrays are not yet supported — a clear UnsupportedConstruct.
-    writeFileSync(inputM, "c = {1, 2};\n");
+    // Class definitions are not yet supported — a clear UnsupportedConstruct.
+    writeFileSync(inputM, "classdef Foo\nend\n");
     expect(() =>
       execFileSync("npx", ["tsx", cliPath, "translate", inputM, outC], {
         stdio: "pipe",

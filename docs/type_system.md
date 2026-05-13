@@ -1,9 +1,9 @@
 # Type system
 
 Lives in `src/lowering/types.ts`. Designed to grow — the discriminated union
-has room for non-numeric variants (Logical, Cell, Class) without
-reshaping. Today `Numeric`, `String`, `Struct`, `Handle`, and the
-sentinels are populated.
+has room for non-numeric variants (Logical, Class) without reshaping. Today
+`Numeric`, `String`, `Struct`, `Handle`, `TupleCell`, `HomogeneousCell`, and
+the sentinels are populated.
 
 ## MType
 
@@ -15,6 +15,8 @@ MType =
   | StringType
   | StructType
   | HandleType
+  | TupleCellType
+  | HomogeneousCellType
   | { kind: "Unknown" }
   | { kind: "Void" }
 ```
@@ -30,9 +32,9 @@ buffer (numbl's `string`, distinct from `char` in shape and semantics).
 `Unknown` shows up at type-check failures; `Void` is reserved for
 statement-only constructs (e.g. `disp` returns nothing).
 
-When further non-numeric kinds (Logical/Cell/Struct/Handle) get added,
-they land as new top-level variants — the discriminator is already there.
-Numeric code paths keep narrowing to `NumericType` without touching them.
+When further non-numeric kinds (Logical/Class) get added, they land as new
+top-level variants — the discriminator is already there. Numeric code paths
+keep narrowing to `NumericType` without touching them.
 
 ## NumericType
 
@@ -185,6 +187,84 @@ Today only one binary op is defined for strings: `+` is concatenation
 ops on strings raise `UnsupportedConstruct`. The introspection builtins
 `length(s)` and `numel(s)` are folded to the constant `1` at lowering (numbl
 semantics — a numbl `string` is a scalar handle, not a char vector).
+
+## TupleCellType
+
+```
+TupleCellType {
+  kind: "TupleCell"
+  slots: ReadonlyArray<MType>   // one entry per slot, source order
+}
+```
+
+A 1-D cell array whose arity is fixed for the lifetime of a variable and
+whose per-slot types may differ. Picked by the cell pre-pass
+(`src/lowering/cellPrePass.ts`) when every `c{k}` / `c{k} = …` access uses
+a literal integer index AND no empty `c = {}` literal appears.
+
+C representation: one typedef per distinct canonicalized slot-type tuple,
+`_mtoc_tcell__<8hex>` with positional fields `slot_0`, `slot_1`, ….
+Codegen for `c{k}` resolves to a typed field access; the tuple-cell
+codegen lives in `src/codegen/emitTupleCell.ts` and shares the
+named-typedef scaffolding (`src/codegen/emitNamedTypedef.ts`) with
+struct / handle codegen. Owned slot types (string, tensor, struct, cell)
+compose through `ownedKinds` recursively.
+
+Two tuple cells unify iff they have the same slot count AND every
+pairwise slot type unifies; the merged shape pulls through the widened
+types per slot (same rule as struct field merging).
+
+`storageCategory` for tuple cells is keyed on the slot count only
+(`tuple-cell:N`), so per-slot type widening doesn't trigger a binding
+split — `normalizeStructTypes` propagates the final widened slot types
+to every IR reference at the end of lowering.
+
+## HomogeneousCellType
+
+```
+HomogeneousCellType {
+  kind: "HomogeneousCell"
+  elem: MType                   // every slot carries this type
+  len: DimInfo                  // length lattice — runtime size lives on the struct
+}
+```
+
+A 1-D cell array whose length may vary at runtime and whose every slot
+carries the same MType. Picked by the cell pre-pass when ANY of:
+
+- some `c{i}` / `c{i} = …` uses a non-literal index, OR
+- an empty `c = {}` literal appears, OR
+- only curly-index reads / writes appear (no literal anchors the
+  tuple's static arity)
+
+C representation: one typedef per distinct canonicalized element type,
+`_mtoc_hcell__<8hex>` with two fields:
+
+- `data` — pointer to `len` consecutive elements of the elem's C type
+- `len` — current element count (`long`)
+
+Helpers are emitted directly by `src/codegen/emitHomogeneousCell.ts`:
+`_empty` (zero handle), `_free` (per-element free for owned elems +
+`free(data)`), `_copy` (deep copy via the elem-kind's `_copy`),
+`_assign` (consume-replace), `_disp` (numbl-style `{e1, …}\n`), and
+`_grow` (extend the buffer to fit a new highest index, zero-initializing
+new slots — drives the `c{k} = v` auto-grow rule).
+
+The empty literal `c = {}` produces a `HomogeneousCell<Unknown, len=notOne>`;
+the Unknown elem is treated as bottom by `unify` (it loses to any
+concrete elem on first slot write) and by `canShareStorage` (Unknown elem
+matches any concrete-elem cell for the purpose of widening a single C
+binding). The actual typedef emitted is the one for the final widened
+elem, propagated via `normalizeStructTypes`.
+
+Length is categorical (`one`/`notOne`/`unknown`) — the same lattice used
+for tensor dims — so two homogeneous cells with the same elem MType but
+different runtime lengths share one specialization.
+
+`storageCategory` for homogeneous cells is keyed on the elem's storage
+category (`homogeneous-cell:<elem-storage-id>`); `canShareStorage` has a
+special case that treats an Unknown elem as matching any concrete elem
+so the empty-cell-then-grow pattern doesn't split bindings.
 
 ## HandleType
 

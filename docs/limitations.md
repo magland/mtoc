@@ -286,7 +286,8 @@ workaround or a roadmap note.
   - **Char function parameters and char return types.** User
     functions still require scalar-numeric returns.
   - **Most char builtins**: `upper`, `lower`, `num2str`, etc.
-- **No cell arrays or classes.**
+- **No classes.** (Cell arrays are supported — see the dedicated
+  "Cell arrays" section below.)
 - **`fprintf` and `sprintf` partial**: the format engine
   (`runtime/format_engine.h`) mirrors numbl's `sprintfFormat`
   byte-for-byte (spec set `d i u f e E g s c x X o %`, flags
@@ -361,6 +362,56 @@ workaround or a roadmap note.
   colon indexing (`s.field(a:b)`) and nested field-then-index chains
   (`s.outer.field(i)`) currently require hoisting the field into a
   local variable first.
+
+## Cell arrays
+
+1-D cell arrays (`{e1, e2, …}`) are supported in two flavors decided by the
+cell pre-pass (`src/lowering/cellPrePass.ts`) based on access pattern:
+
+- **Tuple cells** — fixed arity, per-slot types may differ, every `c{k}` /
+  `c{k} = …` uses a literal integer index. Emitted as one
+  `_mtoc_tcell__<8hex>` typedef per distinct slot-type tuple, with named
+  fields `slot_0…slot_(N-1)`. Zero allocation; `c{k}` is a typed field
+  access at compile time.
+- **Homogeneous cells** — variable length, uniform element type.
+  Triggered by any non-literal index access OR an empty `c = {}` literal.
+  Emitted as one `_mtoc_hcell__<8hex>` typedef per element MType as a
+  `{Elem *data; long len;}` struct, with per-shape helpers including
+  `_grow` (extend buffer + zero-init new slots) that runs before every
+  `c{k} = v` so the auto-grow rule works for both literal- and variable-
+  index writes.
+
+Nesting composes: cell-of-cell, cell-of-struct, struct-of-cell all work.
+The cross-kind typedef ordering is handled by a unified topological sort
+(`src/codegen/emitOwnedTypedefs.ts`).
+
+### Out of scope for v1 (documented gaps)
+
+- **N-D cells.** `cell(m, n)`, `{e1, e2; e3, e4}` (multi-row literals),
+  and indexing with more than one curly slot (`c{i, j}`) are rejected at
+  lowering with a span. v1 is 1-D only.
+- **`cell(n)` / `cell(m, n)` constructor.** Use `{…}` literal or grow
+  from `{}`.
+- **Cell concatenation.** `[c1, c2]` of two cells, `{c1{:}, c2{:}}` flatten
+  patterns. Not yet wired.
+- **Introspection builtins:** `iscell`, `numel(c)`, `length(c)`,
+  `size(c)`, `class(c)`, `cellfun`. Will surface through the "unknown
+  builtin" error path.
+- **`disp(c)` for cells with tensor / struct / nested-cell slots.**
+  Rejected with a clear span pointing the user at `disp(c{i})`. The
+  inline-format engine would need multi-line coordination matching
+  numbl's `formatCell` recursion, which isn't yet wired. Cells of
+  scalar reals / complexes / chars / strings / char arrays disp cleanly
+  (numbl's `{e1, e2, …}` format byte-for-byte).
+- **Branch-divergent cell shape.** An `if` that assigns `c = {…}` of
+  arity N in one arm and arity M in another, or one arm tuple and
+  another homogeneous, is rejected at the pre-pass merge. Hoist the
+  assignment outside the branch, or use a homogeneous cell whose elem
+  unifies.
+- **Mixing tuple and homogeneous semantics on the same variable** is
+  decided by the pre-pass at "first sign of homogeneity wins" — any
+  non-literal index or empty literal flips the variable to
+  homogeneous for its entire scope.
 
 ## Codegen
 
