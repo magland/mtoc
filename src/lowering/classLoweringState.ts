@@ -36,6 +36,13 @@ export class ClassLoweringState {
    *  instance of this class". Drives `lookupClassTypeFor`. */
   roots: Map<string, ClassInfo> = new Map();
 
+  /** Per-root inheritance-flattened property name list (parent-first,
+   *  then child-own). Stored separately from `ClassInfo` (which only
+   *  has the class's OWN properties) so `lookupClassTypeFor` can
+   *  emit the typedef with every accessible property — including
+   *  those inherited from superclasses. */
+  flatProps: Map<string, ReadonlyArray<string>> = new Map();
+
   /** Per-root property-type tracking. Keyed by root var name, each
    *  entry maps property names to the current MType. Properties the
    *  class declares but the body hasn't written use `scalarDouble`
@@ -43,11 +50,18 @@ export class ClassLoweringState {
   propertyTypes: Map<string, Map<string, MType>> = new Map();
 
   /** Register a root variable as a class instance of the declaring
-   *  class. Idempotent; later calls with the same root may pass a
-   *  different `ClassInfo` only if the classes are identical (same
-   *  file + name). */
-  registerRoot(rootName: string, info: ClassInfo): void {
+   *  class. `flatProps` carries the inheritance-flattened property
+   *  list (parent-first); pass `info.propertyNames` if the class has
+   *  no superclass. Idempotent; later calls with the same root may
+   *  pass a different `ClassInfo` only if the classes are identical
+   *  (same file + name). */
+  registerRoot(
+    rootName: string,
+    info: ClassInfo,
+    flatProps: ReadonlyArray<string>
+  ): void {
     this.roots.set(rootName, info);
+    this.flatProps.set(rootName, flatProps);
   }
 
   /** Get-or-insert the per-root `propertyTypes` map. The returned
@@ -71,8 +85,11 @@ export class ClassLoweringState {
     if (info === undefined) return undefined;
     const propMap =
       this.propertyTypes.get(rootName) ?? new Map<string, MType>();
+    const names =
+      this.flatProps.get(rootName) ??
+      (info.propertyNames as ReadonlyArray<string>);
     const properties: { name: string; type: MType }[] = [];
-    for (const name of info.propertyNames) {
+    for (const name of names) {
       const ty = propMap.get(name) ?? scalarDouble("zero");
       properties.push({ name, type: ty });
     }
@@ -84,12 +101,32 @@ export class ClassLoweringState {
   }
 
   /** Seed the per-root state for a class-typed function parameter.
-   *  Records the class identity AND each property's call-site type so
-   *  property reads on an unassigned param still work. No-op for
-   *  non-class types so callers can hand any param type through. */
-  seedFromClassType(rootName: string, ty: MType, info: ClassInfo | null): void {
+   *  Records the class identity AND the flattened property name list.
+   *  Property types ARE seeded too so reads on an unassigned param
+   *  still work — EXCEPT for "placeholder" entries (default
+   *  `scalarDouble("zero")` from a fresh constructor receiver), which
+   *  are skipped so the first body write establishes the type
+   *  fresh. `isInitialReceiver` distinguishes a constructor's
+   *  receiver (all-placeholders) from a method's receiver (real
+   *  call-site types). No-op for non-class types so callers can
+   *  hand any param type through. */
+  seedFromClassType(
+    rootName: string,
+    ty: MType,
+    info: ClassInfo | null,
+    isInitialReceiver = false
+  ): void {
     if (!isClass(ty)) return;
     if (info !== null) this.roots.set(rootName, info);
+    // The call-site ClassType's properties ARE the flattened set —
+    // mtoc never produces a ClassType from a partial set, only via
+    // `initialClassType` / `lookupClassTypeFor` which both use the
+    // inheritance-flattened name list.
+    this.flatProps.set(
+      rootName,
+      ty.properties.map(p => p.name)
+    );
+    if (isInitialReceiver) return;
     const propMap = this.ensurePropertyTypes(rootName);
     for (const p of ty.properties) {
       if (!propMap.has(p.name)) propMap.set(p.name, p.type);

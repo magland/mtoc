@@ -58,7 +58,7 @@ import {
 
 import { StructLoweringState } from "./structLoweringState.js";
 import { ClassLoweringState } from "./classLoweringState.js";
-import { lowerClassMethodCall } from "./lowerClass.js";
+import { lowerClassMethodCall, lowerSuperCall } from "./lowerClass.js";
 import {
   lowerMemberRead,
   lowerMemberStore,
@@ -751,11 +751,14 @@ export class Lowerer {
         // declared property set. This is the analog of the struct
         // pre-pass: for classes, the shape comes from `ClassInfo`,
         // not from a body-walking pre-pass, so the registration
-        // happens here at assignment time.
+        // happens here at assignment time. The flat property name
+        // list comes from `rhsTy.properties` (already inheritance-
+        // flattened by whatever produced this ClassType).
         if (isClass(rhsTy)) {
           const info = this.shared.workspace.ctx.getClassInfo(rhsTy.className);
           if (info !== null) {
-            this.class.registerRoot(s.name, info);
+            const flatProps = rhsTy.properties.map(p => p.name);
+            this.class.registerRoot(s.name, info, flatProps);
             const propTypes = this.class.ensurePropertyTypes(s.name);
             for (const p of rhsTy.properties) {
               if (!propTypes.has(p.name)) propTypes.set(p.name, p.type);
@@ -1233,6 +1236,9 @@ export class Lowerer {
 
       case "Range":
         return this.lowerBareRange(e);
+
+      case "SuperMethodCall":
+        return lowerSuperCall.call(this, e);
 
       default:
         throw new UnsupportedConstruct(

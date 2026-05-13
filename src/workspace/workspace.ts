@@ -78,15 +78,34 @@ const OPERATOR_OVERLOAD_METHOD_NAMES: ReadonlySet<string> = new Set([
   "display",
 ]);
 
-/** Gate Stage 1 unsupported class shapes here so the diagnostic
- *  surfaces with a span at the call site, not deep in lowering. */
+/** Gate unsupported class shapes here so the diagnostic surfaces with
+ *  a span at the call site, not deep in lowering. Validates every
+ *  class in the inheritance chain rooted at `info`, since a child
+ *  whose parent is unsupported (e.g. handle base, operator overloads)
+ *  shouldn't pass either. */
 function validateClassSupported(
+  ctx: LoweringContext,
   info: ClassInfo,
   callName: string,
   span: Span
 ): void {
+  // Walk the inheritance chain so an unsupported parent shape (handle
+  // base, operator overloads, etc.) rejects the entire descendant.
+  // findDefiningClass is a method-level walk; we hand-walk here for
+  // the per-class shape checks.
+  let cur: ClassInfo | null = info;
+  while (cur !== null) {
+    validateOneClass(cur, span);
+    cur = cur.superClass === null ? null : ctx.getClassInfo(cur.superClass);
+  }
+  void callName;
+}
+
+/** Per-class shape validation — applied to every ancestor in the
+ *  inheritance chain. */
+function validateOneClass(info: ClassInfo, span: Span): void {
   // Handle classes: rejected wholesale. mtoc has no shared-storage /
-  // refcount semantics yet (see docs/limitations.md once Stage 1 ships).
+  // refcount semantics yet (see docs/limitations.md).
   if (isHandleClass(info)) {
     throw new UnsupportedConstruct(
       `handle classes (\`classdef ${info.qualifiedName} < handle\`) are ` +
@@ -94,17 +113,8 @@ function validateClassSupported(
       span
     );
   }
-  // Inheritance: deferred to Stage 4.
-  if (info.superClass !== null) {
-    throw new UnsupportedConstruct(
-      `class inheritance (\`${info.qualifiedName} < ${info.superClass}\`) ` +
-        `is not yet supported by mtoc`,
-      span
-    );
-  }
   // Operator overloads / subsref / subsasgn: any class that defines
-  // one of these names is rejected. Stage 1 only supports the basic
-  // dot-access path.
+  // one of these names is rejected.
   for (const name of info.methodNames) {
     if (OPERATOR_OVERLOAD_METHOD_NAMES.has(name)) {
       throw new UnsupportedConstruct(
@@ -120,7 +130,7 @@ function validateClassSupported(
     throw new UnsupportedConstruct(
       `class '${info.qualifiedName}' uses external method files ` +
         `(\`@${info.qualifiedName}/\` folder); only classdef-inline methods ` +
-        `are supported by mtoc Stage 1`,
+        `are supported by mtoc`,
       span
     );
   }
@@ -132,7 +142,6 @@ function validateClassSupported(
       span
     );
   }
-  void callName;
 }
 
 /** Detect a handle-base class — `classdef X < handle` or any class
@@ -439,7 +448,7 @@ export class Workspace {
         // Gate Stage 1 unsupported class shapes here (handle base,
         // external method files, etc.) so the user sees a clear span
         // at the call site.
-        validateClassSupported(info, target.methodName, span);
+        validateClassSupported(this.ctx, info, target.methodName, span);
         const ast = lookupClassMethodAST(info, target.methodName);
         if (ast === null) {
           throw new UnsupportedConstruct(
@@ -472,7 +481,7 @@ export class Workspace {
             span
           );
         }
-        validateClassSupported(info, info.constructorName, span);
+        validateClassSupported(this.ctx, info, info.constructorName, span);
         const ast = lookupClassMethodAST(info, info.constructorName);
         if (ast === null) {
           throw new UnsupportedConstruct(

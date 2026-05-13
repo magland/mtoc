@@ -365,22 +365,38 @@ The subset is growing iteratively. Roughly:
     other cells (use `disp(c{i})` for those).
 - Value-semantics classes (`classdef`): a class with declared
   properties, a constructor that initializes them, and instance
-  methods. Dispatch flows through numbl's vendored `resolveFunction`
-  (so the class-method precedence rules — single-class lookup,
-  `targetClassName` short-circuit, `stripInstance` for any static-
-  method position — are honored without mtoc re-implementing them).
-  Two call syntaxes work: `obj.method(args)` (method-call form, pins
-  dispatch into `obj`'s class) and `method(obj, args)` (function-call
-  form, runs the full precedence walk). Each class shape gets one C
-  typedef (`_mtoc_class__<className>__<8hex>`) plus the standard
-  owned-kind helpers (`_empty` / `_free` / `_copy` / `_assign`); the
-  typedef hash coarsens property types to their C representation so
-  the constructor's pre-mutation `obj` param and its post-mutation
-  return value share a single typedef. Value-copy semantics fall out
-  of the existing copy-on-arg-pass machinery. What's deferred —
-  handle classes, inheritance, static methods, operator overloads,
-  `subsref` / `subsasgn`, external method files, `disp(obj)`, class
-  arrays — see [docs/limitations.md](docs/limitations.md#classes).
+  methods. Single inheritance via `classdef Child < Parent` works
+  end-to-end: child instances inherit parent properties (flattened
+  parent-first into the child's typedef), method dispatch walks the
+  inheritance chain via numbl's `findDefiningClass`, and method
+  override + super-method/super-constructor calls all flow through
+  the resolver pinned to the relevant class via `targetClassName`.
+  Dispatch flows through numbl's vendored `resolveFunction` (so the
+  precedence rules — single-class lookup, `InferiorClasses`
+  promotion, `stripInstance` for any static-method position — are
+  honored without mtoc re-implementing them). Two call syntaxes
+  work: `obj.method(args)` (method-call form, pins dispatch into
+  `obj`'s class) and `method(obj, args)` (function-call form, runs
+  the full precedence walk). Super-calls: `result =
+method@Parent(obj)` for super-method, `obj = obj@Parent(args)`
+  for super-constructor (the parent's constructor body specializes
+  against the child's flattened typedef so its property writes
+  land on the child's struct directly). Each class shape gets one
+  C typedef (`_mtoc_class__<className>__<8hex>`) plus the standard
+  owned-kind helpers (`_empty` / `_free` / `_copy` / `_assign`);
+  the typedef hash coarsens property types to their C
+  representation so the constructor's pre-mutation `obj` param and
+  its post-mutation return value share a single typedef. Specialization
+  names for class methods are salted with the defining class
+  (`<className>__<methodName>`) so a parent's `area` and a child's
+  `area` get distinct C functions even when co-located in one .m
+  file. Value-copy semantics fall out of the existing
+  copy-on-arg-pass machinery. What's deferred — handle classes,
+  static methods, operator overloads, `subsref` / `subsasgn`,
+  external method files, `disp(obj)`, class arrays, and
+  constructor first-writes that change a property's C
+  representation (e.g. assigning a char-array to a fresh property)
+  — see [docs/limitations.md](docs/limitations.md#classes).
 - Text view (`mtoc_text_view_t`): a non-owning `{data, len}` adapter
   every "accepts text" runtime helper consumes. `disp`, `error`,
   `assert(_, msg)`, `strcmp`, and `string_concat` each route through

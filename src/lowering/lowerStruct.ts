@@ -325,7 +325,13 @@ function lowerClassMemberStore(
     );
   }
   const propName = path[0];
-  if (!info.propertyNames.includes(propName)) {
+  // Check the flat (inheritance-flattened) property list, not just
+  // the class's OWN properties — a child class can write through an
+  // inherited parent property.
+  const flatProps =
+    this.class.flatProps.get(rootName) ??
+    (info.propertyNames as ReadonlyArray<string>);
+  if (!flatProps.includes(propName)) {
     throw new TypeError(
       `class '${info.qualifiedName}' has no property '${propName}'`,
       span
@@ -335,7 +341,37 @@ function lowerClassMemberStore(
 
   const propTypes = this.class.ensurePropertyTypes(rootName);
   const prior = propTypes.get(propName);
-  const finalTy: MType = prior === undefined ? rhs.ty : unify(prior, rhs.ty);
+  // A "placeholder" prior is the `scalarDouble("zero")` default that
+  // `initialClassType` / `lookupClassTypeFor` fills in for properties
+  // that haven't been written yet. The first real write should take
+  // the RHS type wholesale, not try to unify against the placeholder
+  // (numeric-zero vs char-array would fail). Real-zero writes (the
+  // user actually wrote `obj.x = 0`) still hit the unify path on
+  // subsequent writes; the placeholder is only relevant before any
+  // user write has landed.
+  const priorIsPlaceholder = prior !== undefined && isPlaceholderZero(prior);
+  // Stage 4 constraint: when the prior is a placeholder (we're inside
+  // a constructor's first write to this property), the RHS must have
+  // a C type compatible with the placeholder's `double`. Writing a
+  // char-array or string to a placeholder triggers a typedef-shape
+  // change between the constructor's param signature and its body's
+  // writes — a problem the constructor ABI can't yet handle because
+  // the param type is committed at specialize() time before the body
+  // is lowered. Documented in docs/limitations.md#classes.
+  if (priorIsPlaceholder && !rhsCompatibleWithPlaceholder(rhs.ty)) {
+    throw new UnsupportedConstruct(
+      `'${rootName}.${propName} = …': writing a non-numeric value ` +
+        `(${typeToString(rhs.ty)}) to a class property in the constructor ` +
+        `is not yet supported by mtoc — the constructor's parameter ` +
+        `signature is committed before the body is lowered, so a ` +
+        `placeholder-to-owned-kind transition isn't supported. Initialize ` +
+        `the property via a method call after construction, or set its ` +
+        `default in the property declaration once mtoc supports that.`,
+      span
+    );
+  }
+  const finalTy: MType =
+    prior === undefined || priorIsPlaceholder ? rhs.ty : unify(prior, rhs.ty);
   if (finalTy.kind === "Unknown") {
     throw new TypeError(
       `'${rootName}.${propName} = …': cannot unify prior property type ` +
@@ -496,4 +532,44 @@ export function lowerStructFieldIndex(
     ty: resultTy,
     span: e.span,
   };
+}
+
+/** True when an RHS value's MType has the same C representation as
+ *  the placeholder's `double` (i.e., any real scalar / real tensor /
+ *  any other type that codegen represents as a numeric slot). When
+ *  this returns false the property would need a non-numeric C slot
+ *  (`mtoc_char_tensor_t`, `mtoc_string_t`, struct typedef, etc.),
+ *  triggering the constructor-ABI typedef-mismatch — rejected at
+ *  the call site so the user sees a clear deferral diagnostic. */
+function rhsCompatibleWithPlaceholder(t: MType): boolean {
+  if (t.kind !== "Numeric") return false;
+  // Real double (any shape, any sign) maps to `double` (scalar) or
+  // `mtoc_tensor_t` (multi-element). For the placeholder = scalar
+  // `double` case to absorb a multi-element tensor, the typedef
+  // would still differ (double vs mtoc_tensor_t). Restrict to
+  // scalar real for now.
+  if (t.elem !== "double" || t.isComplex) return false;
+  // Must be scalar to share the placeholder's `double` slot.
+  if (t.dims.length < 2) return false;
+  return t.dims.every(d => d.kind === "one");
+}
+
+/** True when `t` is the `scalarDouble("zero")` placeholder that
+ *  `initialClassType` / `lookupClassTypeFor` fills in for class
+ *  properties that haven't been written yet. Two real reasons to
+ *  distinguish from a user-written `obj.x = 0`: the placeholder is
+ *  the FIRST write's pre-state, and treating it as "no prior"
+ *  lets the first user write establish the type fresh without an
+ *  ill-typed `unify(zero, char-array)` failure. A user-written
+ *  literal `0` IS structurally identical, but it can only appear
+ *  AFTER a real write has landed (because the very first write
+ *  replaces the placeholder regardless), so the conflation is
+ *  benign: subsequent `obj.x = 0` writes against a real prior
+ *  numeric type go through the unify path normally. */
+function isPlaceholderZero(t: MType): boolean {
+  if (t.kind !== "Numeric") return false;
+  if (t.elem !== "double" || t.isComplex) return false;
+  if (t.sign !== "zero") return false;
+  if (t.dims.length !== 2) return false;
+  return t.dims[0].kind === "one" && t.dims[1].kind === "one";
 }

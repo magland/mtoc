@@ -39,12 +39,19 @@ import type { ClassInfo } from "../numbl-core/lowering/loweringContext.js";
 import { specializeUserCallWithIRArgs } from "./lowerFuncCall.js";
 
 /** Build the initial `ClassType` for a fresh constructor receiver:
- *  every declared property starts at `scalarDouble("zero")` (matching
- *  numbl's `[]`→`0` default-property semantics for unannotated
- *  properties). Property types widen as the constructor body assigns
- *  through them. */
-function initialClassType(info: ClassInfo): ClassType {
-  const properties = info.propertyNames.map(name => ({
+ *  every declared property (own + inherited from every superclass)
+ *  starts at `scalarDouble("zero")`. Property types widen as the
+ *  constructor body assigns through them.
+ *
+ *  Property ordering: parent-first, then child-own. This is the
+ *  numbl-natural order — the parent's constructor sets its own
+ *  properties before the child's constructor reaches `obj.Breed = ...`.
+ *  The order is encoded into the typedef hash (via `classType`'s
+ *  alphabetical sort), so two child classes with the same flattened
+ *  property set share a typedef. */
+function initialClassType(this: Lowerer, info: ClassInfo): ClassType {
+  const propNames = flattenedPropertyNames.call(this, info);
+  const properties = propNames.map(name => ({
     name,
     type: scalarDouble("zero") as MType,
   }));
@@ -53,6 +60,33 @@ function initialClassType(info: ClassInfo): ClassType {
     file: info.fileName,
     properties,
   });
+}
+
+/** Walk the inheritance chain rooted at `info` and accumulate every
+ *  declared property name (parent-first, then child-own). Uses
+ *  numbl's `LoweringContext.getClassInfo` to walk superclasses. */
+function flattenedPropertyNames(this: Lowerer, info: ClassInfo): string[] {
+  // Collect chain root-first so the parent's properties come first.
+  const chain: ClassInfo[] = [];
+  let cur: ClassInfo | null = info;
+  while (cur !== null) {
+    chain.unshift(cur);
+    cur =
+      cur.superClass === null
+        ? null
+        : this.shared.workspace.ctx.getClassInfo(cur.superClass);
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const c of chain) {
+    for (const p of c.propertyNames) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        out.push(p);
+      }
+    }
+  }
+  return out;
 }
 
 /** Lower a class constructor call: resolver verdict was
@@ -73,7 +107,7 @@ export function lowerClassConstructorCall(
       span
     );
   }
-  const initialTy = initialClassType(info);
+  const initialTy = initialClassType.call(this, info);
   // The constructor AST has the receiver-output prepended as its
   // first param (Workspace.resolve's lookupClassMethodAST did this).
   // We feed a synthetic-IR initial receiver as the first arg.
@@ -180,14 +214,27 @@ function dispatchResolvedMethodCall(
   const irArgs: IRExpr[] = target.stripInstance
     ? userArgs.slice()
     : [receiver, ...userArgs];
+  // Salt the specialization name with the defining class so a
+  // parent method and a child method with the same name (and same
+  // file when the classes are co-located in one .m) get distinct
+  // specializations. Without this salt, the in-flight set's
+  // recursion check fires falsely on super-method calls.
   return finishClassCall.call(
     this,
-    target.methodName,
+    classMethodSpecName(target.className, target.methodName),
     target.ast,
     target.file,
     irArgs,
     span
   );
+}
+
+/** Compose the MATLAB-side name used as the `mangleSpecName` salt
+ *  for a class method's specialization. The `__` separator never
+ *  appears in numbl identifiers, so this guarantees a unique hash
+ *  input across the (className, methodName) pairs. */
+function classMethodSpecName(className: string, methodName: string): string {
+  return `${className}__${methodName}`;
 }
 
 /** Tail-end of the constructor/method-call pipelines: specialize via
@@ -224,6 +271,159 @@ function finishClassCall(
     ty: spec.outputs[0].ty,
     span,
   };
+}
+
+/** Lower a `SuperMethodCall` AST node — both shapes:
+ *
+ *   - **Super method-call**: `result = <methodName>@<ParentClass>(receiver, ...)`.
+ *     Detected when `methodName` is a method on `ParentClass` (via
+ *     numbl's `classHasMethod`). Dispatches via
+ *     `resolveForTargetClass(methodName, ..., targetClassName=ParentClass)`
+ *     so the resolver's short-circuit pins the call into the parent.
+ *     The verdict drives `findDefiningClass`-aware AST lookup the same
+ *     way regular method calls do.
+ *
+ *   - **Super constructor-call**: `<outputBinding> = <outputBinding>@<ParentClass>(args)`.
+ *     Detected when `methodName` is NOT a method on `ParentClass`
+ *     (i.e. it's the constructor's output binding name). Specializes
+ *     the parent class's constructor body against the CURRENT receiver's
+ *     ClassType (the child's flattened typedef). The parent's constructor
+ *     body only touches its own properties — all of which are also
+ *     present in the child's flattened typedef via inheritance — so the
+ *     specialization emits cleanly against the child layout.
+ *
+ * The shape distinction is made via `classHasMethod`, not via
+ * positional analysis of the surrounding statement, so the same
+ * `SuperMethodCall` node works inside or outside an Assign. */
+export function lowerSuperCall(
+  this: Lowerer,
+  e: Extract<Expr, { type: "SuperMethodCall" }>
+): IRExpr {
+  const parentClassName = e.superClassName;
+  const ctx = this.shared.workspace.ctx;
+  const parentInfo = ctx.getClassInfo(parentClassName);
+  if (parentInfo === null) {
+    throw new TypeError(
+      `super call references unknown class '${parentClassName}'`,
+      e.span
+    );
+  }
+  // Disambiguate via numbl's `classHasMethod` (which walks the chain
+  // rooted at the parent — also picks up grand-parent methods). If
+  // the methodName is a known method on the parent, this is a
+  // method super-call; otherwise it's a constructor super-call.
+  const isMethodSuper = ctx.classHasMethod(parentClassName, e.methodName);
+  if (isMethodSuper) {
+    return lowerSuperMethodCall.call(this, parentClassName, e);
+  }
+  return lowerSuperConstructorCall.call(this, parentInfo, e);
+}
+
+/** Method super-call: `result = greet@Parent(obj)`. The receiver is
+ *  the FIRST user-arg (explicit in the source). Dispatches via the
+ *  resolver pinned to the parent, then specializes. */
+function lowerSuperMethodCall(
+  this: Lowerer,
+  parentClassName: string,
+  e: Extract<Expr, { type: "SuperMethodCall" }>
+): IRExpr {
+  const irArgs = e.args.map(a => this.lowerExpr(a));
+  const argTypes = irArgs.map(a => a.ty);
+  const target = this.shared.workspace.resolveForTargetClass(
+    e.methodName,
+    argTypes,
+    parentClassName,
+    this.callSite(),
+    e.span
+  );
+  if (target === null || target.kind !== "classMethod") {
+    throw new UnsupportedConstruct(
+      `internal: super-method-call '${e.methodName}@${parentClassName}' ` +
+        `did not resolve to a class method`,
+      e.span
+    );
+  }
+  // For instance methods, `irArgs[0]` is the receiver — already in
+  // the user-args; `dispatchResolvedMethodCall` expects `receiver`
+  // and `userArgs` separately. Split here.
+  if (irArgs.length === 0) {
+    throw new TypeError(
+      `super method-call '${e.methodName}@${parentClassName}' requires ` +
+        `at least the receiver argument`,
+      e.span
+    );
+  }
+  const receiver = irArgs[0];
+  const userArgs = irArgs.slice(1);
+  return dispatchResolvedMethodCall.call(
+    this,
+    target,
+    receiver,
+    userArgs,
+    e.span
+  );
+}
+
+/** Constructor super-call: `<obj> = <obj>@Parent(args)`. The parent's
+ *  constructor body is specialized against the CHILD's current
+ *  receiver type (the inherited+own flat property set), so its
+ *  property writes land on the child's typedef directly. */
+function lowerSuperConstructorCall(
+  this: Lowerer,
+  parentInfo: ClassInfo,
+  e: Extract<Expr, { type: "SuperMethodCall" }>
+): IRExpr {
+  // The receiver for the parent constructor is the enclosing scope's
+  // `<methodName>` binding (the child constructor's output, which has
+  // already been seeded as a ClassType param via `seedFromClassType`).
+  const receiverName = e.methodName;
+  const receiverTy = this.envLookup(receiverName);
+  if (receiverTy === undefined) {
+    throw new TypeError(
+      `super constructor-call '${receiverName}@${parentInfo.qualifiedName}': ` +
+        `'${receiverName}' is not in scope`,
+      e.span
+    );
+  }
+  // Look up the parent's constructor AST. We reuse the lookup
+  // already done by `Workspace.resolve` by going through the
+  // resolver via `resolveForTargetClass` with the parent's
+  // constructor name as the methodName — but `classConstructor` is a
+  // separate verdict, so we route through `Workspace.resolve` with
+  // the parent class name as the call name. The resolver returns
+  // `workspaceClassConstructor` for that case.
+  const target = this.shared.workspace.resolve(
+    parentInfo.qualifiedName,
+    [], // arg types don't drive constructor dispatch
+    this.callSite(),
+    e.span
+  );
+  if (target === null || target.kind !== "classConstructor") {
+    throw new TypeError(
+      `super constructor-call '${receiverName}@${parentInfo.qualifiedName}' ` +
+        `could not resolve the parent's constructor`,
+      e.span
+    );
+  }
+  // Build IR args: receiver (typed with the CHILD's full ClassType,
+  // so the parent's body writes hit the child's typedef) + user args.
+  const receiverIR: IRExpr = {
+    kind: "Var",
+    name: receiverName,
+    cName: this.currentCNameFor(receiverName),
+    ty: receiverTy,
+    span: e.span,
+  };
+  const userArgs = e.args.map(a => this.lowerExpr(a));
+  const irArgs: IRExpr[] = [receiverIR, ...userArgs];
+  return finishClassCall.call(
+    this,
+    target.className,
+    target.ast,
+    target.file,
+    irArgs,
+    e.span
+  );
 }
 
 /** Synthesize the initial receiver value for a constructor call. A

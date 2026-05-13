@@ -839,11 +839,16 @@ function specialize(
     // class identity + property tuple so member reads / writes on
     // the param resolve correctly inside the method body. The class
     // info is looked up from the workspace's class registry by the
-    // param's ClassType.className.
+    // param's ClassType.className. The `isInitialReceiver` flag is
+    // set when every property type is the default
+    // `scalarDouble("zero")` placeholder — i.e., a fresh constructor
+    // receiver where the first body write should establish the type
+    // fresh, not unify against the placeholder.
     for (const p of paramBindings) {
       if (isClass(p.ty)) {
         const info = this.shared.workspace.ctx.getClassInfo(p.ty.className);
-        inner.class.seedFromClassType(p.name, p.ty, info);
+        const isInitialReceiver = classTypeIsAllPlaceholders(p.ty);
+        inner.class.seedFromClassType(p.name, p.ty, info, isInitialReceiver);
       }
     }
     const body = inner.lowerStmts(fnAst.body);
@@ -912,4 +917,25 @@ function specialize(
   } finally {
     this.shared.inFlight.delete(mangledName);
   }
+}
+
+/** True when every property on a `ClassType` is the
+ *  `scalarDouble("zero")` placeholder — i.e., the type was produced
+ *  by `initialClassType` and the caller is the constructor entry
+ *  point. Used by `specialize` to decide whether to seed the
+ *  class-state propertyTypes (skip when initial — first body write
+ *  authoritative) or seed them as real call-site types (every
+ *  other class param). */
+function classTypeIsAllPlaceholders(ty: MType): boolean {
+  if (ty.kind !== "Class") return false;
+  for (const p of ty.properties) {
+    if (p.type.kind !== "Numeric") return false;
+    const n = p.type;
+    if (n.elem !== "double" || n.isComplex) return false;
+    if (n.sign !== "zero") return false;
+    // Must be scalar (1x1 dims).
+    if (n.dims.length !== 2) return false;
+    if (n.dims[0].kind !== "one" || n.dims[1].kind !== "one") return false;
+  }
+  return true;
 }
