@@ -319,9 +319,12 @@ describe("translate scalar example", () => {
   });
 
   it("assert(cond, msg) lowers to mtoc_assert_double_msg_text", () => {
-    const c = translate('assert(1 == 1, "boom");\n');
+    // `n == 1` keeps the comparison live (constant folding would
+    // otherwise collapse `1 == 1` to `1.0`) so the asserted shape
+    // still includes the `==` operator.
+    const c = translate('n = 1;\nassert(n == 1, "boom");\n');
     expect(c).toMatch(
-      /mtoc_assert_double_msg_text\(1\.0 == 1\.0, mtoc_text_from_string\(mtoc_string_from_literal\("boom", 4\)\)\);/
+      /mtoc_assert_double_msg_text\(n == 1\.0, mtoc_text_from_string\(mtoc_string_from_literal\("boom", 4\)\)\);/
     );
   });
 

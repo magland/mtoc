@@ -89,13 +89,27 @@ unset. Three carriers depending on `elem`/`isComplex`:
 - complex double scalar (`elem: "double"`, `isComplex`) → `{re, im}`
 - scalar char (`elem: "char"`, scalar shape) → one-character `string`
 
-Today the field is filled in only at literal lowering sites (number /
-string / char / `1i` / `complex(re, im)` with literal args) and
-threaded through `unify` (preserve when both sides agree, drop when they
-differ or when the merged shape is no longer scalar). `canonicalizeType`
-deliberately ignores it so spec keys are unaffected — current consumers
-treat it as a witness available for future use (constant folding,
-predictor tightening, spec-key effects).
+The field is filled in at literal lowering sites (number / string /
+char / `1i` / `complex(re, im)` with literal args) and at every
+literal-producing predictor / fold site, then threaded through `unify`
+(preserve when both sides agree, drop when they differ or when the
+merged shape is no longer scalar). `canonicalizeType` deliberately
+ignores it so spec keys are unaffected.
+
+Two consumers read it today:
+
+- The class constructor pre-pass (`predictConstructorPropertyTypes`
+  in `lowerClass.ts`) uses literal exacts as the property's initial
+  type — `obj.x = 5` predicts `scalarDouble(positive, exact=5)`.
+- The compile-time constant folder (`src/lowering/constFold.ts`)
+  collapses every binary / unary op whose operands are literal IR
+  kinds (`NumLit` / `CharLit` / `ImagLit` / `StringLit`) into a
+  single literal — real arithmetic / comparisons / power, char
+  arithmetic via the char→double promotion, pure-imag arithmetic
+  that lands back on a representable literal, and string concat
+  all fold at lowering time.
+
+Spec-key effects (per-exact specialization) remain deferred.
 
 ## DimInfo
 

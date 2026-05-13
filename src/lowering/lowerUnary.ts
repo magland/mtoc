@@ -27,6 +27,7 @@ import {
   type MType,
   typeToString,
 } from "./types.js";
+import { tryFoldUnaryLit } from "./constFold.js";
 import type { BuiltinSig } from "../workspace/builtins.js";
 import type { Lowerer } from "./lower.js";
 
@@ -71,7 +72,7 @@ export function lowerUnary(
       return {
         ...operand,
         value: v,
-        ty: scalarDouble(signFromValue(v)),
+        ty: scalarDouble(signFromValue(v), Number.isFinite(v) ? v : undefined),
         span: e.span,
       };
     }
@@ -79,7 +80,7 @@ export function lowerUnary(
       return {
         kind: "NumLit",
         value: operand.value !== 0 ? 0 : 1,
-        ty: scalarDouble("nonnegative"),
+        ty: scalarDouble("nonnegative", operand.value !== 0 ? 0 : 1),
         span: e.span,
       };
     }
@@ -94,6 +95,12 @@ export function lowerUnary(
       return { ...operand, value: -operand.value, span: e.span };
     }
   }
+  // Char-literal scalar folds (`-'a'` → NumLit(-97), `~'a'` → 0).
+  // Promotes the char's byte to a double per numbl's char→double
+  // promotion. `+'a'` keeps the CharLit untouched per the helper's
+  // null-means-no-fold contract.
+  const charFold = tryFoldUnaryLit(e.op, operand, e.span);
+  if (charFold !== null) return charFold;
   let ty: MType = operand.ty;
   if (isNumeric(operand.ty)) {
     if (e.op === "Minus") {

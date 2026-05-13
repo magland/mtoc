@@ -35,6 +35,7 @@ import {
   type Sign,
   typeToString,
 } from "./types.js";
+import { tryFoldBinaryLit } from "./constFold.js";
 import type { Lowerer } from "./lower.js";
 
 const SUPPORTED_BIN_OPS: ReadonlySet<BinOp> = new Set([
@@ -122,6 +123,14 @@ export function lowerBinary(
       span: e.span,
     };
   }
+  // Generic constant-folding pass: when both operands are literal IR
+  // kinds with known exact values, compute the op at lowering time
+  // and collapse to a single literal. Handles real / char / pure-
+  // imag arithmetic, comparisons, power, and string concat.
+  // Returning null leaves the IR shape unchanged and the existing
+  // typed-Binary path runs as before.
+  const folded = tryFoldBinaryLit(e.op, left, right, e.span);
+  if (folded !== null) return folded;
   // String concatenation: `+` lowers to a string-typed Binary whenever
   // at least one operand is a string. The other operand may be a
   // string or a char-array (numbl coerces char into string at the `+`

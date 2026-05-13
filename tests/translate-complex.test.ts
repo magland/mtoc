@@ -71,22 +71,31 @@ describe("complex scalar codegen", () => {
   });
 
   it("folds (negative)^(1/3) to cpow (constant-folds the divide)", () => {
+    // `1/3` constant-folds to `0.3333...` at lowering; the outer pow
+    // still routes to cpow because the (statically-negative base,
+    // non-integer exponent) pair triggers the complex lift.
     const c = translate("r = (-8)^(1/3);\ndisp(r);\n");
     expect(c).toContain("double _Complex r");
-    expect(c).toContain("cpow(-8.0, 1.0 / 3.0)");
+    expect(c).toMatch(/cpow\(-8\.0, 0\.3333333333333333\)/);
   });
 
   it("keeps (negative)^(integer-const) on real pow", () => {
-    const c = translate("r = (-2)^2;\ndisp(r);\n");
+    // Use a variable so the outer pow doesn't constant-fold; verifies
+    // the complex-lift decision picks the REAL `pow` for an integer
+    // exponent regardless of the (negative) base.
+    const c = translate("x = -2;\nr = x^2;\ndisp(r);\n");
     expect(c).not.toContain("cpow");
-    expect(c).toContain("pow(-2.0, 2.0)");
+    expect(c).toContain("pow(x, 2.0)");
     expect(c).not.toContain("double _Complex r");
   });
 
   it("keeps (positive)^(non-integer-const) on real pow", () => {
-    const c = translate("r = 4^0.5;\ndisp(r);\n");
+    // Use a variable so the outer pow doesn't constant-fold; verifies
+    // a positive base never triggers the complex lift even with a
+    // non-integer exponent.
+    const c = translate("x = 4;\nr = x^0.5;\ndisp(r);\n");
     expect(c).not.toContain("cpow");
-    expect(c).toContain("pow(4.0, 0.5)");
+    expect(c).toContain("pow(x, 0.5)");
   });
 });
 
