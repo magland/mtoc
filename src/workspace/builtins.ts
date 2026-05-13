@@ -40,6 +40,8 @@ import {
   rowVecDouble,
   scalarComplex,
   scalarDouble,
+  signIsNonneg,
+  signIsPositive,
   STRING,
   typeToString,
   type DimInfo,
@@ -224,6 +226,17 @@ export interface BuiltinSig {
    *  scalar-input-scalar-output param shape is otherwise
    *  indistinguishable from an elementwise lift. */
   producesOwnedDirectly?: boolean;
+  /** When true, a real argument whose static sign misses a param's
+   *  `domain` is NOT rejected at lowering — the call is admitted and
+   *  the result type is promoted to complex (so the complex sibling
+   *  emits at codegen). Numbl's runtime falls back from `realFn` to
+   *  `complexFn` on NaN, returning a complex value; mtoc commits at
+   *  codegen to the complex type whenever it cannot prove the input
+   *  meets the domain. Set on builtins whose complex extension is
+   *  total: `sqrt`, `log`, `asin`, `acos`, `log2`, `log10`. Requires
+   *  the builtin's `result`/`emit` to dispatch on input sign so the
+   *  complex sibling fires whenever the domain isn't statically met. */
+  promoteOnDomainMiss?: boolean;
 }
 
 // ── Factory helpers ─────────────────────────────────────────────────────
@@ -269,6 +282,31 @@ interface LibmComplexOpts {
   /** Sign of the result when the input is complex. Defaults to
    *  "unknown"; `cabs`-style builtins set this to "nonnegative". */
   complexResultSign?: Sign;
+  /** Promote the result to complex when a real arg's static sign
+   *  misses the param's `domain` (instead of rejecting at lowering).
+   *  Requires `complexCName` — the complex sibling is used to render
+   *  the call. See `BuiltinSig.promoteOnDomainMiss` for context. */
+  promoteOnDomainMiss?: boolean;
+}
+
+/** True iff the real arg in slot `i` has a static sign that fails
+ *  `domains[i]`. Complex args and missing-domain slots return `false`
+ *  unconditionally. Used to decide between the real C call and the
+ *  complex sibling on a promote-on-domain-miss builtin. */
+function realArgMissesDomain(
+  argTys: ReadonlyArray<MType>,
+  domains: ReadonlyArray<Domain>
+): boolean {
+  for (let i = 0; i < argTys.length; i++) {
+    const ty = argTys[i];
+    if (!isNumeric(ty)) continue;
+    if (ty.isComplex) continue;
+    const dom = domains[i];
+    if (!dom) continue;
+    if (dom === "nonnegative" && !signIsNonneg(ty.sign)) return true;
+    if (dom === "positive" && !signIsPositive(ty.sign)) return true;
+  }
+  return false;
 }
 
 /** Builtin that maps directly to a libm function. Optionally also
@@ -286,16 +324,22 @@ function libm(
     complexCName,
     complexResult = "propagates",
     complexResultSign = "nonnegative",
+    promoteOnDomainMiss = false,
   } = complexOpts;
   const complexDomain: ComplexDomain = complexCName
     ? "real-or-complex"
     : "real-only";
+  const useComplex = (argTys: ReadonlyArray<MType>): boolean =>
+    !!complexCName &&
+    (anyComplex(argTys) ||
+      (promoteOnDomainMiss && realArgMissesDomain(argTys, domains)));
   return {
     name,
     category: "expr",
     params: scalarParams(arity, domains, complexDomain),
+    promoteOnDomainMiss,
     result: argTys => {
-      if (complexCName && anyComplex(argTys)) {
+      if (useComplex(argTys)) {
         return complexResult === "propagates"
           ? scalarComplex()
           : scalarDouble(complexResultSign);
@@ -303,7 +347,7 @@ function libm(
       return scalarDouble(resultSign);
     },
     emit: (args, argTys) => {
-      const target = complexCName && anyComplex(argTys) ? complexCName : cName;
+      const target = useComplex(argTys) ? complexCName! : cName;
       return `${target}(${args.join(", ")})`;
     },
   };
@@ -799,6 +843,11 @@ const BUILTINS: BuiltinSig[] = [
   // numeric-value-domain question is moot there.
   libm("sqrt", 1, "sqrt", "nonnegative", ["nonnegative"], {
     complexCName: "csqrt",
+    // `sqrt` of a real arg whose sign we can't prove nonnegative
+    // promotes to `csqrt` and a complex result, matching numbl's
+    // `realFn → NaN → complexFn` fallback. The numeric-domain check
+    // doesn't fire for opted-in builtins; see `validateDomain`.
+    promoteOnDomainMiss: true,
   }),
   libm("exp", 1, "exp", "positive", [], { complexCName: "cexp" }),
   libm("log", 1, "log", "unknown", ["nonnegative"], { complexCName: "clog" }),

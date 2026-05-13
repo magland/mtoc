@@ -171,7 +171,7 @@ export function lowerBuiltinCallWithArgs(
       // (matches the scalar path); the actual shape mismatch isn't an
       // error here — it's the whole point of the lift.
       validateComplexDomain(name, constraint, args[i], argLabel(i), span);
-      validateDomain(name, constraint, args[i], argLabel(i), span);
+      validateDomain(builtin, constraint, args[i], argLabel(i), span);
     }
     const scalarArgTys = args.map(a => scalarifyType(a.ty));
     let scalarResult: MType;
@@ -209,7 +209,7 @@ export function lowerBuiltinCallWithArgs(
     const constraint = builtin.params[i];
     validateShape(name, builtin, constraint, args[i], argLabel(i));
     validateComplexDomain(name, constraint, args[i], argLabel(i), span);
-    validateDomain(name, constraint, args[i], argLabel(i), span);
+    validateDomain(builtin, constraint, args[i], argLabel(i), span);
   }
   // The builtin computes its own result MType from the lowered arg
   // types — captures arg-sign-preserving reductions (sum), fixed-sign
@@ -375,7 +375,7 @@ function validateComplexDomain(
 }
 
 function validateDomain(
-  name: string,
+  builtin: BuiltinSig,
   constraint: ParamConstraint,
   arg: IRExpr,
   argLabel: string,
@@ -383,6 +383,11 @@ function validateDomain(
 ): void {
   const dom = constraint.domain;
   if (!dom) return;
+  // Builtins that opt into `promoteOnDomainMiss` (sqrt etc.) handle a
+  // domain miss by emitting their complex sibling and returning a
+  // complex result — see `BuiltinSig.promoteOnDomainMiss`. The
+  // sign-domain throw would block that admit path, so skip it.
+  if (builtin.promoteOnDomainMiss) return;
   const argTy = arg.ty;
   // Sign is meaningless on complex inputs (the type-system invariant
   // pins it to "unknown"), and the complex sibling implementation
@@ -394,7 +399,7 @@ function validateDomain(
     dom === "nonnegative" ? signIsNonneg(argSign) : signIsPositive(argSign);
   if (!ok) {
     throw new TypeError(
-      `${name} requires ${argLabel} to be statically ${dom} ` +
+      `${builtin.name} requires ${argLabel} to be statically ${dom} ` +
         `(got sign='${argSign}'). ` +
         `Use abs(...) or restructure the expression.`,
       span

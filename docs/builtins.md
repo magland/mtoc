@@ -24,7 +24,14 @@ defaulting to `real-only`). The lowerer reads `params[i].shape`/`.domain`/
 `TypeError` or `UnsupportedConstruct` with a span pointing at that argument.
 The sign-domain check is skipped for complex args (sign is meaningless on
 complex per the type-system invariant; the complex sibling implementation is
-total).
+total). It is also skipped when the builtin sets
+`BuiltinSig.promoteOnDomainMiss`: the call is admitted at the real-arg
+position, and the builtin's `result`/`emit` closures route the call to
+the complex sibling. This mirrors numbl's runtime `realFn → NaN →
+complexFn` fallback (the static result type becomes complex even when
+the actual runtime value is nonneg). See `docs/limitations.md` for the
+downstream consequences (chained ops requiring a real operand will
+refuse the complex result).
 
 `result` and `emit` are first-class closures — there is no magic-string
 indirection. A reduction like `sum` whose result sign tracks its argument's
@@ -45,7 +52,12 @@ patterns:
   libm function call (`sqrt`, `cos`, `pow`, …). Activates `<math.h>`. Pass
   `complexOpts.complexCName` to admit complex inputs and dispatch to a
   complex libm sibling (`csqrt`, `cabs` …); set `complexResult: "real"` for
-  abs-style builtins whose complex form returns a real magnitude.
+  abs-style builtins whose complex form returns a real magnitude. Pass
+  `complexOpts.promoteOnDomainMiss: true` (requires `complexCName`) to
+  also admit real arguments whose static sign misses the param's
+  `domain` — instead of rejecting at lowering, the call is admitted and
+  the result type promotes to complex (numbl's `realFn → NaN →
+complexFn` fallback, mtoc-flavored). Today only `sqrt` opts in.
 - **`runtime(name, arity, helperName, resultSign, domains, complexOpts?)`** —
   call to a runtime helper (`mtoc_mod`, `mtoc_sign`, …). Activates the
   helper snippet via the runtime registry. Pass

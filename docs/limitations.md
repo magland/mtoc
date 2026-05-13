@@ -13,6 +13,20 @@ workaround or a roadmap note.
   across iterations may keep a sound but imprecise post-loop type — usually
   `unknown`. The merge function documents the gap. Fixpoint iteration is part
   of the larger "decouple type inference from IR construction" roadmap item.
+- **`sqrt` of an unknown-sign real input always emits complex.** Numbl
+  decides at runtime: `realFn → NaN → complexFn`, so `sqrt(x)` returns a
+  plain number when `x ≥ 0` at runtime and a complex value otherwise.
+  mtoc has to commit at codegen, so any `sqrt(x)` whose static sign isn't
+  proved nonneg promotes the result type to complex (the C call goes
+  through `csqrt`). Disp / fprintf still match numbl byte-for-byte
+  because `mtoc_format_complex` collapses `im == 0` back to the real
+  format; but downstream operations that only accept a real operand —
+  e.g. `x > 0`, `floor(x)`, `if x`, char/int specs in `fprintf` — will
+  refuse the result. The workaround is to wrap the operand
+  (`sqrt(abs(x))`) or refine its sign before the call. The same applies
+  in principle to other libm builtins whose complex extension is total
+  (`log`, `asin`, `acos`, `log2`, `log10`); today only `sqrt` opts in
+  via `BuiltinSig.promoteOnDomainMiss`.
 - **Variable re-typing across kinds is split at top level, rejected
   inside control flow.** At script or function-body top level, an
   assignment whose new type can't share a C variable with the prior

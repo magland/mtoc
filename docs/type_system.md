@@ -283,10 +283,17 @@ Sign = positive | nonnegative | negative | nonpositive | zero | nonzero | unknow
 ```
 
 Tracked on every `NumericType`. Used by builtins to refuse translation when an
-input could land outside the function's domain — `sqrt(x)` and `log(x)` both
-require `x` to be statically `nonnegative` (numbl defines `log(0) = -Inf`, so
-the zero-input case is well-formed and matches C's `log(0.0)`). The canonical
-pattern when a user has only `unknown` info is `sqrt(abs(x))`.
+input could land outside the function's domain — `log(x)` requires `x` to be
+statically `nonnegative` (numbl defines `log(0) = -Inf`, so the zero-input case
+is well-formed and matches C's `log(0.0)`). The canonical pattern when a user
+has only `unknown` info is `log(abs(x))`. `sqrt` has the same `nonnegative`
+declared domain but opts into `BuiltinSig.promoteOnDomainMiss`: a domain miss
+admits the call and promotes the result type to complex (the C call goes
+through `csqrt`), mirroring numbl's `realFn → NaN → complexFn` runtime
+fallback. The downstream result type is complex even when the runtime value
+happens to be nonneg — `mtoc_format_complex` collapses `im == 0` to the real
+format so disp/fprintf still match byte-for-byte, but subsequent
+real-operand-only ops (`x > 0`, `floor(x)`, etc.) will refuse.
 
 The sign lattice has its own helpers (`signNegate`, `signAdd`, `signSub`,
 `signMul`, `signDiv`, `joinSign`, `signFromValue`). The rules are conservative
@@ -357,7 +364,7 @@ Type errors surface from lowering with a `Span`. The two shapes are:
 - `UnsupportedConstruct(message, span)` — "this construct isn't yet supported"
   (defines a roadmap item if hit by a real program).
 - `TypeError(message, span)` — "the program is well-formed numbl but
-  inconsistent for static codegen" (e.g. `sqrt(x)` with `x.sign === "negative"`).
+  inconsistent for static codegen" (e.g. `log(x)` with `x.sign === "negative"`).
 
 A small post-lowering `validateIR` pass catches structural invariants (tensor
 literals only as `Assign` RHS, etc.) so the codegen never has to surface
