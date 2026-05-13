@@ -251,6 +251,12 @@ async function runCuratedList(scripts: string[]): Promise<number> {
   return fail;
 }
 
+/** Format a corpus-relative path as a path relative to the mtoc repo
+ *  root so terminals / IDEs render it as a clickable link. */
+function clickable(rel: string): string {
+  return `../numbl/numbl_test_scripts/${rel}`;
+}
+
 async function runProbe(filters: string[]): Promise<void> {
   let scripts = discoverAllScripts();
   if (filters.length > 0) {
@@ -275,7 +281,9 @@ async function runProbe(filters: string[]): Promise<void> {
     byCategory.set(r.category, bucket);
     done++;
     if (INTERESTING.has(r.category)) {
-      console.log(`[${done}/${scripts.length}] ${r.category} ${r.rel}`);
+      console.log(
+        `[${done}/${scripts.length}] ${r.category} ${clickable(r.rel)}`
+      );
       if (r.detail) {
         for (const line of r.detail.split("\n")) console.log(`    ${line}`);
       }
@@ -305,7 +313,7 @@ async function runProbe(filters: string[]): Promise<void> {
   const passing = byCategory.get("PASS") ?? [];
   if (passing.length > 0) {
     console.log(`\n=== passing (${passing.length}) ===`);
-    for (const r of passing) console.log(r.rel);
+    for (const r of passing) console.log(clickable(r.rel));
   }
 
   const interesting: Result[] = [];
@@ -323,7 +331,8 @@ async function runProbe(filters: string[]): Promise<void> {
     console.log(
       `\n=== translated-but-broken (${interesting.length}) — tests that failed for reasons OTHER than UnsupportedConstruct ===`
     );
-    for (const r of interesting) console.log(`${r.category} ${r.rel}`);
+    for (const r of interesting)
+      console.log(`${r.category} ${clickable(r.rel)}`);
   }
 }
 
