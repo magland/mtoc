@@ -391,12 +391,16 @@ method@Parent(obj)` for super-method, `obj = obj@Parent(args)`
   (`<className>__<methodName>`) so a parent's `area` and a child's
   `area` get distinct C functions even when co-located in one .m
   file. Value-copy semantics fall out of the existing
-  copy-on-arg-pass machinery. What's deferred — handle classes,
-  static methods, operator overloads, `subsref` / `subsasgn`,
-  external method files, `disp(obj)`, class arrays, and
-  constructor first-writes that change a property's C
-  representation (e.g. assigning a char-array to a fresh property)
-  — see [docs/limitations.md](docs/limitations.md#classes).
+  copy-on-arg-pass machinery. Non-numeric property types
+  (char-array, string) work in constructors: a static AST pre-pass
+  (`predictConstructorPropertyTypes`) walks each `obj.<prop> =
+  <RHS>` statement plus super-constructor calls and commits the
+  receiver's typedef to the post-body shape ahead of
+  specialization. What's deferred — handle classes, static
+  methods, operator overloads, `subsref` / `subsasgn`, external
+  method files, `disp(obj)`, class arrays, and constructor writes
+  whose RHS the pre-pass can't statically type — see
+  [docs/limitations.md](docs/limitations.md#classes).
 - Text view (`mtoc_text_view_t`): a non-owning `{data, len}` adapter
   every "accepts text" runtime helper consumes. `disp`, `error`,
   `assert(_, msg)`, `strcmp`, and `string_concat` each route through

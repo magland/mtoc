@@ -17,6 +17,7 @@ import type { IRExpr } from "../lowering/ir.js";
 import {
   cTypeFor,
   isCharArray,
+  isClass,
   isMultiElement,
   isNumeric,
   isScalar,
@@ -168,7 +169,12 @@ export function wrapOwnedArgCopy(
   // owned value that it may freely mutate / reassign / free at scope
   // exit. Strings and char-tensors as args are borrowed (no automatic
   // wrap) — they were never in this convention.
-  if (!isMultiElement(argTy) && !isStruct(argTy) && argTy.kind !== "Handle") {
+  if (
+    !isMultiElement(argTy) &&
+    !isStruct(argTy) &&
+    !isClass(argTy) &&
+    argTy.kind !== "Handle"
+  ) {
     return inner;
   }
   const helper = owned.copy(argTy);

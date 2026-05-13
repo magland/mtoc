@@ -24,42 +24,264 @@
  * consume the resolver's verdict and route to specialization.
  */
 
-import type { Expr, Span } from "../parser/index.js";
+import type { Expr, Span, Stmt } from "../parser/index.js";
 import { Lowerer } from "./lower.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import {
+  charArrayType,
   classType,
+  scalarChar,
   scalarDouble,
+  signFromValue,
+  STRING,
+  unify,
   type ClassType,
+  type DimInfo,
   type MType,
 } from "./types.js";
 import type { FunctionStmt, ResolvedTarget } from "../workspace/workspace.js";
 import type { ClassInfo } from "../numbl-core/lowering/loweringContext.js";
 import { specializeUserCallWithIRArgs } from "./lowerFuncCall.js";
+import { decodeNumblQuotedLexeme } from "./lexerHelpers.js";
 
-/** Build the initial `ClassType` for a fresh constructor receiver:
- *  every declared property (own + inherited from every superclass)
- *  starts at `scalarDouble("zero")`. Property types widen as the
- *  constructor body assigns through them.
+/** Build the initial `ClassType` for a fresh constructor receiver.
+ *  Property types come from a best-effort static analysis of the
+ *  constructor body (`predictConstructorPropertyTypes`): the analysis
+ *  walks `obj.<prop> = <RHS>` writes plus super-constructor calls and
+ *  derives each property's eventual MType from literals / arg
+ *  references / nested super-ctor returns. Properties that the
+ *  analysis can't pin down stay at the conservative
+ *  `scalarDouble("zero")` placeholder.
  *
- *  Property ordering: parent-first, then child-own. This is the
- *  numbl-natural order — the parent's constructor sets its own
- *  properties before the child's constructor reaches `obj.Breed = ...`.
- *  The order is encoded into the typedef hash (via `classType`'s
- *  alphabetical sort), so two child classes with the same flattened
- *  property set share a typedef. */
-function initialClassType(this: Lowerer, info: ClassInfo): ClassType {
+ *  Why this matters: the constructor's `obj` C param uses this initial
+ *  type as its typedef, and `return obj;` returns the post-body
+ *  widened type. Without the pre-pass, the param's typedef (all-
+ *  placeholders) and the post-body typedef (real types) would differ,
+ *  causing C-side type-check failures. With the pre-pass, the param
+ *  typedef already has the right C representation for each property,
+ *  and the body's writes just fill in values.
+ *
+ *  Property ordering: parent-first, then child-own. The order is
+ *  encoded into the typedef hash (via `classType`'s alphabetical
+ *  sort), so two child classes with the same flattened property set
+ *  share a typedef. */
+function initialClassType(
+  this: Lowerer,
+  info: ClassInfo,
+  userArgTypes: ReadonlyArray<MType>
+): ClassType {
   const propNames = flattenedPropertyNames.call(this, info);
+  const predicted = predictConstructorPropertyTypes.call(
+    this,
+    info,
+    userArgTypes
+  );
   const properties = propNames.map(name => ({
     name,
-    type: scalarDouble("zero") as MType,
+    type: (predicted.get(name) ?? scalarDouble("zero")) as MType,
   }));
   return classType({
     className: info.qualifiedName,
     file: info.fileName,
     properties,
   });
+}
+
+/** Predict property types by walking the constructor body's AST. The
+ *  result map keys are property names; values are best-effort MTypes
+ *  derived from RHS expression analysis. Properties absent from the
+ *  map stay at the placeholder default in the caller.
+ *
+ *  The analysis is conservative — it only commits to a type when the
+ *  RHS is something we can confidently type without full lowering.
+ *  Specifically:
+ *
+ *   - Number literal → `scalarDouble(signFromValue)`.
+ *   - String literal → `STRING`.
+ *   - Char literal → `scalarChar()` or `charArrayType(notOne)`.
+ *   - Ident referring to a constructor param → that param's type.
+ *   - SuperMethodCall to the parent's constructor (super-ctor form)
+ *     → recursively predict the parent's property types and merge
+ *     into the result.
+ *   - Anything else → conservative `scalarDouble("unknown")`.
+ *
+ *  Multiple writes to the same property unify, so a write that's
+ *  hard to type doesn't pin the property to "unknown" if a later
+ *  write is more precise. */
+function predictConstructorPropertyTypes(
+  this: Lowerer,
+  info: ClassInfo,
+  userArgTypes: ReadonlyArray<MType>
+): Map<string, MType> {
+  const ctorAst = lookupClassConstructorAST(info);
+  if (ctorAst === null) return new Map();
+
+  // The constructor AST's `params` has been transformed (via
+  // `lookupClassMethodAST` in Workspace.resolve) to prepend the
+  // receiver-output var name. So params[0] is the receiver, and
+  // params[1..] are the user-declared args.
+  const receiverName = ctorAst.params[0] ?? "obj";
+  const paramTypes = new Map<string, MType>();
+  for (let i = 1; i < ctorAst.params.length; i++) {
+    const argTy = userArgTypes[i - 1];
+    if (argTy !== undefined) {
+      paramTypes.set(ctorAst.params[i], argTy);
+    }
+  }
+
+  const result = new Map<string, MType>();
+  const ctx = this.shared.workspace.ctx;
+
+  const recordWrite = (propName: string, ty: MType): void => {
+    const prior = result.get(propName);
+    if (prior === undefined) {
+      result.set(propName, ty);
+      return;
+    }
+    const merged = unify(prior, ty);
+    if (merged.kind !== "Unknown") result.set(propName, merged);
+  };
+
+  const visitStmt = (s: Stmt): void => {
+    switch (s.type) {
+      case "Assign": {
+        // Watch for `obj = obj@Parent(args)` — super-constructor
+        // call. The parent's pre-pass result is merged into the
+        // child's so inherited properties get their predicted types.
+        if (
+          s.name === receiverName &&
+          s.expr.type === "SuperMethodCall" &&
+          !ctx.classHasMethod(s.expr.superClassName, s.expr.methodName)
+        ) {
+          const parentInfo = ctx.getClassInfo(s.expr.superClassName);
+          if (parentInfo !== null) {
+            const parentArgTys = s.expr.args.map(predictExprType);
+            const parentResult = predictConstructorPropertyTypes.call(
+              this,
+              parentInfo,
+              parentArgTys
+            );
+            for (const [k, v] of parentResult) recordWrite(k, v);
+          }
+        }
+        return;
+      }
+      case "AssignLValue": {
+        // `<root>.<prop> = <rhs>` where <root> is the receiver. We
+        // only handle single-step paths here; nested paths
+        // (`obj.x.y = ...`) aren't writable on classes today, so
+        // they'd fail at lowering anyway.
+        if (s.lvalue.type !== "Member") return;
+        const lv = s.lvalue;
+        if (lv.base.type !== "Ident") return;
+        if (lv.base.name !== receiverName) return;
+        recordWrite(lv.name, predictExprType(s.expr));
+        return;
+      }
+      case "If": {
+        for (const t of s.thenBody) visitStmt(t);
+        for (const eif of s.elseifBlocks) {
+          for (const t of eif.body) visitStmt(t);
+        }
+        if (s.elseBody !== null) {
+          for (const t of s.elseBody) visitStmt(t);
+        }
+        return;
+      }
+      case "While":
+        for (const t of s.body) visitStmt(t);
+        return;
+      case "For":
+        for (const t of s.body) visitStmt(t);
+        return;
+      default:
+        return;
+    }
+  };
+
+  const predictExprType = (e: Expr): MType => {
+    switch (e.type) {
+      case "Number": {
+        const n = Number(e.value);
+        return scalarDouble(signFromValue(n));
+      }
+      case "String":
+        return STRING;
+      case "Char": {
+        const raw = e.value;
+        if (raw.length < 2 || raw[0] !== "'") return scalarDouble("unknown");
+        const inner = decodeNumblQuotedLexeme(raw);
+        if (inner.length === 0) return scalarDouble("unknown");
+        if (inner.length === 1) return scalarChar();
+        const cols: DimInfo = { kind: "notOne" };
+        return charArrayType(cols);
+      }
+      case "Ident": {
+        const t = paramTypes.get(e.name);
+        if (t !== undefined) return t;
+        return scalarDouble("unknown");
+      }
+      case "SuperMethodCall": {
+        // Only recognize the super-CONSTRUCTOR form here (receiver
+        // bound to the parent's constructor return). Super-method
+        // calls in a constructor's RHS are unusual; predict
+        // conservatively.
+        if (!ctx.classHasMethod(e.superClassName, e.methodName)) {
+          const parentInfo = ctx.getClassInfo(e.superClassName);
+          if (parentInfo !== null) {
+            const flatNames = function walkChain(
+              this: Lowerer,
+              i: ClassInfo
+            ): string[] {
+              return flattenedPropertyNames.call(this, i);
+            }.call(this, parentInfo);
+            const parentArgTys = e.args.map(predictExprType);
+            const predicted = predictConstructorPropertyTypes.call(
+              this,
+              parentInfo,
+              parentArgTys
+            );
+            const properties = flatNames.map(name => ({
+              name,
+              type: (predicted.get(name) ?? scalarDouble("zero")) as MType,
+            }));
+            return classType({
+              className: parentInfo.qualifiedName,
+              file: parentInfo.fileName,
+              properties,
+            });
+          }
+        }
+        return scalarDouble("unknown");
+      }
+      default:
+        return scalarDouble("unknown");
+    }
+  };
+
+  for (const s of ctorAst.body) visitStmt(s);
+  return result;
+}
+
+/** Look up the constructor AST for a class via numbl's already-
+ *  vendored mechanism. The AST has the receiver-output prepended as
+ *  the first param (mirrors `getOrCreateClassFileContext`'s
+ *  transform). Returns null when the class has no explicit
+ *  constructor — caller handles. */
+function lookupClassConstructorAST(info: ClassInfo): FunctionStmt | null {
+  const ctorName = info.constructorName;
+  if (ctorName === null) return null;
+  for (const member of info.ast.members) {
+    if (member.type !== "Methods") continue;
+    for (const stmt of member.body) {
+      if (stmt.type !== "Function") continue;
+      if (stmt.name !== ctorName) continue;
+      const outputName = stmt.outputs.length > 0 ? stmt.outputs[0] : "obj";
+      return { ...stmt, params: [outputName, ...stmt.params] };
+    }
+  }
+  return null;
 }
 
 /** Walk the inheritance chain rooted at `info` and accumulate every
@@ -107,7 +329,12 @@ export function lowerClassConstructorCall(
       span
     );
   }
-  const initialTy = initialClassType.call(this, info);
+  // Lower user args first so we know their MTypes — the pre-pass
+  // predictor uses them to type Ident references in the constructor
+  // body (e.g. `obj.x = v` where `v` is a constructor param).
+  const userArgs: IRExpr[] = argExprs.map(a => this.lowerExpr(a));
+  const userArgTypes = userArgs.map(a => a.ty);
+  const initialTy = initialClassType.call(this, info, userArgTypes);
   // The constructor AST has the receiver-output prepended as its
   // first param (Workspace.resolve's lookupClassMethodAST did this).
   // We feed a synthetic-IR initial receiver as the first arg.
@@ -117,8 +344,7 @@ export function lowerClassConstructorCall(
     initialTy,
     span
   );
-  const irArgs: IRExpr[] = [initialArg];
-  for (const a of argExprs) irArgs.push(this.lowerExpr(a));
+  const irArgs: IRExpr[] = [initialArg, ...userArgs];
   return finishClassCall.call(
     this,
     info.qualifiedName,

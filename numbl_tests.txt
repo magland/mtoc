@@ -10,6 +10,8 @@
 # Lines starting with `#` and blank lines are ignored.
 
 arithmetic/basic_ops.m
+classes/inherited_method_dispatch.m
+classes/super_calls.m
 arithmetic/fortran_exponent_literal.m
 arithmetic/complex_advanced.m
 arithmetic/test_colon_endpoint.m

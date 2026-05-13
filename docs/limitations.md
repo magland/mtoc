@@ -450,20 +450,20 @@ consumes the verdict. Both call syntaxes work:
   call sites with a span.
 - **Static methods** — `ClassName.method(args)` syntax and `Static`
   attribute methods rejected at class-info validation.
-- **Constructor first-write to a non-numeric property type**.
-  mtoc's constructor ABI commits the receiver-param's C typedef at
-  specialization time, before the body is lowered. The receiver
-  param starts with every property at the `scalarDouble("zero")`
-  placeholder (C type `double`); any first write that has a
-  different C representation (`mtoc_char_tensor_t`,
-  `mtoc_string_t`, a struct / class typedef) would force the
-  param's typedef to differ from the body's writes. mtoc rejects
-  this case with a clear span. Workaround: initialize the
-  property to a numeric default in the constructor, then write
-  the real value via a method call after construction. Lifting
-  this restriction needs either a constructor-body pre-pass that
-  predicts property types or a two-phase specialization
-  (specialize-then-patch); both deferred to a later stage.
+- **Complex constructor RHS expressions stay at the conservative
+  default.** mtoc's constructor pre-pass
+  (`predictConstructorPropertyTypes`) statically derives each
+  property's eventual type from literals, constructor-arg
+  references, and nested super-ctor returns. Expressions outside
+  that surface (builtin / user-function calls, multi-step binary
+  ops, etc.) fall back to `scalarDouble("unknown")`. If the body
+  then writes a value whose C type differs from `double` to a
+  property the pre-pass couldn't predict, the constructor's
+  typedef will disagree with the body's writes and `cc` will fail
+  the C compile. Workaround: assign the complex expression to a
+  local first, then `obj.prop = local` so the pre-pass picks up
+  the local's predicted type — OR move that initialization out of
+  the constructor entirely.
 - **Operator overloads** — `plus`, `minus`, `mtimes`, `eq`,
   `subsref`, `subsasgn`, `horzcat`, `vertcat`, `numel`, `size`,
   `length`, etc. defined as methods cause the class to reject at
