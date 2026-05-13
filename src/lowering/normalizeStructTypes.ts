@@ -18,7 +18,13 @@ import type {
   IndexSliceArg,
   VarBinding,
 } from "./ir.js";
-import { isStruct, type MType, type StructType } from "./types.js";
+import {
+  isHandle,
+  isStruct,
+  type HandleType,
+  type MType,
+  type StructType,
+} from "./types.js";
 
 /** Rewrite every struct-typed expression in the program so the type
  *  comes from the variable's binding in the relevant scope. */
@@ -28,18 +34,42 @@ export function normalizeStructTypes(prog: IRProgram): void {
   // outputs, and the function's assignedVars (later wins on duplicate
   // keys, but they shouldn't overlap).
   prog.stmts = rewriteStmts(prog.stmts, prog.assignedVars);
+  normalizeAssignedVars(prog.assignedVars);
   for (const fn of prog.functions) {
     const binds = new Map<string, MType>();
     for (const p of fn.params) binds.set(p.cName, p.ty);
     for (const o of fn.outputs) binds.set(o.cName, o.ty);
     for (const [k, v] of fn.assignedVars) binds.set(k, v.ty);
-    fn.body = rewriteStmts(fn.body, mapFromTypeMap(binds));
-    // Also rewrite the assignedVars entries (their internal struct
-    // shapes are already the final widened ones — but their field
-    // types may transitively include other struct types that we need
-    // to also normalize. In v1 that's a no-op since field types come
-    // straight from unify on field values, not on cross-variable
-    // references).
+    const wrapped = mapFromTypeMap(binds);
+    fn.body = rewriteStmts(fn.body, wrapped);
+    normalizeAssignedVars(fn.assignedVars);
+    // Normalize handle-typed params/outputs too — their captures may
+    // hold stale struct types referencing the enclosing-scope's
+    // bindings.
+    fn.params = fn.params.map(p =>
+      isHandle(p.ty) ? { ...p, ty: normalizeHandleType(p.ty, wrapped) } : p
+    );
+    fn.outputs = fn.outputs.map(o =>
+      isHandle(o.ty) ? { ...o, ty: normalizeHandleType(o.ty, wrapped) } : o
+    );
+  }
+}
+
+/** Normalize handle-typed entries in an assignedVars map: the
+ *  predeclaration uses the binding's type to pick a C type, so the
+ *  binding must reflect the normalized HandleType (with binds-aligned
+ *  captures) or the predecl and the assign site disagree. */
+function normalizeAssignedVars(assignedVars: Map<string, VarBinding>): void {
+  // Build a `binds`-shape view of the same map so the helper can
+  // look up by cName.
+  const wrapped: ReadonlyMap<string, VarBinding> = assignedVars;
+  for (const [k, v] of assignedVars) {
+    if (isHandle(v.ty)) {
+      assignedVars.set(k, {
+        ...v,
+        ty: normalizeHandleType(v.ty, wrapped),
+      });
+    }
   }
 }
 
@@ -68,8 +98,27 @@ function rewriteStmt(
       // If the LHS is a struct binding, update s.ty to match the
       // post-widening type so the codegen emits a consistent typedef
       // for the predeclaration vs the assign site.
-      const finalTy =
-        isStruct(s.ty) && binds.has(s.cName) ? binds.get(s.cName)!.ty : s.ty;
+      let finalTy: MType = s.ty;
+      if (isStruct(s.ty) && binds.has(s.cName)) {
+        finalTy = binds.get(s.cName)!.ty;
+      } else if (isHandle(s.ty)) {
+        // For handle bindings: the binds map's stored HandleType may
+        // itself have stale captures, so normalize it before adopting
+        // it as the LHS type. The RHS HandleLit was normalized via
+        // `rewriteExpr` above and is the authoritative shape; use
+        // its ty as the final LHS type so the predecl, the assign
+        // site, and any later reads all see the same typedef.
+        if (newRhs.kind === "HandleLit" && isHandle(newRhs.ty)) {
+          finalTy = newRhs.ty;
+        } else if (binds.has(s.cName)) {
+          finalTy = normalizeHandleType(
+            binds.get(s.cName)!.ty as HandleType,
+            binds
+          );
+        } else {
+          finalTy = normalizeHandleType(s.ty, binds);
+        }
+      }
       // If the RHS is a StructLit and the surrounding Assign got
       // widened, also widen the literal's ty so emitExpr produces
       // the same typedef name as the LHS binding expects.
@@ -179,6 +228,9 @@ function rewriteExpr(
       if (isStruct(e.ty) && binds.has(e.cName)) {
         return { ...e, ty: binds.get(e.cName)!.ty };
       }
+      if (isHandle(e.ty)) {
+        return { ...e, ty: normalizeHandleType(e.ty, binds) };
+      }
       return e;
     }
     case "MemberLoad": {
@@ -236,9 +288,61 @@ function rewriteExpr(
     case "StringLit":
     case "CharLit":
     case "EndRef":
-    case "HandleLit":
       return e;
+    case "HandleLit": {
+      // Rewrite the captured VALUES' tys AND the HandleType's
+      // captures' tys (which determine the C struct field types) so
+      // both line up against the final widened struct types in
+      // `binds`. Without this, a struct-typed capture taken at the
+      // @-site (when `s` was `Struct<{a:+, b:+}>`) but later widened
+      // (to `Struct<{a:+, b:nonneg}>`) would emit a typedef whose
+      // `cap_s` field disagrees with the call-site copy helper.
+      const newCaptures = e.captures.map(c => ({
+        name: c.name,
+        value: rewriteExpr(c.value, binds),
+      }));
+      const newTy = isHandle(e.ty) ? normalizeHandleType(e.ty, binds) : e.ty;
+      return { ...e, captures: newCaptures, ty: newTy };
+    }
+    case "HandleCaptureLoad": {
+      // Rewrite the base (so its HandleType reflects post-widening
+      // capture shapes), then derive the load's `ty` from the base's
+      // normalized HandleType. Without this, a HandleCaptureLoad
+      // built at @-site time would carry a stale capture type while
+      // the handle struct's field has the binds-normalized type.
+      const newBase = rewriteExpr(e.base, binds) as Extract<
+        IRExpr,
+        { kind: "Var" }
+      >;
+      let newTy = e.ty;
+      if (isHandle(newBase.ty)) {
+        const cap = newBase.ty.captures.find(c => c.name === e.captureName);
+        if (cap !== undefined) newTy = cap.ty;
+      }
+      return { ...e, base: newBase, ty: newTy };
+    }
   }
+}
+
+/** Rewrite a `HandleType`'s capture-tuple types using `binds`. The
+ *  capture name is the same identifier as the captured variable's
+ *  scope-level binding, so we look it up directly. Returns a fresh
+ *  HandleType with normalized captures; leaves the target unchanged. */
+function normalizeHandleType(
+  h: HandleType,
+  binds: ReadonlyMap<string, VarBinding>
+): HandleType {
+  if (h.captures.length === 0) return h;
+  const newCaptures = h.captures.map(c => {
+    if (binds.has(c.name)) {
+      return { name: c.name, ty: binds.get(c.name)!.ty };
+    }
+    if (isHandle(c.ty)) {
+      return { name: c.name, ty: normalizeHandleType(c.ty, binds) };
+    }
+    return c;
+  });
+  return { ...h, captures: newCaptures };
 }
 
 /** Walk a field path through a struct type and return the leaf's

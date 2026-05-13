@@ -177,20 +177,21 @@ workaround or a roadmap note.
   after the call. Zero-output functions (`function foo(x)`) and the
   bare-statement call form `foo(x);` also work. See `docs/specialization.md`
   for the full ABI.
-- **Function handles** (`@name`, `@(...) ...`) are supported under a
-  phantom-representation rule: the handle's target identity rides on
-  the MType, so every `h(args)` call resolves statically to a concrete
-  mangled C function (no runtime function pointer, no dispatcher).
-  v1 admits named handles to user functions (`@my_helper`), named
-  handles to builtins (`@sin`, `@sqrt`, ...), and anonymous functions
-  WITHOUT captures (`@(x) x.^2`, `@(a,b) a+b`, `@(x) sq(x)+1`). The
-  handle's identity is part of the higher-order function's
-  specialization key — `apply(@foo, x)` and `apply(@bar, x)` produce
-  two distinct `apply__<hex>` specializations. What's deferred:
-  - **Captures.** `k = 5; f = @(x) x + k` rejects at lowering with a
-    span. Workaround: pass the captured value through as a parameter
-    (`f = @(x, k) x + k; disp(f(3, 5));`), or replace the closure
-    with a named function. Captures are Phase 2.
+- **Function handles** (`@name`, `@(...) ...`) are supported as
+  first-class values backed by a per-shape C struct. The function-call
+  DISPATCH is still static — the handle's target identity rides on the
+  MType and every `h(args)` resolves to a concrete mangled C function
+  at lowering time — so there is no runtime function pointer or
+  dispatcher. The struct carries only the captured values. Named
+  handles (`@my_func`, `@sin`) share one shared empty typedef;
+  anonymous functions with captures get a per-shape typedef
+  (`_mtoc_handle__<8hex>`) with one field per capture and the standard
+  `_empty` / `_free` / `_copy` / `_assign` helpers. Captured tensors,
+  strings, structs, and nested handles all participate via the
+  existing owned-kind machinery. The handle's identity is part of the
+  higher-order function's specialization key — `apply(@foo, x)` and
+  `apply(@bar, x)` produce two distinct `apply__<hex>` specializations.
+  What's deferred:
   - **Branch-divergent handle identity.** An `if`/`while`/`for` body
     that assigns different handle targets to the same name (e.g.
     `if c; f = @foo; else; f = @bar; end`) rejects with the same
@@ -199,7 +200,10 @@ workaround or a roadmap note.
     fresh C binding like any other category change. Workaround:
     hoist the if/else around the call itself
     (`if c; y = foo(x); else; y = bar(x); end`).
-  - **Handles inside struct fields / tensors / cells** are rejected.
+  - **Handles inside tensors / cells** are rejected. Handles in
+    struct fields aren't yet wired but are a straightforward
+    extension (struct fields already accept arbitrary MTypes; the
+    handle's owned-kind helpers compose recursively).
   - **`feval`, `class(h)`, `nargin(h)`, `disp(h)`** are not yet
     wired — call the handle directly with `h(args)` instead.
   - **Builtin handles in multi-output / zero-output positions** are

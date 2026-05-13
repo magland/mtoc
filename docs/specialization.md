@@ -121,30 +121,42 @@ span.
 ## Function-handle args
 
 Handle-typed arguments participate in the specialization key like any
-other MType. `canonicalizeType(HandleType)` emits a small JSON shard
-`{kind:"Handle", target:"<identity>"}` where `<identity>` is
-`userFunc:<file>:<name>`, `builtin:<name>`, or
+other MType. `canonicalizeType(HandleType)` emits a JSON shard
+`{kind:"Handle", target:"<identity>", captures:[[name, canonical-ty], ...]}`
+where `<identity>` is `userFunc:<file>:<name>`, `builtin:<name>`, or
 `anonymous:<mangledBase>`. Two calls `apply(@foo, x)` and
 `apply(@bar, x)` produce two distinct `apply__<hex>` specializations
-because the first arg's canonical hash differs.
+because their first arg's canonical hashes differ; two calls
+`apply(@(x) x+k, ...)` with different capture types similarly
+specialize independently.
 
-Handle args do NOT appear in the emitted C signature or rendered call
-site — they're phantom in v1. The static dispatch already happened:
+Handle args travel as real C struct values (one shared
+`_mtoc_handle_empty_t` typedef for no-capture handles, one per-shape
+`_mtoc_handle__<8hex>` typedef per distinct capture-tuple shape
+otherwise). The function-call DISPATCH is still entirely static:
 inside the body's `h(args)` call site, the lowerer reads the handle
-param's `HandleType` from `env`, peels off the target, and runs
-`specializeUserCall` (or `lowerBuiltinCall`) with the concrete
-underlying function. The emitted IR Call's `callee.mangled` points
-straight at the resolved specialization — no function-pointer table,
-no dispatcher. Same-named workspace functions in different files
-remain distinct under this rule because the canonical hash includes
-the target's source file.
+param's `HandleType` from env, peels off the target, and runs
+`specializeUserCallWithIRArgs` (or `lowerBuiltinCall`) with the
+concrete underlying function. The emitted IR Call's `callee.mangled`
+points straight at the resolved specialization — no function-pointer
+table, no dispatcher. Same-named workspace functions in different
+files remain distinct because the canonical hash includes the target's
+source file.
+
+For captures: at the `@(...)` site, the lowerer snapshots each
+captured variable's value into the handle struct via an
+`mtoc_<kind>_copy` wrap (so the snapshot is independent of later
+reassignments at the source binding). At each `h(args)` call site,
+the captures' values are read out of the struct via `HandleCaptureLoad`
+IR nodes and passed as additional positional arguments to the
+underlying specialization. The synth function's params list is
+`[...userParams, ...captureNames]`, so positional binding lines up.
 
 A 1-output user function whose output is `HandleType` is emitted with
-`void` return type. Its body's side effects (`disp`, etc.) emit
-normally; the implicit fall-through return is dropped. The call site
-treats the Assign as phantom on the LHS — the variable receives no C
-declaration — but the call itself emits as a bare statement so side
-effects fire.
+the per-shape struct return type — standard owned return-by-value.
+The caller installs the returned handle into its lvalue via the
+kind's `_assign` helper, matching how tensor- and struct-returning
+functions are consumed.
 
 ## Limitations
 

@@ -127,6 +127,8 @@ export function renderExpr(e: IRExpr, parentPrec = 0): string {
       if (t.kind === "userFunc" || t.kind === "builtin") return `@${t.name}`;
       return "@(...)";
     }
+    case "HandleCaptureLoad":
+      return `${renderExpr(e.base, 0)}.${e.captureName}`;
   }
 }
 

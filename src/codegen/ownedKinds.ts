@@ -17,7 +17,9 @@
  */
 
 import {
+  handleMangledName,
   isCharArray,
+  isHandle,
   isMultiElement,
   isNumeric,
   isString,
@@ -124,6 +126,23 @@ export function ownedOps(ty: MType): OwnedKindOps | null {
       assign: `${name}_assign`,
       copy: () => `${name}_copy`,
       disp: () => `${name}_disp`,
+    };
+  }
+  if (isHandle(ty)) {
+    const name = handleMangledName(ty);
+    // Same shape as struct: helpers are emitted by `emitHandle.ts`
+    // directly into the output (one set per distinct capture-tuple
+    // shape; one shared set for the no-capture case). Not in the
+    // runtime registry — same `__handle__:` sentinel intercept as
+    // struct. No `disp` helper — `disp(h)` is rejected at lowering
+    // (no byte-for-byte numbl format to match).
+    return {
+      cType: name,
+      structSnippet: `__handle__:${name}`,
+      empty: `${name}_empty`,
+      free: `${name}_free`,
+      assign: `${name}_assign`,
+      copy: () => `${name}_copy`,
     };
   }
   return null;

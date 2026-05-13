@@ -393,6 +393,15 @@ export class Lowerer {
         ty: merged,
         cName: prevBinding.cName,
       });
+      // For struct and handle types, also widen env to the merged
+      // type. The codegen pipeline (normalizeStructTypes,
+      // handle-capture snapshot in `lowerAnonFunc`) reads the
+      // widened type from assignedVars or env; keeping env in sync
+      // here avoids a discrepancy between the at-time captured type
+      // and the post-normalize struct/handle typedef.
+      if (isStruct(merged) || isHandle(merged)) {
+        this.env.set(name, merged);
+      }
       return prevBinding.cName;
     }
 

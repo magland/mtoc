@@ -172,36 +172,34 @@ export function isStruct(t: MType): t is StructType {
 
 /**
  * Function-handle type. Carries the statically-resolved target of a
- * `@name` or `@(...) ...` expression. v1 representation is *phantom*:
- * `cTypeFor(HandleType)` returns `null`, so handle-typed variables and
- * parameters are elided from the emitted C entirely — the handle's
- * identity flows through the type system at lowering time and every
- * `h(args)` call site resolves to a concrete mangled C function ahead
- * of codegen. The handle therefore has no runtime representation,
- * no owned-kind allocation, and zero ABI cost.
+ * `@name` or `@(...) ...` expression PLUS any variables captured from
+ * the enclosing scope.
+ *
+ * The C representation is a real struct (one shared typedef for
+ * no-capture handles, one typedef per distinct capture-tuple shape
+ * otherwise). The function-call DISPATCH is still static — the
+ * target's identity lives on the MType and every `h(args)` resolves
+ * to a concrete mangled C function ahead of codegen. The struct
+ * carries only the captures' VALUES; it has no function pointer.
  *
  * Three target shapes:
  *  - `userFunc`   — `@my_func`. Carries the resolved AST + source
- *                   file so the handle-call path can hand them to the
- *                   existing `specializeUserCall` pipeline. Identity
- *                   for unify / canonicalize / storageCategory is just
- *                   `{kind, name, file}`; the AST is excluded from the
- *                   canonical JSON.
- *  - `builtin`    — `@sin`, `@sqrt`, etc. Identity is the builtin name.
- *                   The call site looks the sig up via `getBuiltin` so
- *                   we don't have to thread it through the type.
- *  - `anonymous`  — `@(x) x.^2 + 1`. The body is synthesized into a
- *                   `FunctionStmt`-shaped AST at the `@(...)` site and
- *                   registered with `mangledBase` as its synthetic
- *                   user-function name. v1 rejects any anonymous body
- *                   that references an outer-scope local — captures
- *                   are deferred to Phase 2.
+ *                   file. Always has empty captures (named handles
+ *                   don't capture anything).
+ *  - `builtin`    — `@sin`, `@sqrt`, etc. Always has empty captures.
+ *                   The call site looks the sig up via `getBuiltin`.
+ *  - `anonymous`  — `@(...) ...`. The body is synthesized into a
+ *                   `FunctionStmt`-shaped AST whose params are
+ *                   `[...userParams, ...captureNames]`. Captures
+ *                   detected by the lowering helper get snapshotted
+ *                   into the handle struct at the `@(...)` site;
+ *                   inside the synthesized body they appear as
+ *                   regular parameters.
  *
- * Reassigning a handle variable to a different target identity is a
- * top-level variable split (the existing scalar↔tensor split machinery,
- * driven by `storageCategory`); inside control flow it errors. That
- * keeps the "every `h(x)` resolves to one mangled C function"
- * invariant straightforward.
+ * Reassigning a handle to a different target identity OR a different
+ * capture-tuple shape is a top-level variable split (driven by
+ * `storageCategory`); inside control flow it errors with the
+ * standard category-mismatch diagnostic.
  */
 export type HandleTarget =
   | {
@@ -226,14 +224,16 @@ export type HandleTarget =
     }
   | {
       kind: "anonymous";
-      /** Synthetic mangled-base name (`_mtoc_anon__<8hex>`) the
-       *  anonymous body registers under in the specialization cache.
-       *  Derived from the source span so two textually distinct
-       *  `@(...)` expressions have distinct identities even if their
-       *  bodies happen to be alpha-equivalent. */
+      /** Synthetic mangled-base name (`anon_<N>`) the anonymous body
+       *  registers under in the specialization cache. Derived from
+       *  a per-program counter so two textually distinct `@(...)`
+       *  expressions have distinct identities. */
       mangledBase: string;
-      /** Synthesized `function _ = _(params) <body> end` AST handed to
-       *  `specializeUserCall`. */
+      /** Synthesized `function <outName> = <mangledBase>(params, captures)`
+       *  AST handed to `specializeUserCall`. The params list contains
+       *  the user-declared params FIRST, followed by the captures'
+       *  names — so the body's references to a captured variable
+       *  resolve naturally to the synthesized param. */
       ast: FunctionStmt;
       /** Source file the `@(...)` expression appeared in. */
       file: string;
@@ -242,6 +242,24 @@ export type HandleTarget =
 export interface HandleType {
   kind: "Handle";
   target: HandleTarget;
+  /** Variables captured from the enclosing scope at the `@(...)`
+   *  site. Each capture lands as a field in the handle's C struct;
+   *  reads inside the synthesized body resolve to the parallel synth
+   *  param. Empty for userFunc / builtin targets and for
+   *  capture-free anonymous functions. Field order is the same as
+   *  the synth function's tail params (after user-declared params),
+   *  so the call site can read captures back from the struct in
+   *  registration order. */
+  captures: ReadonlyArray<HandleCapture>;
+}
+
+/** One captured variable on a HandleType. The `name` is the
+ *  enclosing-scope identifier the @-site snapshot reads from; the
+ *  same string is also the synth body's tail-param name. The `ty` is
+ *  the captured value's type at the @-site. */
+export interface HandleCapture {
+  name: string;
+  ty: MType;
 }
 
 /** True when `t` is a function handle. */
@@ -249,36 +267,50 @@ export function isHandle(t: MType): t is HandleType {
   return t.kind === "Handle";
 }
 
-/** Constructor for a `@user_func` handle. */
+/** Constructor for a `@user_func` handle. Named handles never capture. */
 export function userFuncHandle(
   name: string,
   file: string,
   ast: FunctionStmt
 ): HandleType {
-  return { kind: "Handle", target: { kind: "userFunc", name, file, ast } };
+  return {
+    kind: "Handle",
+    target: { kind: "userFunc", name, file, ast },
+    captures: [],
+  };
 }
 
-/** Constructor for a `@builtin_name` handle. */
+/** Constructor for a `@builtin_name` handle. Builtin handles never capture. */
 export function builtinHandle(name: string): HandleType {
-  return { kind: "Handle", target: { kind: "builtin", name } };
+  return {
+    kind: "Handle",
+    target: { kind: "builtin", name },
+    captures: [],
+  };
 }
 
-/** Constructor for a `@(...)` anonymous-function handle. */
+/** Constructor for a `@(...)` anonymous-function handle, with zero or
+ *  more captured variables in registration order. */
 export function anonymousHandle(
   mangledBase: string,
   ast: FunctionStmt,
-  file: string
+  file: string,
+  captures: ReadonlyArray<HandleCapture> = []
 ): HandleType {
   return {
     kind: "Handle",
     target: { kind: "anonymous", mangledBase, ast, file },
+    captures,
   };
 }
 
 /** Stable identity string for a handle's target. Used by
  *  `storageCategory` (so two different identities split into distinct
  *  C bindings) and as the deterministic shard of `canonicalizeType`
- *  (so a higher-order function specializes per-handle-target). */
+ *  (so a higher-order function specializes per-handle-target). The
+ *  identity does NOT include the captures' types — capture identity
+ *  rides on a separate `capturesId` shard so the storage category
+ *  reflects "same target AND same capture shape". */
 function handleTargetId(target: HandleTarget): string {
   switch (target.kind) {
     case "userFunc":
@@ -290,12 +322,47 @@ function handleTargetId(target: HandleTarget): string {
   }
 }
 
+/** Deterministic identity of a handle's capture shape. Two handles
+ *  with the same `(name, canonicalize(ty))` tuple for every capture
+ *  in order produce the same id — so they share a C typedef and can
+ *  unify into a single binding. */
+function handleCapturesId(captures: ReadonlyArray<HandleCapture>): string {
+  if (captures.length === 0) return "empty";
+  return captures
+    .map(c => `${c.name}:${JSON.stringify(canonicalizeType(c.ty))}`)
+    .join("|");
+}
+
 /** True when two handle targets refer to the same concrete function.
- *  Anonymous handles use their synthesized mangledBase as identity;
- *  user-func handles compare by `(file, name)`; builtin handles compare
- *  by name. */
+ *  Captures are compared separately by `handleCapturesId`. */
 function handleTargetsEqual(a: HandleTarget, b: HandleTarget): boolean {
   return handleTargetId(a) === handleTargetId(b);
+}
+
+/** True when two handles refer to the same concrete function AND
+ *  carry the same capture shape (names + canonicalized types in
+ *  order). Both pieces matter — a handle that captures `k:double`
+ *  and one that captures `k:complex` are different shapes, and a
+ *  handle capturing `k` is different from one capturing `m` even at
+ *  the same type. */
+function handlesEqual(a: HandleType, b: HandleType): boolean {
+  return (
+    handleTargetsEqual(a.target, b.target) &&
+    handleCapturesId(a.captures) === handleCapturesId(b.captures)
+  );
+}
+
+/** Mangled C typedef name for a handle shape. All no-capture handles
+ *  share the single `_mtoc_handle_empty_t` typedef regardless of
+ *  target identity (the function dispatch is static); handles with
+ *  captures get a per-shape `_mtoc_handle__<8hex>` typedef hashed
+ *  over the captures tuple. */
+export function handleMangledName(t: HandleType): string {
+  if (t.captures.length === 0) return "_mtoc_handle_empty_t";
+  const canonical = JSON.stringify({
+    captures: t.captures.map(c => [c.name, canonicalizeType(c.ty)]),
+  });
+  return `_mtoc_handle__${fnv1a32Hex(canonical)}`;
 }
 
 /** FNV-1a 32-bit hash of a UTF-16 string, returned as zero-padded 8-hex.
@@ -569,7 +636,13 @@ export function isText(t: MType): boolean {
  *  last use" liveness pass, the scope-exit free walks, and the
  *  "owned-allocating expression cannot appear nested" lowering check. */
 export function isOwned(t: MType): boolean {
-  return isMultiElement(t) || isString(t) || isStruct(t);
+  // Function handles are treated as owned for uniform machinery —
+  // the per-shape typedef gets `_empty`/`_free`/`_copy`/`_assign`
+  // helpers like any other struct. For no-capture handles these
+  // helpers are trivial (no heap fields) but routing through the
+  // owned-kind pipeline keeps every declaration / assign / scope-
+  // exit-free dispatch site identical across handle shapes.
+  return isMultiElement(t) || isString(t) || isStruct(t) || isHandle(t);
 }
 
 export function isScalarReal(t: MType): boolean {
@@ -599,11 +672,13 @@ export function staticNumElements(t: MType): number | null {
 export function cTypeFor(t: MType): string | null {
   if (t.kind === "String") return "mtoc_string_t";
   if (t.kind === "Struct") return structMangledName(t);
-  // Function handles are phantom in v1 — no C representation. Callers
-  // (codegen) treat a `null` here as "this slot is elided from the
-  // emitted source": handle params skip the C signature, handle args
-  // skip the call site, and handle-typed Assigns drop their RHS.
-  if (t.kind === "Handle") return null;
+  // Function handles get a per-shape struct typedef. No-capture
+  // handles share one `_mtoc_handle_empty_t` typedef (placeholder
+  // field so the struct is standards-conformant); with-capture
+  // handles get a `_mtoc_handle__<8hex>` typedef per distinct
+  // capture-tuple shape. The function dispatch is still static —
+  // the struct only carries captures.
+  if (t.kind === "Handle") return handleMangledName(t);
   if (t.kind !== "Numeric") return null;
   if (t.elem === "char") {
     if (isScalar(t)) return "char";
@@ -640,15 +715,14 @@ export function shapeCategory(t: NumericType): string {
 export function storageCategory(t: MType): string | null {
   if (t.kind === "String") return "string";
   if (t.kind === "Handle") {
-    // Storage category encodes the resolved target identity. Two
-    // handle values share a single binding only when they point at
-    // the same concrete function — `f = @foo; f = @foo` keeps a
-    // single binding; `f = @foo; f = @bar` (different identity)
-    // trips `canShareStorage` and falls into the split / error path
-    // depending on `controlDepth`. The phantom representation means
-    // codegen still emits no C declaration; the category is just for
-    // the variable-tracking logic.
-    return `handle:${handleTargetId(t.target)}`;
+    // Storage category encodes both the resolved target identity AND
+    // the capture-tuple shape — two handles share a binding only
+    // when they have the same target AND the same captures (so they
+    // dispatch to the same C function AND the same struct typedef).
+    // Different targets OR different capture shapes trip
+    // `canShareStorage` and fall into the split / error path
+    // depending on `controlDepth`.
+    return `handle:${handleTargetId(t.target)}:${handleCapturesId(t.captures)}`;
   }
   if (t.kind === "Struct") {
     // Storage category is keyed on the SORTED FIELD-NAME SET only,
@@ -986,14 +1060,15 @@ export function unify(a: MType, b: MType): MType {
       ? STRING
       : { kind: "Unknown" };
   }
-  // Handle: two handles unify iff their target identity matches —
-  // identity is keyed on `(kind, name, file?)`, the same shard
-  // `canonicalizeType` and `storageCategory` use. Different identity
-  // (or handle-vs-anything-else) collapses to Unknown so
+  // Handle: two handles unify iff both their target identity AND
+  // their capture shape match — the C struct layout depends on the
+  // captures, and the dispatch depends on the target, so both pieces
+  // must agree for a single binding to hold both values. Different
+  // identity OR different captures collapses to Unknown so
   // `recordAssignment` produces a clear category-mismatch diagnostic.
   if (a.kind === "Handle" || b.kind === "Handle") {
     if (a.kind !== "Handle" || b.kind !== "Handle") return { kind: "Unknown" };
-    return handleTargetsEqual(a.target, b.target) ? a : { kind: "Unknown" };
+    return handlesEqual(a, b) ? a : { kind: "Unknown" };
   }
   // Struct sibling variant. Two structs unify iff they have the same
   // field-name set AND each pairwise field type unifies. Different
@@ -1160,13 +1235,17 @@ export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Void") return { kind: "Void" };
   if (t.kind === "String") return { kind: "String" };
   if (t.kind === "Handle") {
-    // Encode only the target's identity in the canonical hash —
-    // excluding the AST so the JSON is small and stable. This is what
-    // makes a higher-order user function specialize per-handle-target:
-    // `apply(@foo, x)` and `apply(@bar, x)` produce two distinct
-    // `apply__<hex>` specializations because their first arg's
-    // canonical hash differs in the embedded `name`/`file` shard.
-    return { kind: "Handle", target: handleTargetId(t.target) };
+    // Encode both the target's identity and the canonicalized
+    // capture tuple. This is what makes a higher-order function
+    // specialize per-handle: `apply(@foo, x)` vs `apply(@bar, x)`
+    // differ in the target shard; two anonymous handles with
+    // different capture types differ in the captures shard. The
+    // AST is excluded — only the type-level identity participates.
+    return {
+      kind: "Handle",
+      target: handleTargetId(t.target),
+      captures: t.captures.map(c => [c.name, canonicalizeType(c.ty)]),
+    };
   }
   if (t.kind === "Struct") {
     return {
@@ -1204,14 +1283,23 @@ export function typeToString(t: MType): string {
   if (t.kind === "Void") return "Void";
   if (t.kind === "String") return "String";
   if (t.kind === "Handle") {
+    let label: string;
     switch (t.target.kind) {
       case "userFunc":
-        return `Handle<@${t.target.name} from ${t.target.file}>`;
+        label = `@${t.target.name} from ${t.target.file}`;
+        break;
       case "builtin":
-        return `Handle<@${t.target.name}>`;
+        label = `@${t.target.name}`;
+        break;
       case "anonymous":
-        return `Handle<@(...) ${t.target.mangledBase}>`;
+        label = `@(...) ${t.target.mangledBase}`;
+        break;
     }
+    if (t.captures.length === 0) return `Handle<${label}>`;
+    const caps = t.captures
+      .map(c => `${c.name}:${typeToString(c.ty)}`)
+      .join(", ");
+    return `Handle<${label}, captures={${caps}}>`;
   }
   if (t.kind === "Struct") {
     const parts = t.fields.map(f => `${f.name}:${typeToString(f.type)}`);

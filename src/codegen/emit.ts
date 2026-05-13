@@ -36,6 +36,7 @@ import { emitStmt } from "./emitStmt.js";
 import { emitDeclarations, emitScopeExitFrees } from "./emitOwned.js";
 import { emitFunction } from "./emitFunction.js";
 import { emitStructBlocks } from "./emitStruct.js";
+import { emitHandleBlocks } from "./emitHandle.js";
 import { inlinePass } from "./inline/inlinePass.js";
 import { isParallelThreadsOption } from "../build.js";
 
@@ -113,6 +114,15 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   // can declare struct-typed locals.
   const structBlocks = emitStructBlocks(state, prog);
 
+  // Per-handle-shape typedefs + helpers (empty/free/copy/assign). One
+  // shared `_mtoc_handle_empty_t` typedef covers every no-capture
+  // handle; with-capture handles get one typedef per distinct
+  // capture-tuple shape. Emitted AFTER struct blocks so a handle
+  // whose capture references a struct typedef sees that typedef in
+  // scope; emitted BEFORE user-function bodies so a function param
+  // declared with the typedef can reference it.
+  const handleBlocks = emitHandleBlocks(state, prog);
+
   // Emit user-function bodies first into separate buffers; we paste
   // them into the output below, before main.
   const functionBlocks: string[][] = prog.functions.map(fn =>
@@ -173,6 +183,9 @@ export function emitC(prog: IRProgram, opts: EmitOptions = {}): string {
   }
   if (structBlocks.length > 0) {
     out.push(...structBlocks);
+  }
+  if (handleBlocks.length > 0) {
+    out.push(...handleBlocks);
   }
   for (const fnLines of functionBlocks) {
     out.push(...fnLines, "");

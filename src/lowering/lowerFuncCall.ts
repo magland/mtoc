@@ -591,12 +591,41 @@ export function specializeUserCall(
     );
   }
   const args = argExprs.map(a => this.lowerExpr(a));
+  return specializeUserCallWithIRArgs.call(
+    this,
+    name,
+    fnAst,
+    fnFile,
+    args,
+    span
+  );
+}
+
+/** Variant of `specializeUserCall` that takes ALREADY-LOWERED IR
+ *  args. Used by the handle-call dispatch (`lowerHandle.ts`) where
+ *  the caller wants to mix user-source AST args with synthesized
+ *  capture-read IR nodes (`HandleCaptureLoad`) without re-running
+ *  them through `lowerExpr`. Same caching / specialization path as
+ *  the AST-args entry point. */
+export function specializeUserCallWithIRArgs(
+  this: Lowerer,
+  name: string,
+  fnAst: FunctionStmt,
+  fnFile: string,
+  args: IRExpr[],
+  span: Span
+): { args: IRExpr[]; mangledName: string; spec: IRFunction } {
+  if (args.length !== fnAst.params.length) {
+    throw new TypeError(
+      `function '${name}' expects ${fnAst.params.length} argument(s), got ${args.length}`,
+      span
+    );
+  }
   for (const a of args) {
-    // Handles ride alongside numeric/struct args under the phantom
-    // representation: their identity is encoded in `canonicalizeType`
-    // so each `(handle-target, ...)` arg tuple lands in its own
-    // specialization, and codegen drops handle-typed params/args
-    // from the emitted C signature/call site entirely.
+    // Handle args ride alongside numeric/struct args: their identity
+    // is encoded in `canonicalizeType` so each `(handle-target+captures, ...)`
+    // arg tuple lands in its own specialization. The handle's struct
+    // value (carrying captures) passes through as a real C value.
     if (!isNumeric(a.ty) && !isStruct(a.ty) && !isHandle(a.ty)) {
       throw new UnsupportedConstruct(
         `function '${name}' only accepts numeric, struct, or function-handle ` +

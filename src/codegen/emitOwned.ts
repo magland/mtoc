@@ -25,6 +25,7 @@ import {
   isStruct,
   typeToString,
 } from "../lowering/types.js";
+// `isHandle` is used by `functionFreeOnExitSet`.
 import { ownedOps } from "./ownedKinds.js";
 import { pushStmt, useRuntimeByName, type EmitState } from "./emitState.js";
 
@@ -48,11 +49,8 @@ export function emitDeclarations(
   for (const key of cNames) {
     const binding = vars.get(key)!;
     const { ty, cName } = binding;
-    // Function handles are phantom in v1 — no C representation, no
-    // predeclaration, no runtime value. The handle's identity lives
-    // on the MType only; every call site resolves statically.
-    if (isHandle(ty)) continue;
-    // Owned kinds (string, char-array, multi-element double tensor)
+    // Owned kinds (string, char-array, multi-element double tensor,
+    // struct, function handle with or without captures)
     // share one shape: predeclare a known-empty handle whose later
     // re-assignments go through the kind's `assign` helper. The empty
     // handle has `owned=0` (or NULL buffers), so a scope-exit free of
@@ -126,7 +124,7 @@ export function functionFreeOnExitSet(
 ): ReadonlyMap<string, VarBinding> {
   const out = new Map<string, VarBinding>(fn.assignedVars);
   for (const p of fn.params) {
-    if (isMultiElement(p.ty) || isStruct(p.ty)) {
+    if (isMultiElement(p.ty) || isStruct(p.ty) || isHandle(p.ty)) {
       out.set(p.cName, { ty: p.ty, cName: p.cName });
     }
   }

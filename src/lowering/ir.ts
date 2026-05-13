@@ -211,19 +211,44 @@ export type IRExpr =
       /** Function-handle literal — produced by `@name` (named handle to
        *  a user function or builtin) and by `@(...) ...` (anonymous
        *  function). The lowerer resolves the target identity at the
-       *  literal site and stores it in `ty` as a `HandleType` (whose
-       *  `target` discriminator carries the resolved AST / builtin /
-       *  anonymous body). v1 handles are phantom: codegen emits NOTHING
-       *  for a `HandleLit`. The Assign that holds one is dropped from
-       *  the emitted C entirely; the handle's identity flows through
-       *  the type system only. Every `h(args)` call site reads the
-       *  bound variable's `HandleType` and dispatches statically to
-       *  the right specialization or builtin emit.
+       *  literal site and stores it in `ty` as a `HandleType`.
        *
-       *  Restricted to the RHS of an Assign by `validateIR` — nested
-       *  uses (`apply(@foo, x)`) require the user to assign the handle
-       *  to a name first. */
+       *  The function-call DISPATCH is static — every later `h(args)`
+       *  call site reads the bound variable's `HandleType` and resolves
+       *  to a concrete mangled C function. The literal renders as a C
+       *  compound literal of the handle's per-shape struct
+       *  (`(_mtoc_handle__<hex>){.cap_<name> = <value>, ...}`); for
+       *  no-capture handles it's the shared empty placeholder struct.
+       *  The captures' IR values are the at-the-@-site reads of the
+       *  enclosing scope's locals (after snapshot copy semantics for
+       *  owned kinds). */
       kind: "HandleLit";
+      /** One entry per `ty.captures` field, in the same order. Each
+       *  `value` is the lowered IR expression for the captured local
+       *  at the `@(...)` site (typically a `Var` read of the enclosing
+       *  scope's binding). For owned kinds the codegen wraps the
+       *  value in the kind's `_copy` helper at struct-literal
+       *  construction time so the snapshot is independent of later
+       *  reassignments. */
+      captures: ReadonlyArray<{ name: string; value: IRExpr }>;
+      ty: MType;
+      span: Span;
+    }
+  | {
+      /** Field read of a captured value inside a handle struct.
+       *  Used by `lowerHandleCall` when dispatching `h(args)` inside
+       *  a higher-order function body: each capture of `h`'s
+       *  `HandleType` becomes a `HandleCaptureLoad` IR node that
+       *  reads `h.cap_<name>` and passes it as an extra positional
+       *  argument to the underlying user-function specialization.
+       *  Codegen emits `<base.cName>.cap_<captureName>`.
+       *
+       *  Structurally similar to `MemberLoad` but kept separate so
+       *  the struct-field machinery stays narrowed to `StructType`
+       *  bases. */
+      kind: "HandleCaptureLoad";
+      base: Extract<IRExpr, { kind: "Var" }>;
+      captureName: string;
       ty: MType;
       span: Span;
     }

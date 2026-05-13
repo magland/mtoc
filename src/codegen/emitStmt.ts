@@ -141,30 +141,6 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // `mtoc_tensor_assign` / `mtoc_string_assign`, so the new
       // lifetime starts here — drop the LHS from the freed set so a
       // subsequent dead-after pass can free it again on its own terms.
-      if (s.ty.kind === "Handle") {
-        // Function-handle assignment is phantom on the LHS side: no
-        // C declaration, no value to assign. But if the RHS is a
-        // user-function call (a "factory function" returning a
-        // handle), we still need to emit the call so its body's side
-        // effects fire. The callee was emitted with `void` return
-        // type by `emitFunction` because its single output is a
-        // phantom handle. Other RHS shapes (HandleLit, Var, etc.)
-        // have no side effects and are dropped entirely.
-        if (s.rhs.kind === "Call" && s.rhs.callee.kind === "userFunc") {
-          const argStrs: string[] = [];
-          for (const a of s.rhs.args) {
-            if (a.ty.kind === "Handle") continue;
-            argStrs.push(wrapOwnedArgCopy(state, a.ty, emitExpr(state, a, 0)));
-          }
-          pushStmt(
-            state,
-            level,
-            `${s.rhs.callee.mangled}(${argStrs.join(", ")});`
-          );
-        }
-        emitEarlyFrees(state, level, deadAfterStmt(state, s));
-        break;
-      }
       if (isOwned(s.ty)) {
         state.freedOwned.delete(s.cName);
       }
@@ -220,6 +196,7 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           s.ty.elem === "double" &&
           s.rhs.kind !== "Var" &&
           s.rhs.kind !== "MemberLoad" &&
+          s.rhs.kind !== "HandleCaptureLoad" &&
           !isDirectOwnedCall(s.rhs)
         ) {
           emitTensorAssignFromExpr(state, level, s.cName, s.rhs);
@@ -233,9 +210,12 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
           const copyHelper = owned.copy(s.rhs.ty);
           useRuntimeByName(state, copyHelper);
           rhsExpr = `${copyHelper}(${s.rhs.cName})`;
-        } else if (s.rhs.kind === "MemberLoad") {
-          // Treat a struct-field read like a Var read: deep-copy so
-          // the assignment owns its own buffer.
+        } else if (
+          s.rhs.kind === "MemberLoad" ||
+          s.rhs.kind === "HandleCaptureLoad"
+        ) {
+          // Struct-field or handle-capture read: deep-copy so the
+          // assignment owns its own buffer (same shape as Var read).
           const copyHelper = owned.copy(s.rhs.ty);
           useRuntimeByName(state, copyHelper);
           rhsExpr = `${copyHelper}(${emitExpr(state, s.rhs, 0)})`;
@@ -651,16 +631,13 @@ export function emitStmt(state: EmitState, level: number, s: IRStmt): void {
       // The call site never appears with `outputs.length === 1`
       // because that case routes to `Assign` / `ExprStmt(Call)` in
       // lowering (1-output is return-by-value).
-      // Copy-on-arg-pass for tensor / char-array args, mirroring the
-      // regular `Call` path in `emitExpr`. Handle-typed args are
-      // phantom — their identity is baked into the callee's mangled
-      // specialization name via `canonicalizeType`, so they don't
-      // appear in the rendered C argument list at all.
-      const argStrs: string[] = [];
-      for (const a of s.args) {
-        if (a.ty.kind === "Handle") continue;
-        argStrs.push(wrapOwnedArgCopy(state, a.ty, emitExpr(state, a, 0)));
-      }
+      // Copy-on-arg-pass for owned-kind args (tensor / char-array /
+      // struct / handle-with-captures), mirroring the regular `Call`
+      // path in `emitExpr`. `wrapOwnedArgCopy` returns the input
+      // unchanged for non-owned types.
+      const argStrs = s.args.map(a =>
+        wrapOwnedArgCopy(state, a.ty, emitExpr(state, a, 0))
+      );
       if (s.outputs.length === 0) {
         // Zero-output: simplest form — bare `<mangled>(args);`. No
         // discard temps, no surrounding block.

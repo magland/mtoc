@@ -193,18 +193,25 @@ The subset is growing iteratively. Roughly:
   locals callable from the entry. Matches numbl, which calls the
   first function with no args when the file has no script body
 - Function handles. `@my_func`, `@sin`, and `@(x) x.^2 + 1` are
-  supported under a _phantom_ representation: the handle's target
-  identity rides on its MType so every `h(args)` call resolves
-  statically to a concrete mangled C function — no runtime function
-  pointer, no dispatcher. Handles can be assigned, passed as args
-  (`apply(@my_func, x)`), and returned from factory functions (which
-  emit as `void` and have their side effects preserved). The handle's
-  target is part of the higher-order function's specialization key,
-  so `apply(@foo, x)` and `apply(@bar, x)` produce distinct
-  `apply__<hex>` specializations. Anonymous functions with captures
-  (`@(x) x + k` where `k` is from the enclosing scope) are deferred to
-  Phase 2; see [docs/limitations.md](docs/limitations.md) for the full
-  v1 surface
+  first-class values backed by a per-shape C struct: no-capture
+  handles share a single placeholder typedef, anonymous handles with
+  captures get a per-shape `_mtoc_handle__<8hex>` typedef with one
+  `cap_<name>` field per capture. The function-call DISPATCH is
+  static — the handle's target identity rides on its MType and every
+  `h(args)` resolves to a concrete mangled C function at lowering
+  time, no runtime function pointer or dispatcher. The struct carries
+  only the captured values, fed back into the underlying call. Handles
+  can be assigned, passed as args (`apply(@my_func, x)`), returned
+  from factory functions (`function h = make_adder(k); h = @(x) x + k; end`),
+  and captured by other anonymous functions. Captures cover scalars
+  (real, complex, char), tensors, strings, structs, and nested
+  handles — the existing owned-kind machinery composes recursively.
+  The handle's target AND capture shape are both part of the higher-
+  order function's specialization key, so `apply(@foo, x)` and
+  `apply(@bar, x)` produce distinct `apply__<hex>` specializations.
+  See [docs/limitations.md](docs/limitations.md) for the deferred
+  surface (branch-divergent handles, handles in tensors / cells,
+  `feval`)
 - Cross-file user functions. A call like `helper(x)` resolves to the
   primary function of a sibling `helper.m` in the same directory.
   Resolution is delegated to numbl's vendored `functionResolve.ts`

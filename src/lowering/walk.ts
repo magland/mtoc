@@ -41,7 +41,15 @@ export function forEachSubExpr(
     case "CharLit":
     case "Var":
     case "EndRef":
+      return;
     case "HandleLit":
+      // Each captured value is an IRExpr sub-expression — descend so
+      // analyses see the captured Vars (e.g. liveness counts a
+      // captured tensor as still-in-use through the @-site).
+      for (const c of e.captures) forEachSubExpr(c.value, visit);
+      return;
+    case "HandleCaptureLoad":
+      forEachSubExpr(e.base, visit);
       return;
     case "Binary":
       forEachSubExpr(e.left, visit);

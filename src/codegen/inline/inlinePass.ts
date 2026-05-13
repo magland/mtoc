@@ -513,10 +513,12 @@ function isPureElementwiseExpr(e: IRExpr): boolean {
     case "EndRef":
       return true;
     case "HandleLit":
-      // Handles are phantom values — they never appear inside a
-      // multi-element tensor expression. Treat any HandleLit reached
-      // here as "not inlinable" so the inliner falls back to the
-      // standard emit path.
+    case "HandleCaptureLoad":
+      // Handles never appear inside a multi-element tensor
+      // expression — they're scalar struct values whose only valid
+      // consume sites are call-arg / Assign-RHS positions. Treat
+      // either reached here as "not inlinable" so the inliner falls
+      // back to the standard emit path.
       return false;
     case "Binary":
       return isPureElementwiseExpr(e.left) && isPureElementwiseExpr(e.right);
@@ -726,6 +728,11 @@ function appearsInNonSlotPosition(e: IRExpr, cName: string): boolean {
     case "CharLit":
     case "EndRef":
     case "HandleLit":
+    case "HandleCaptureLoad":
+      // Handles and handle-capture loads only occur in handle-call
+      // arg positions, never under a multi-element iter loop — so
+      // they can't reach a non-slot position relative to a
+      // multi-element substitution target.
       return false;
     case "Binary":
       return (
@@ -815,6 +822,7 @@ function substituteVar(e: IRExpr, target: string, replacement: IRExpr): IRExpr {
     case "CharLit":
     case "EndRef":
     case "HandleLit":
+    case "HandleCaptureLoad":
     case "TensorLit":
     case "IndexSlice":
     case "MakeRange":

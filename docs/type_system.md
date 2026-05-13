@@ -192,69 +192,89 @@ semantics — a numbl `string` is a scalar handle, not a char vector).
 HandleType {
   kind: "Handle"
   target: HandleTarget
+  captures: ReadonlyArray<{ name; ty }>
 }
 
 HandleTarget =
-  | { kind: "userFunc"; name; file; ast }      // @my_func
-  | { kind: "builtin";  name }                  // @sin
-  | { kind: "anonymous"; mangledBase; ast; file } // @(x) ...
+  | { kind: "userFunc"; name; file; ast }          // @my_func
+  | { kind: "builtin";  name }                      // @sin
+  | { kind: "anonymous"; mangledBase; ast; file }   // @(x) ...
 ```
 
 A function-handle type carrying the _statically resolved_ target of an
-`@name` or `@(...) ...` expression. The v1 representation is
-**phantom**: `cTypeFor(HandleType)` returns `null`, so handle-typed
-variables, parameters, and Assigns vanish from the emitted C entirely.
-The handle's identity flows through the type system only, and every
-`h(args)` call site resolves to a concrete mangled C function at
-lowering time.
+`@name` or `@(...) ...` expression PLUS the variables captured from
+the enclosing scope at the `@(...)` site. The C representation is a
+real struct (one shared `_mtoc_handle_empty_t` typedef for every
+no-capture handle, one per-shape `_mtoc_handle__<8hex>` typedef per
+distinct capture-tuple shape otherwise). The function-call DISPATCH
+remains static — every `h(args)` call site reads the bound variable's
+`HandleType` and resolves to a concrete mangled C function at lowering
+time; the struct only carries the captures' VALUES, no function
+pointer.
 
-This is what makes the static-dispatch design tractable. Three
-properties fall out of "identity lives in the type":
+Three properties fall out of "identity lives in the type":
 
-- **`unify(handle_a, handle_b)`** returns `handle_a` iff both targets
-  match by deep identity (kind + name + file for userFunc, name for
-  builtin, mangledBase for anonymous). Mismatch collapses to
-  `Unknown`, which `recordAssignment` reports as a clear category
-  conflict.
-- **`storageCategory(handle)`** encodes the target identity as a
-  string. `canShareStorage` therefore returns false across distinct
-  targets — `f = @foo; f = @bar` at top level splits into a fresh C
-  binding (the existing variable-split machinery), and inside control
-  flow it errors with the standard category-mismatch diagnostic.
-- **`canonicalizeType(handle)`** encodes the target identity only —
-  no AST, no body — so the JSON shard contributed by a handle arg is
-  small and deterministic. A higher-order function `apply(h, x)`
-  specializes per-handle-target: `apply(@foo, x)` and `apply(@bar, x)`
-  produce two distinct `apply__<hex>` specializations, and the body
-  of each one calls the concrete underlying user function.
+- **`unify(handle_a, handle_b)`** returns `handle_a` iff both target
+  identity AND capture shape match. Mismatch collapses to `Unknown`,
+  which `recordAssignment` reports as a clear category conflict.
+- **`storageCategory(handle)`** encodes both the target identity and
+  the capture-tuple shape (`handle:<target-id>:<captures-id>`).
+  `canShareStorage` therefore returns false across distinct targets OR
+  distinct capture shapes — `f = @foo; f = @bar` at top level splits
+  into a fresh C binding, and inside control flow it errors with the
+  standard category-mismatch diagnostic.
+- **`canonicalizeType(handle)`** encodes both the target's identity
+  and the canonicalized capture tuple. A higher-order function
+  `apply(h, x)` specializes per-handle-target AND per-capture-shape:
+  `apply(@foo, x)` and `apply(@bar, x)` produce two distinct
+  `apply__<hex>` specializations.
 
 Codegen consequences:
 
-- A handle-typed parameter is **elided** from the C signature. The
-  per-specialization header comment annotates it as `(handle, elided)`
-  so the generated C remains self-explanatory.
-- A handle-typed argument is elided from the rendered call argument
-  list. The static dispatch already happened — there's nothing to
-  pass.
-- A handle-typed Assign is elided from main / function bodies. If the
-  RHS is a user-function `Call` (a "factory function" returning a
-  handle), the call still emits as a bare statement so its body's side
-  effects fire; the discarded handle value is implicit.
-- A 1-output user function whose output is a handle is emitted with
-  `void` return type. The body's side effects emit normally; the
-  implicit fall-through `return <cName>;` is dropped.
+- `cTypeFor(HandleType)` returns the per-shape typedef name. No-capture
+  handles share `_mtoc_handle_empty_t` (a struct with a single
+  `char _placeholder` field for standards-conformant C); with-capture
+  handles use `_mtoc_handle__<8hex>` with one `cap_<name>` field per
+  capture.
+- Handles are an owned kind in the registry (see
+  `src/codegen/ownedKinds.ts`). Each per-shape typedef gets generated
+  `_empty` / `_free` / `_copy` / `_assign` helpers via
+  `src/codegen/emitHandle.ts`, mirroring `emitStruct.ts`. Captured
+  tensors / strings / nested structs / nested handles compose
+  recursively through the owned-kind dispatch.
+- Function returns of a HandleType use the standard owned return-by-
+  value path: the factory function's body installs the captures into
+  the return handle, and the caller consumes it via the handle's
+  `_assign` helper.
+- A handle's compound literal `(<typedef>){.cap_<name> = <value>, ...}`
+  appears as the RHS of an Assign at the `@(...)` site. Owned captures
+  are wrapped in their kind's `_copy` helper so the snapshot is
+  independent of subsequent reassignments at the source binding.
+- At each `h(args)` call site, `lowerHandle.ts::lowerHandleCall`
+  builds the underlying call's args as
+  `[<user-args>..., HandleCaptureLoad(h, cap_1), HandleCaptureLoad(h, cap_2), ...]`,
+  feeding the captures from the struct's fields. The synth function's
+  param list mirrors that order (`[...userParams, ...captureNames]`)
+  so positional binding lines up.
 
-Anonymous functions get a synthesized `FunctionStmt` AST and a
-counter-derived `mangledBase` (`anon_<N>`). The output assign is named
-`anonOut_<N>`. Capture detection runs before synthesis: any Ident in
-the body that's bound in the enclosing scope and not in the param list
-is rejected with a clear "captures are not yet supported" diagnostic.
+Anonymous functions get a synthesized `FunctionStmt` AST whose params
+list is `[...userParams, ...captureNames]` and a counter-derived
+`mangledBase` (`anon_<N>`). The output assign is `anonOut_<N>`. The
+synth body's references to a captured variable resolve to the synth
+function's tail param of the same name.
 
 Storage-category guarantees: a `Handle:userFunc:<file>:<name>` ≠
 `Handle:userFunc:<file>:<other-name>` ≠ `Handle:builtin:<name>` ≠
-`Handle:anonymous:<mangledBase>`. Two anonymous expressions at different
-source spans bump the shared counter and so always produce distinct
-identities; an anonymous's identity is independent of its body text.
+`Handle:anonymous:<mangledBase>`, and within each target identity
+distinct capture-tuple shapes produce distinct categories. Two
+anonymous expressions at different source spans bump the shared
+counter and always produce distinct identities even before captures
+are considered.
+
+`normalizeStructTypes` extends to handles: after lowering, every
+HandleType's captures are rewritten to use the binds-aligned final
+widened types (the same machinery that ensures every struct reference
+uses a single canonical typedef per logical variable).
 
 ## Sign
 

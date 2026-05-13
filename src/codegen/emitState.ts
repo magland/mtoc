@@ -187,6 +187,12 @@ export function useRuntimeByName(state: EmitState, name: string): void {
   // uniformly call useRuntimeByName regardless of kind.
   if (name.startsWith("__struct__:")) return;
   if (name.startsWith("_mtoc_struct__")) return;
+  // Handle typedefs + their generated helpers (`<typedef>_empty`,
+  // `_free`, `_copy`, `_assign`) are emitted directly by
+  // `emitHandle.ts` ahead of every user function; same no-op
+  // intercept as struct.
+  if (name.startsWith("__handle__:")) return;
+  if (name.startsWith("_mtoc_handle")) return;
   const snippet = RUNTIME_HELPERS.get(name);
   if (!snippet) {
     throw new Error(`codegen: unknown runtime helper '${name}'`);

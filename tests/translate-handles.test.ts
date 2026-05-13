@@ -55,9 +55,11 @@ describe("function handles — type-system invariants", () => {
     const u = userFuncHandle("foo", "x.m", fakeAst);
     const b = builtinHandle("sin");
     const a = anonymousHandle("anon_0", fakeAst, "x.m");
-    expect(storageCategory(u)).toBe("handle:userFunc:x.m:foo");
-    expect(storageCategory(b)).toBe("handle:builtin:sin");
-    expect(storageCategory(a)).toBe("handle:anonymous:anon_0");
+    // Storage category encodes both the target identity AND the
+    // capture-tuple shape (`:empty` for no captures).
+    expect(storageCategory(u)).toBe("handle:userFunc:x.m:foo:empty");
+    expect(storageCategory(b)).toBe("handle:builtin:sin:empty");
+    expect(storageCategory(a)).toBe("handle:anonymous:anon_0:empty");
     // Two distinct anonymous handles must have distinct categories.
     const a2 = anonymousHandle("anon_1", fakeAst, "x.m");
     expect(storageCategory(a)).not.toBe(storageCategory(a2));
@@ -81,18 +83,19 @@ describe("function handles — type-system invariants", () => {
 });
 
 describe("function handles — lowering", () => {
-  it("rejects an anonymous function that captures an enclosing local", () => {
+  it("accepts an anonymous function that captures an enclosing scalar local", () => {
     const src = ["k = 5;", "f = @(x) x + k;", "disp(f(3));"].join("\n");
-    expect(() => translate(src)).toThrow(/captures 'k'/);
+    expect(() => translate(src)).not.toThrow();
   });
 
-  it("rejects an anonymous function whose body invokes a captured variable", () => {
+  it("accepts an anonymous function whose body invokes a captured handle", () => {
     const src = [
       "g = @sq;",
       "f = @(x) g(x) + 1;",
+      "disp(f(4));",
       "function y = sq(x); y = x*x; end",
     ].join("\n");
-    expect(() => translate(src)).toThrow(/captures 'g'/);
+    expect(() => translate(src)).not.toThrow();
   });
 
   it("accepts an anonymous function whose body calls a workspace function", () => {
@@ -126,34 +129,39 @@ describe("function handles — lowering", () => {
   });
 });
 
-describe("function handles — codegen elision", () => {
-  it("handle-typed user-function parameters are absent from the emitted signature", () => {
+describe("function handles — codegen", () => {
+  it("handle-typed user-function parameters appear in the emitted signature with the handle typedef", () => {
     const src = [
       "disp(apply(@sq, 5));",
       "function r = apply(h, x); r = h(x); end",
       "function y = sq(x); y = x*x; end",
     ].join("\n");
     const c = translate(src);
-    // `apply` should have ONE param (x), not two (h, x). Match the
-    // entire signature — handle h is elided.
-    expect(c).toMatch(/static double apply__[0-9a-f]+\(double x\)/);
-    // Header comment annotates the elided handle param.
-    expect(c).toMatch(/h\s*:\s*Handle<.*>\s*\(handle, elided\)/);
+    // `apply` takes `(h: handle, x: double)`. The handle param uses
+    // the shared empty typedef since `@sq` has no captures.
+    expect(c).toMatch(
+      /static double apply__[0-9a-f]+\(_mtoc_handle_empty_t h, double x\)/
+    );
+    // No-capture handle typedef is generated with the placeholder field.
+    expect(c).toMatch(/typedef struct _mtoc_handle_empty_t \{/);
+    expect(c).toMatch(/char _placeholder/);
   });
 
-  it("a top-level handle variable is not predeclared in main", () => {
+  it("a top-level handle variable is predeclared as the handle typedef", () => {
     const src = [
       "f = @sq;",
       "disp(f(3));",
       "function y = sq(x); y = x*x; end",
     ].join("\n");
     const c = translate(src);
-    // `f` is a handle — no `double f` or any declaration for it.
-    expect(c).not.toMatch(/[\s,(]\s*f\s*;/);
-    expect(c).not.toMatch(/= f\s*\(/);
+    // `f` is declared with the empty handle typedef and initialized
+    // to its empty helper.
+    expect(c).toMatch(
+      /_mtoc_handle_empty_t f = _mtoc_handle_empty_t_empty\(\);/
+    );
   });
 
-  it("a factory function returning a handle is emitted as `void` and its call survives for side effects", () => {
+  it("a factory function returning a handle returns the handle struct by value", () => {
     const src = [
       "f = get_h();",
       "disp(f(3));",
@@ -161,10 +169,82 @@ describe("function handles — codegen elision", () => {
       "function y = sq(x); y = x*x; end",
     ].join("\n");
     const c = translate(src);
-    // The factory becomes a `void` function (handle return is phantom).
-    expect(c).toMatch(/static void get_h__[0-9a-f]+\(void\) \{/);
-    // The call survives at the caller for side effects (the `disp(99)`
-    // inside the factory must still fire).
-    expect(c).toMatch(/^\s*get_h__[0-9a-f]+\(\);/m);
+    // The factory returns the handle typedef by value.
+    expect(c).toMatch(
+      /static _mtoc_handle_empty_t get_h__[0-9a-f]+\(void\) \{/
+    );
+    // The factory's body emits `disp(99)` as a side effect.
+    expect(c).toMatch(/mtoc_disp_double\(99\.0\);/);
+    // The caller installs the returned handle into f via the kind's
+    // assign helper.
+    expect(c).toMatch(
+      /_mtoc_handle_empty_t_assign\(&f, get_h__[0-9a-f]+\(\)\);/
+    );
+  });
+
+  it("an anonymous function with a scalar capture lowers to a per-shape handle struct", () => {
+    const src = ["k = 5;", "f = @(x) x + k;", "disp(f(3));"].join("\n");
+    const c = translate(src);
+    // Per-capture-shape typedef with a `cap_k: double` field.
+    expect(c).toMatch(/typedef struct _mtoc_handle__[0-9a-f]+ \{/);
+    expect(c).toMatch(/double cap_k;/);
+    // The handle assignment installs a struct literal carrying k's
+    // snapshot value.
+    expect(c).toMatch(
+      /_mtoc_handle__[0-9a-f]+_assign\(&f, \(_mtoc_handle__[0-9a-f]+\)\{\.cap_k = k\}\);/
+    );
+    // The anonymous body becomes a synthetic user function with the
+    // capture as a tail parameter.
+    expect(c).toMatch(
+      /static double anon_[0-9]+__[0-9a-f]+\(double x, double k\)/
+    );
+  });
+
+  it("a tensor-typed capture is deep-copied into the handle struct at @-site", () => {
+    const src = ["v = [1 2 3];", "f = @(i) v(i);", "disp(f(2));"].join("\n");
+    const c = translate(src);
+    // The handle's struct has a tensor capture field.
+    expect(c).toMatch(/mtoc_tensor_t cap_v;/);
+    // The @-site struct literal deep-copies v into cap_v.
+    expect(c).toMatch(/\.cap_v = mtoc_tensor_copy\(v\)/);
+    // The handle struct's _free helper releases the captured tensor.
+    expect(c).toMatch(
+      /_mtoc_handle__[0-9a-f]+_free.*mtoc_tensor_free\(&h->cap_v\)/s
+    );
+  });
+
+  it("two handles with different capture-tuple shapes get distinct typedefs", () => {
+    const src = [
+      "k = 5;",
+      "v = [1 2 3];",
+      "f = @(x) x + k;",
+      "g = @(i) v(i);",
+      "disp(f(1));",
+      "disp(g(1));",
+    ].join("\n");
+    const c = translate(src);
+    const typedefs = c.match(/_mtoc_handle__[0-9a-f]+(?= cap|\b)/g) ?? [];
+    const uniq = new Set(typedefs.map(t => t.split(" ")[0]));
+    // At least two distinct handle typedefs (one for k:double, one for
+    // v:tensor). The shared empty placeholder is not present here
+    // because both handles capture.
+    expect(uniq.size).toBeGreaterThanOrEqual(2);
+  });
+
+  it("factory functions returning a handle with captures return the struct by value", () => {
+    const src = [
+      "f = make_adder(7);",
+      "disp(f(3));",
+      "function h = make_adder(k); h = @(x) x + k; end",
+    ].join("\n");
+    const c = translate(src);
+    // The factory returns the handle typedef by value.
+    expect(c).toMatch(
+      /static _mtoc_handle__[0-9a-f]+ make_adder__[0-9a-f]+\(double k\)/
+    );
+    // The factory body installs the captures into its return handle.
+    expect(c).toMatch(
+      /_mtoc_handle__[0-9a-f]+_assign\(&h, \(_mtoc_handle__[0-9a-f]+\)\{\.cap_k = k\}\);/
+    );
   });
 });

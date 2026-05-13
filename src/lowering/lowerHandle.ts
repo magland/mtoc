@@ -18,7 +18,10 @@ import { getConstant } from "../workspace/constants.js";
 import { UnsupportedConstruct, TypeError } from "./errors.js";
 import type { IRExpr } from "./ir.js";
 import { Lowerer } from "./lower.js";
-import { lowerBuiltinCall, specializeUserCall } from "./lowerFuncCall.js";
+import {
+  lowerBuiltinCall,
+  specializeUserCallWithIRArgs,
+} from "./lowerFuncCall.js";
 import {
   anonymousHandle,
   builtinHandle,
@@ -70,16 +73,20 @@ export function lowerFuncHandle(
       e.span
     );
   }
-  return { kind: "HandleLit", ty, span: e.span };
+  // Named handles never capture — empty captures list, empty struct
+  // literal at codegen.
+  return { kind: "HandleLit", captures: [], ty, span: e.span };
 }
 
-/** Lower a `@(p1, ..., pN) <body>` anonymous function. v1: rejects any
- *  body that references an outer-scope local (a "capture"). Accepted
- *  bodies are synthesized into a FunctionStmt-shaped AST with a single
- *  output, registered in the spec cache under a synthetic
- *  `_mtoc_anon_<N>` name. The handle's MType carries that name as its
- *  target identity (so a higher-order user function specializes per-
- *  anonymous-body). */
+/** Lower a `@(p1, ..., pN) <body>` anonymous function. Detects every
+ *  variable in the body that's bound in the enclosing scope and not in
+ *  the param list ("captures"), snapshots each one's value into the
+ *  handle struct at the `@(...)` site, and appends the captures to the
+ *  synthesized function's tail params so the body's references resolve
+ *  naturally. The captures travel with the handle wherever it goes;
+ *  at each `h(x)` call site, the handle's struct fields supply the
+ *  captures' values as additional positional arguments to the underlying
+ *  specialization. */
 export function lowerAnonFunc(
   this: Lowerer,
   e: Extract<Expr, { type: "AnonFunc" }>
@@ -94,34 +101,69 @@ export function lowerAnonFunc(
       );
     }
   }
-  // Capture detection: a free identifier in the body that's bound in
+  // Capture collection: every free Ident in the body that's bound in
   // the enclosing scope (env) and not in the param list is a capture.
-  // The walker only looks at Idents — Ident-shaped Method/FuncCall
-  // names are handled separately (function/builtin lookups, not
-  // variable reads).
+  // Order matters — we use registration order for both the synth
+  // function's tail-params and the handle struct's field order, so
+  // the underlying call site can match positions.
   const paramSet = new Set(e.params);
-  const captured = findFirstCapture(this, e.body, paramSet);
-  if (captured !== null) {
-    throw new UnsupportedConstruct(
-      `anonymous function captures '${captured}' from the enclosing scope; ` +
-        `captures are not yet supported. Workarounds: move the captured ` +
-        `value into a parameter and pass it at the call site, or replace ` +
-        `'@(...)' with a named function.`,
-      e.span
-    );
+  const captureNames: string[] = [];
+  const captureSet = new Set<string>();
+  collectCaptures(this, e.body, paramSet, captureNames, captureSet);
+
+  // Disallow capture name conflicting with user-declared params (numbl
+  // shadowing rule prohibits this at the source level; defensive
+  // check here so an unusual parser path doesn't sneak past).
+  for (const c of captureNames) {
+    if (paramSet.has(c)) {
+      throw new UnsupportedConstruct(
+        `anonymous-function parameter '${c}' shadows a captured variable; rename the parameter`,
+        e.span
+      );
+    }
+  }
+
+  // Build the capture-value IR expressions: each capture reads the
+  // outer scope's binding at the @-site. The outer scope's env tells
+  // us the captured variable's TYPE; the C-level snapshot lives in
+  // the handle struct's `cap_<name>` field, populated by the
+  // codegen's compound-literal renderer.
+  const captureValues: { name: string; value: IRExpr }[] = [];
+  const captures: { name: string; ty: MType }[] = [];
+  for (const cname of captureNames) {
+    const capTy = this.envLookup(cname);
+    if (capTy === undefined) {
+      // Should never happen — collectCaptures only added names whose
+      // envLookup returned non-undefined. Belt-and-suspenders.
+      throw new UnsupportedConstruct(
+        `internal: capture '${cname}' lost between detection and lowering`,
+        e.span
+      );
+    }
+    captures.push({ name: cname, ty: capTy });
+    captureValues.push({
+      name: cname,
+      value: {
+        kind: "Var",
+        name: cname,
+        cName: this.currentCNameFor(cname),
+        ty: capTy,
+        span: e.span,
+      },
+    });
   }
 
   // Synthesize a FunctionStmt:
   //
-  //   function <outName> = <synthName>(p1, ..., pN)
+  //   function <outName> = <synthName>(p1, ..., pN, c1, ..., cM)
   //     <outName> = <body>;
   //   end
   //
-  // <synthName> and <outName> use a counter from the shared state so
-  // each `@(...)` site gets a unique identity. The names do NOT use
-  // the reserved `_mtoc_` prefix (which `assertNotMtocReserved` would
-  // reject) — they're regular MATLAB identifiers in form, just
-  // unlikely to collide with user code.
+  // The captures appear as TAIL parameters of the synth function.
+  // When the body lowers, the inner Lowerer's env has both the
+  // user-params and the capture-params bound — so a body reference
+  // to a captured `k` resolves to the synth function's `k` param,
+  // not the (no-longer-in-scope) outer binding.
   const idx = this.shared.anonCounter.value++;
   const synthName = `anon_${idx}`;
   const outName = `anonOut_${idx}`;
@@ -136,14 +178,19 @@ export function lowerAnonFunc(
     type: "Function",
     name: synthName,
     functionId: synthName,
-    params: e.params,
+    params: [...e.params, ...captureNames],
     outputs: [outName],
     body: [assignStmt],
     argumentsBlocks: [],
     span: e.span,
   };
-  const ty = anonymousHandle(synthName, synthAst, this.currentFile);
-  return { kind: "HandleLit", ty, span: e.span };
+  const ty = anonymousHandle(synthName, synthAst, this.currentFile, captures);
+  return {
+    kind: "HandleLit",
+    captures: captureValues,
+    ty,
+    span: e.span,
+  };
 }
 
 /** Lower `h(args...)` where `h` resolves to an in-scope variable of
@@ -177,13 +224,17 @@ export function lowerHandleCall(
   }
   const t = handleTy.target;
   if (t.kind === "builtin") {
-    // Defer to the regular builtin-call path. The builtin's `lowerExpr`
-    // hook (if any) runs as it would for `<name>(args)`; sign-domain
-    // and shape checks fire with the args' spans.
+    // Builtin handles never carry captures. Defer to the regular
+    // builtin-call path — the builtin's `lowerExpr` hook (if any)
+    // runs as it would for `<name>(args)`; sign-domain and shape
+    // checks fire with the args' spans.
     return lowerBuiltinCall.call(this, t.name, argExprs, span);
   }
   // userFunc / anonymous: same machinery. Both have an AST + a source
-  // file; `specializeUserCall` does the lowering + caching.
+  // file. The CALLEE's params are `[...userParams, ...captureNames]`,
+  // so the args we hand to specialization must mirror that order:
+  // user-source args first, then the handle's captures read off the
+  // struct via `HandleCaptureLoad` nodes.
   const fnAst = t.ast;
   const fnFile = t.file;
   const matlabName = t.kind === "userFunc" ? t.name : t.mangledBase;
@@ -201,12 +252,15 @@ export function lowerHandleCall(
       span
     );
   }
-  const spec = specializeUserCall.call(
+  const userArgs = argExprs.map(a => this.lowerExpr(a));
+  const captureArgs = buildCaptureArgs(this, handleName, handleTy, span);
+  const allArgs = [...userArgs, ...captureArgs];
+  const spec = specializeUserCallWithIRArgs.call(
     this,
     matlabName,
     fnAst,
     fnFile,
-    argExprs,
+    allArgs,
     span
   );
   return {
@@ -217,6 +271,34 @@ export function lowerHandleCall(
     ty: spec.spec.outputs[0].ty,
     span,
   };
+}
+
+/** Build the per-capture `HandleCaptureLoad` IR nodes for a
+ *  handle-call site. Each capture becomes a read of `<handle>.cap_<name>`
+ *  passed as a positional arg to the underlying specialization. */
+function buildCaptureArgs(
+  outer: Lowerer,
+  handleName: string,
+  handleTy: HandleType,
+  span: Span
+): IRExpr[] {
+  if (handleTy.captures.length === 0) return [];
+  const baseTy = handleTy;
+  const baseCName = outer.currentCNameFor(handleName);
+  const base: Extract<IRExpr, { kind: "Var" }> = {
+    kind: "Var",
+    name: handleName,
+    cName: baseCName,
+    ty: baseTy,
+    span,
+  };
+  return handleTy.captures.map(c => ({
+    kind: "HandleCaptureLoad" as const,
+    base,
+    captureName: c.name,
+    ty: c.ty,
+    span,
+  }));
 }
 
 /** Extract the user-callable (AST + file + name) underlying a handle
@@ -258,28 +340,26 @@ export function handleUserCallable(
  *  would be expensive and a stray "Identifier that happens to share a
  *  workspace function name" is unusual enough to surface clearly at
  *  the real lowering of the body. */
-function findFirstCapture(
+function collectCaptures(
   outer: Lowerer,
   e: Expr,
-  params: ReadonlySet<string>
-): string | null {
+  params: ReadonlySet<string>,
+  names: string[],
+  seen: Set<string>
+): void {
+  const register = (name: string): void => {
+    if (params.has(name)) return;
+    if (seen.has(name)) return;
+    if (getConstant(name)) return;
+    if (getBuiltin(name)) return;
+    if (outer.envLookup(name) === undefined) return;
+    seen.add(name);
+    names.push(name);
+  };
   switch (e.type) {
-    case "Ident": {
-      if (params.has(e.name)) return null;
-      // Constants and builtins are name-based, not variable-based —
-      // they don't capture.
-      if (getConstant(e.name)) return null;
-      if (getBuiltin(e.name)) return null;
-      // Workspace functions (resolved by name in the enclosing
-      // workspace) aren't captures either — but a strict resolve()
-      // call here would surface a stray "unresolved" error at the
-      // anonymous-function site instead of the body's eventual
-      // lowering. Just check the env; if a name happens to alias a
-      // workspace function AND a variable, the variable wins under
-      // numbl semantics (which is what we'd reject anyway).
-      if (outer.envLookup(e.name) !== undefined) return e.name;
-      return null;
-    }
+    case "Ident":
+      register(e.name);
+      return;
     case "Number":
     case "Char":
     case "String":
@@ -287,102 +367,75 @@ function findFirstCapture(
     case "ImagUnit":
     case "Colon":
     case "MetaClass":
-      return null;
+      return;
     case "Binary":
-      return (
-        findFirstCapture(outer, e.left, params) ??
-        findFirstCapture(outer, e.right, params)
-      );
+      collectCaptures(outer, e.left, params, names, seen);
+      collectCaptures(outer, e.right, params, names, seen);
+      return;
     case "Unary":
-      return findFirstCapture(outer, e.operand, params);
+      collectCaptures(outer, e.operand, params, names, seen);
+      return;
     case "Range":
-      return (
-        findFirstCapture(outer, e.start, params) ??
-        (e.step ? findFirstCapture(outer, e.step, params) : null) ??
-        findFirstCapture(outer, e.end, params)
-      );
+      collectCaptures(outer, e.start, params, names, seen);
+      if (e.step) collectCaptures(outer, e.step, params, names, seen);
+      collectCaptures(outer, e.end, params, names, seen);
+      return;
     case "FuncCall": {
-      // The call's `name` is a function lookup, not a variable read —
-      // skip it (a workspace function named the same as an enclosing
-      // variable still routes to the function in numbl's resolver,
-      // except when the variable shadows it inside this body; that
-      // shadowing only matters for body lowering, not for capture
-      // detection at the @-site). Recurse into args.
-      for (const a of e.args) {
-        const r = findFirstCapture(outer, a, params);
-        if (r !== null) return r;
-      }
-      // But if the name itself is bound in the outer scope as a
-      // variable (e.g. `f` is a captured handle, and the body calls
-      // `f(x)`), we DO want to reject — the body is trying to call
-      // through a captured handle. This is the exact "capture" case
-      // we're refusing in v1.
-      if (
-        !params.has(e.name) &&
-        !getConstant(e.name) &&
-        !getBuiltin(e.name) &&
-        outer.envLookup(e.name) !== undefined
-      ) {
-        return e.name;
-      }
-      return null;
+      // A bare `name(args)` inside the body may resolve to a
+      // captured variable (e.g. the body calls `f(x)` where `f` is
+      // a captured handle) OR to a builtin / workspace function.
+      // We register `name` as a capture only when it matches an
+      // enclosing-scope binding — same `register` predicate as
+      // Ident. Args recurse normally.
+      register(e.name);
+      for (const a of e.args) collectCaptures(outer, a, params, names, seen);
+      return;
     }
     case "Index":
     case "IndexCell":
-      return (
-        findFirstCapture(outer, e.base, params) ??
-        firstCaptureInArr(outer, e.indices, params)
-      );
+      collectCaptures(outer, e.base, params, names, seen);
+      for (const i of e.indices) collectCaptures(outer, i, params, names, seen);
+      return;
     case "Member":
-      return findFirstCapture(outer, e.base, params);
+      collectCaptures(outer, e.base, params, names, seen);
+      return;
     case "MemberDynamic":
-      return (
-        findFirstCapture(outer, e.base, params) ??
-        findFirstCapture(outer, e.nameExpr, params)
-      );
+      collectCaptures(outer, e.base, params, names, seen);
+      collectCaptures(outer, e.nameExpr, params, names, seen);
+      return;
     case "MethodCall":
-      return (
-        findFirstCapture(outer, e.base, params) ??
-        firstCaptureInArr(outer, e.args, params)
-      );
+      collectCaptures(outer, e.base, params, names, seen);
+      for (const a of e.args) collectCaptures(outer, a, params, names, seen);
+      return;
     case "SuperMethodCall":
-      return firstCaptureInArr(outer, e.args, params);
+      for (const a of e.args) collectCaptures(outer, a, params, names, seen);
+      return;
     case "AnonFunc": {
-      // Nested anonymous: descend with an extended param set (inner
-      // params shadow the outer's). Captures from the OUTER scope
-      // through the inner are still captures of the outer anonymous
-      // — which v1 rejects. So we just union the param sets and
-      // recurse.
+      // Nested anonymous: inner params shadow the outer's. Captures
+      // from the OUTER scope reached through the inner body are
+      // still captures of the OUTER anonymous (the inner anonymous
+      // would, when itself lowered, capture them through its own
+      // mechanism — but the outer needs them too so the inner has
+      // access). Union the param sets and recurse.
       const nested = new Set(params);
       for (const p of e.params) nested.add(p);
-      return findFirstCapture(outer, e.body, nested);
+      collectCaptures(outer, e.body, nested, names, seen);
+      return;
     }
     case "FuncHandle":
       // `@name` inside a `@(...)` body resolves at body-lowering
-      // time, not at the outer @-site. No free vars introduced.
-      return null;
+      // time to a function reference — it doesn't capture an outer
+      // variable.
+      return;
     case "Tensor":
     case "Cell":
       for (const row of e.rows) {
-        for (const cell of row) {
-          const r = findFirstCapture(outer, cell, params);
-          if (r !== null) return r;
-        }
+        for (const cell of row)
+          collectCaptures(outer, cell, params, names, seen);
       }
-      return null;
+      return;
     case "ClassInstantiation":
-      return firstCaptureInArr(outer, e.args, params);
+      for (const a of e.args) collectCaptures(outer, a, params, names, seen);
+      return;
   }
-}
-
-function firstCaptureInArr(
-  outer: Lowerer,
-  arr: ReadonlyArray<Expr>,
-  params: ReadonlySet<string>
-): string | null {
-  for (const e of arr) {
-    const r = findFirstCapture(outer, e, params);
-    if (r !== null) return r;
-  }
-  return null;
 }

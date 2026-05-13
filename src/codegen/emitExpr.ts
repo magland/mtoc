@@ -15,6 +15,7 @@
 
 import type { IRExpr } from "../lowering/ir.js";
 import {
+  cTypeFor,
   isCharArray,
   isMultiElement,
   isNumeric,
@@ -160,7 +161,14 @@ export function wrapOwnedArgCopy(
 ): string {
   const owned = ownedOps(argTy);
   if (owned === null) return inner;
-  if (!isMultiElement(argTy) && !isStruct(argTy)) return inner;
+  // Multi-element tensors, structs, and function handles use the
+  // copy-on-arg-pass convention: the callee receives an independently-
+  // owned value that it may freely mutate / reassign / free at scope
+  // exit. Strings and char-tensors as args are borrowed (no automatic
+  // wrap) — they were never in this convention.
+  if (!isMultiElement(argTy) && !isStruct(argTy) && argTy.kind !== "Handle") {
+    return inner;
+  }
   const helper = owned.copy(argTy);
   useRuntimeByName(state, helper);
   return `${helper}(${inner})`;
@@ -191,6 +199,7 @@ export function emitExpr(
     e.kind !== "TensorLit" &&
     e.kind !== "CharLit" &&
     e.kind !== "MemberLoad" &&
+    e.kind !== "HandleCaptureLoad" &&
     !isDirectOwnedCall(e) &&
     isMultiElement(e.ty)
   ) {
@@ -204,17 +213,37 @@ export function emitExpr(
     case "NumLit":
       return formatNumLit(e.value);
 
-    case "HandleLit":
-      // Function handles are phantom in v1 — they have no C
-      // representation and never reach this emitter at a position
-      // that demands a value. The only legal IR site for a HandleLit
-      // is the RHS of an Assign whose LHS has a HandleType, and that
-      // Assign is dropped by `emitStmt` before reaching here. Any
-      // other arrival point is a lowering bug.
-      throw new Error(
-        "codegen internal: HandleLit reached emitExpr; should have been " +
-          "consumed by an elided HandleType Assign in emitStmt"
-      );
+    case "HandleLit": {
+      // Render as a C compound literal of the handle's per-shape
+      // struct: `(_mtoc_handle__<hex>){.cap_<name> = <value>, ...}`,
+      // or `(_mtoc_handle_empty_t){0}` for the no-capture form.
+      // Captured values feed in directly; owned captures (tensors,
+      // strings, nested structs / handles) are deep-copied by an
+      // ownership-aware wrapper so the snapshot is independent of
+      // later mutations to the source binding.
+      if (e.ty.kind !== "Handle") {
+        throw new Error("codegen internal: HandleLit with non-Handle ty");
+      }
+      const cTy = cTypeFor(e.ty);
+      if (cTy === null) {
+        throw new Error("codegen internal: HandleLit ty has no C type");
+      }
+      useRuntimeByName(state, `__handle__:${cTy}`);
+      if (e.captures.length === 0) {
+        return `(${cTy}){0}`;
+      }
+      const parts: string[] = [];
+      for (const c of e.captures) {
+        const inner = emitExpr(state, c.value, 0);
+        parts.push(
+          `.cap_${c.name} = ${wrapOwnedArgCopy(state, c.value.ty, inner)}`
+        );
+      }
+      return `(${cTy}){${parts.join(", ")}}`;
+    }
+
+    case "HandleCaptureLoad":
+      return `${e.base.cName}.cap_${e.captureName}`;
 
     case "StringLit": {
       // Build a non-owning `mtoc_string_t` whose `data` field points
@@ -326,28 +355,21 @@ export function emitExpr(
       // The closure receives the arg MTypes so it can dispatch on
       // `isComplex` (e.g. `sqrt(x)` vs `sqrt(z)` → `csqrt(z)`).
       //
-      // Copy-on-arg-pass: for user-function calls, every tensor-typed
-      // argument is wrapped in `mtoc_tensor_copy(...)` so the callee
-      // gets an owned tensor (which it may freely reassign or free at
-      // scope exit). Builtins are known read-only and skip the wrap.
-      //
-      // Handle-typed args are phantom (no C representation) and so
-      // skipped from the rendered argument list. Their identity is
-      // already baked into the user-function specialization's mangled
-      // name via `canonicalizeType`; builtins do not appear with
-      // handle args.
+      // Copy-on-arg-pass: for user-function calls, every owned-typed
+      // argument (tensor, string, char-array, struct, handle-with-
+      // captures) is wrapped in the kind's `_copy` helper so the
+      // callee gets an independently-owned value. Builtins are known
+      // read-only and skip the wrap. `wrapOwnedArgCopy` returns the
+      // input unchanged for non-owned types.
       const isUserCall = e.callee.kind === "userFunc";
-      const argStrs: string[] = [];
-      const argTys: MType[] = [];
-      for (const a of e.args) {
-        if (a.ty.kind === "Handle") continue;
+      const argStrs = e.args.map(a => {
         const inner = emitExpr(state, a, 0);
-        argStrs.push(isUserCall ? wrapOwnedArgCopy(state, a.ty, inner) : inner);
-        argTys.push(a.ty);
-      }
+        return isUserCall ? wrapOwnedArgCopy(state, a.ty, inner) : inner;
+      });
       if (e.callee.kind === "userFunc") {
         return `${e.callee.mangled}(${argStrs.join(", ")})`;
       }
+      const argTys = e.args.map(a => a.ty);
       return e.callee.sig.emit(argStrs, argTys, builtinEmitFacade(state));
     }
 

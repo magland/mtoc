@@ -14,7 +14,6 @@
 import type { IRFunction, IRStmt } from "../lowering/ir.js";
 import {
   cTypeFor,
-  isHandle,
   isNumeric,
   isOwned,
   typeToString,
@@ -126,16 +125,11 @@ export function emitFunctionBody(
     // value is needed. Skip the trailing `return;` — falling off the
     // end of a `void` function is well-defined.
   } else if (fn.outputs.length === 1) {
-    if (isHandle(fn.outputs[0].ty)) {
-      // Phantom handle output: function was emitted with `void`
-      // return type. No value to return at the C level.
-    } else {
-      // Classic single-output convention: return-by-value of the
-      // post-body live binding's C name. For owned types the struct
-      // copy hands the heap buffers to the caller; the callee skipped
-      // freeing this cName above.
-      pushStmt(state, 1, `return ${fn.outputs[0].cName};`);
-    }
+    // Classic single-output convention: return-by-value of the
+    // post-body live binding's C name. For owned types (including
+    // handles) the struct copy hands the buffers to the caller; the
+    // callee skipped freeing this cName above.
+    pushStmt(state, 1, `return ${fn.outputs[0].cName};`);
   } else {
     // Multi-output sret writes already emitted above; just return.
     pushStmt(state, 1, `return;`);
@@ -173,8 +167,7 @@ function functionHeaderComment(fn: IRFunction): string[] {
   lines.push(` *   defined : ${loc.file}:${lineRange}`);
   lines.push(` *   mangled : ${fn.mangledName}`);
   for (const p of fn.params) {
-    const tag = isHandle(p.ty) ? " (handle, elided)" : "";
-    lines.push(` *   ${pad(p.name)} : ${typeToString(p.ty)}${tag}`);
+    lines.push(` *   ${pad(p.name)} : ${typeToString(p.ty)}`);
   }
   if (fn.outputs.length === 0) {
     lines.push(` *   ${pad("returns")} : (none)`);
@@ -209,7 +202,7 @@ export function emitFunction(
   //                   the caller's prior buffer at the lvalue is
   //                   released before the new handle lands.
   let returnCTy: string;
-  if (fn.outputs.length === 1 && !isHandle(fn.outputs[0].ty)) {
+  if (fn.outputs.length === 1) {
     const cTy = cTypeFor(fn.outputs[0].ty);
     if (cTy === null) {
       throw new Error(
@@ -226,11 +219,6 @@ export function emitFunction(
       state.needComplex.value = true;
     }
   } else {
-    // 0-output, N-output, OR a 1-output function returning a phantom
-    // handle: emit as `void`. The handle-return case folds into the
-    // void shape — the body's side effects still emit, but the
-    // implicit fall-through return slot is dropped (no value to
-    // return at the C level).
     returnCTy = "void";
   }
   // Per param: `cTypeFor` picks the C representation — `double` for
@@ -244,12 +232,6 @@ export function emitFunction(
   // every multi-element tensor param to the free set.
   const paramParts: string[] = [];
   for (const p of fn.params) {
-    // Function-handle params are phantom — they ride alongside the C
-    // signature via the specialization's mangled name (which encodes
-    // the handle's target identity) and never appear as runtime C
-    // parameters. Skip them entirely; the header comment annotates
-    // their elision so the generated C stays self-explanatory.
-    if (isHandle(p.ty)) continue;
     const cTy = cTypeFor(p.ty);
     if (cTy === null) {
       throw new Error(

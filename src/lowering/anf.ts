@@ -393,8 +393,20 @@ function anfExprChildren(
     case "CharLit":
     case "Var":
     case "EndRef":
-    case "HandleLit":
       return e;
+    case "HandleLit":
+      // Recurse into each captured value so an ANF-eligible
+      // producer (e.g. a tensor-returning Call) gets hoisted out
+      // before reaching the @-site's struct literal.
+      return {
+        ...e,
+        captures: e.captures.map(cap => ({
+          name: cap.name,
+          value: anfRequireHandle(cap.value, pre, av, c),
+        })),
+      };
+    case "HandleCaptureLoad":
+      return { ...e, base: anfExpr(e.base, pre, av, c) as typeof e.base };
   }
 }
 
