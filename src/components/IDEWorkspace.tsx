@@ -225,7 +225,10 @@ export function IDEWorkspace({ filesApi, header }: IDEWorkspaceProps) {
     updateFileContent(v);
   };
 
-  const isRunning = exec.status === "running";
+  // "compiling" (wasm-mode network round trip) is also a busy state —
+  // the user shouldn't be able to fire a second run, and the Run button
+  // should already show Stop so they can cancel mid-fetch.
+  const isRunning = exec.status === "running" || exec.status === "compiling";
   const canRun = !!c && !error && !isRunning;
   const runDisabledReason = !c
     ? "Nothing to run yet."

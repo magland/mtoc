@@ -27,6 +27,8 @@ import {
 } from "../translate";
 import { computeCacheKey, getCachedWasm, putCachedWasm } from "../db/wasmCache";
 import type { RunEvent, RunResult } from "./remoteExecution";
+import WasmRunnerWorker from "./wasmRunner.worker.ts?worker";
+import type { WasmRunMessage } from "./wasmRunner.worker";
 
 export type WasmOptLevel = "O0" | "O2" | "O3";
 
@@ -75,12 +77,21 @@ function base64ToUint8Array(b64: string): Uint8Array {
  * source breaks the build. The native path keeps the user's threads
  * choice; wasm-mode display also forces threads=1 (see IDEWorkspace).
  */
+export interface BuildWasmHooks {
+  /** Fires once we've determined a network compile is necessary —
+   *  i.e. translation succeeded and the cache lookup missed. Used by
+   *  the IDE to flip the run state into "compiling" so the user sees
+   *  that the latency is the wasm-service round trip, not local work. */
+  onCompileStart?: () => void;
+}
+
 export async function buildWasm(
   files: SourceFile[],
   activeName: string,
   opts: WasmBuildOpts,
   wasmServiceUrl: string,
-  abortSignal?: AbortSignal
+  abortSignal?: AbortSignal,
+  hooks?: BuildWasmHooks
 ): Promise<BuildWasmResult> {
   // Step 1: translate in-browser. Any UnsupportedConstruct / TypeError
   // raised by the lowerer surfaces here, before we touch the network.
@@ -102,6 +113,10 @@ export async function buildWasm(
     if (cached) return { ok: true, artifact: cached };
   }
   if (abortSignal?.aborted) return { ok: false, kind: "aborted" };
+
+  // About to hit the network — tell the caller so it can show the user
+  // that the wait is the compile service, not local work.
+  hooks?.onCompileStart?.();
 
   // Step 3: POST to the compile service.
   let response: Response;
@@ -198,59 +213,24 @@ export async function buildWasm(
   return { ok: true, artifact };
 }
 
-/** Minimal type for the Emscripten module factory we expect from the
- *  glue. We only call the parts we control; emscripten's public surface
- *  is much larger but unstable across versions. */
-interface EmModuleOverrides {
-  wasmBinary: Uint8Array;
-  /** Short-circuits the Emscripten glue's default URL-resolution path
-   *  for the sibling `.wasm`. We need this because the glue runs
-   *  `new URL("out.wasm", import.meta.url)` even when `wasmBinary` is
-   *  provided, and `import.meta.url` is a `blob:` URL (which browsers
-   *  reject as a base for relative URL resolution). Returning the path
-   *  unchanged is fine — the actual binary fetch is short-circuited by
-   *  `wasmBinary`, so the returned string is only used as the cache key
-   *  in `getBinarySync(file == wasmBinaryFile)`. */
-  locateFile: (path: string) => string;
-  print: (text: string) => void;
-  printErr: (text: string) => void;
-  noExitRuntime?: boolean;
-  onExit?: (code: number) => void;
-  onAbort?: (reason: unknown) => void;
-}
-
-type EmModuleFactory = (overrides: EmModuleOverrides) => Promise<unknown>;
-
-interface GlueModule {
-  default: EmModuleFactory;
-}
-
-/** Load the Emscripten glue via Blob-URL dynamic import.
- *
- *  Why Blob and not a `data:` URL: dynamic `import("data:text/javascript;...")`
- *  is blocked by some browsers' CSPs and has no clear base URL for
- *  `import.meta.url` to anchor against. A Blob URL behaves like any other
- *  same-origin script.
- *
- *  We pass `wasmBinary` directly so the glue never tries to fetch the
- *  sibling `.wasm` by URL — that fetch would fail for a Blob-URL host. */
-async function loadGlue(glueSource: string): Promise<GlueModule> {
-  const blob = new Blob([glueSource], { type: "text/javascript" });
-  const url = URL.createObjectURL(blob);
-  try {
-    // The /* @vite-ignore */ comment keeps Vite from trying to statically
-    // analyze the dynamic import target (which would fail since the URL
-    // is a runtime blob).
-    return (await import(/* @vite-ignore */ url)) as GlueModule;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
-}
-
 export interface RunWasmCallbacks {
   onEvent: (event: RunEvent) => void;
 }
 
+/**
+ * Run the built wasm artifact in a dedicated Web Worker.
+ *
+ * Off-main-thread execution is what makes the Stop button actually work
+ * for long-running numbl programs: a tight loop in the wasm would
+ * otherwise block the main thread (including the UI's own click handler),
+ * so a cooperative abort flag is useless. With a worker, the cancel path
+ * is `worker.terminate()`, which kills the wasm regardless of what it's
+ * doing.
+ *
+ * The worker emits the same `stdout` / `stderr` / `done` events the
+ * original in-process runner used to emit via callback, so callers
+ * (`useRemoteExecution`) wire up unchanged.
+ */
 export async function runWasm(
   artifact: WasmBuildArtifact,
   callbacks: RunWasmCallbacks,
@@ -260,78 +240,62 @@ export async function runWasm(
     return { success: false, aborted: true };
   }
 
-  let factory: EmModuleFactory;
-  try {
-    const mod = await loadGlue(artifact.glue);
-    factory = mod.default;
-    if (typeof factory !== "function") {
-      return {
-        success: false,
-        transportError: "WASM glue is missing default export",
-      };
-    }
-  } catch (error) {
-    return {
-      success: false,
-      transportError:
-        error instanceof Error
-          ? `Failed to load WASM glue: ${error.message}`
-          : "Failed to load WASM glue",
+  return new Promise<RunResult>(resolve => {
+    const worker = new WasmRunnerWorker();
+    let settled = false;
+    let aborted = false;
+
+    const finish = (result: RunResult) => {
+      if (settled) return;
+      settled = true;
+      abortSignal?.removeEventListener("abort", abortHandler);
+      worker.terminate();
+      resolve(result);
     };
-  }
 
-  let exitCode: number | undefined;
-  let aborted = false;
-  const abortHandler = () => {
-    aborted = true;
-  };
-  abortSignal?.addEventListener("abort", abortHandler, { once: true });
+    const abortHandler = () => {
+      aborted = true;
+      // Emit a synthetic `done` so the console transitions cleanly —
+      // the worker is being killed mid-execution and won't get to send
+      // its own. Phase stays "run" because that's where we were.
+      callbacks.onEvent({ type: "done", phase: "run", exitCode: 130 });
+      finish({ success: false, aborted: true });
+    };
+    abortSignal?.addEventListener("abort", abortHandler, { once: true });
 
-  try {
-    // Emscripten's `print`/`printErr` are line-buffered (fire once per
-    // newline); mtoc's `disp` always ends in `\n` so this matches the
-    // SSE path's chunk shape closely. We append a trailing newline to
-    // restore the byte the buffer stripped, so cross-runner byte-for-byte
-    // parity with native stdout still holds.
-    await factory({
-      wasmBinary: artifact.wasm,
-      locateFile: path => path,
-      print: text => {
-        callbacks.onEvent({ type: "stdout", text: `${text}\n` });
-      },
-      printErr: text => {
-        callbacks.onEvent({ type: "stderr", text: `${text}\n` });
-      },
-      noExitRuntime: false,
-      onExit: code => {
-        exitCode = code;
-      },
-      onAbort: reason => {
-        callbacks.onEvent({
-          type: "stderr",
-          text: `[mtoc-wasm] abort: ${String(reason)}\n`,
-        });
-      },
-    });
-  } catch (error) {
-    // Emscripten's `exit(N)` throws an `ExitStatus` which propagates up
-    // here. The `onExit` handler already captured the code, so on a
-    // genuine non-zero exit we want to fall through to the normal `done`
-    // path rather than report it as a transport error.
-    if (exitCode === undefined) {
-      const message = error instanceof Error ? error.message : String(error);
+    worker.onmessage = (event: MessageEvent<WasmRunMessage>) => {
+      if (aborted) return;
+      const msg = event.data;
+      if (msg.type === "stdout" || msg.type === "stderr") {
+        callbacks.onEvent({ type: msg.type, text: msg.text });
+        return;
+      }
+      if (msg.type === "error") {
+        callbacks.onEvent({ type: "stderr", text: `${msg.message}\n` });
+        callbacks.onEvent({ type: "done", phase: "run", exitCode: 1 });
+        finish({ success: false, transportError: msg.message });
+        return;
+      }
+      // "done"
+      callbacks.onEvent({ type: "done", phase: "run", exitCode: msg.exitCode });
+      finish({ success: msg.exitCode === 0, exitCode: msg.exitCode });
+    };
+
+    worker.onerror = event => {
+      if (aborted) return;
+      const message = event.message || "worker error";
       callbacks.onEvent({ type: "stderr", text: `${message}\n` });
       callbacks.onEvent({ type: "done", phase: "run", exitCode: 1 });
-      abortSignal?.removeEventListener("abort", abortHandler);
-      return aborted
-        ? { success: false, aborted: true }
-        : { success: false, exitCode: 1 };
-    }
-  }
-  abortSignal?.removeEventListener("abort", abortHandler);
+      finish({ success: false, transportError: message });
+    };
 
-  const finalCode = exitCode ?? 0;
-  callbacks.onEvent({ type: "done", phase: "run", exitCode: finalCode });
-  if (aborted) return { success: false, aborted: true };
-  return { success: finalCode === 0, exitCode: finalCode };
+    // Default structured-clone (no transfer): keeps `artifact.wasm`
+    // usable on the main thread for any concurrent IDB cache write
+    // that may still be in flight from `buildWasm`.
+    worker.postMessage({
+      type: "run",
+      wasm: artifact.wasm,
+      glue: artifact.glue,
+    });
+  });
 }
