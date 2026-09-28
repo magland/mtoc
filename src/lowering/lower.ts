@@ -56,6 +56,7 @@ import {
   type DimInfo,
 } from "./types.js";
 
+import { exactToLiteral } from "./constFold.js";
 import { StructLoweringState } from "./structLoweringState.js";
 import { ClassLoweringState } from "./classLoweringState.js";
 import {
@@ -395,7 +396,26 @@ export class Lowerer {
     const out: IRStmt[] = [];
     for (const s of stmts) {
       const lowered = this.lowerStmt(s);
-      if (lowered) out.push(lowered);
+      if (lowered === null) continue;
+      if (Array.isArray(lowered)) out.push(...lowered);
+      else out.push(lowered);
+      // Stop processing the rest of the current stmt-list once the
+      // last pushed IR stmt is an unconditional terminator. Critical
+      // for the Stage-C if-fold: when a folded arm contains a
+      // `return` / `break` / `continue`, subsequent stmts in the
+      // parent scope are dead — continuing to lower them would (a)
+      // emit unreachable C and (b) leak their env updates into the
+      // function's return type (so `c = -x` after a folded-out early
+      // return would pin `c`'s post-function type to -5).
+      const tail = out[out.length - 1];
+      if (
+        tail !== undefined &&
+        (tail.kind === "ReturnFromFunction" ||
+          tail.kind === "Break" ||
+          tail.kind === "Continue")
+      ) {
+        break;
+      }
     }
     return out;
   }
@@ -715,7 +735,7 @@ export class Lowerer {
     };
   }
 
-  private lowerStmt(s: Stmt): IRStmt | null {
+  private lowerStmt(s: Stmt): IRStmt | IRStmt[] | null {
     switch (s.type) {
       case "Function":
         // Function declarations are pulled out of the script body before
@@ -1119,6 +1139,15 @@ export class Lowerer {
       case "Ident": {
         const ty = this.env.get(e.name);
         if (ty) {
+          // Stage-D substitution: a variable whose static type carries
+          // `exact` reads as the literal value. Subsequent ops (binary,
+          // unary, calls, disp, etc.) see the literal IR shape directly
+          // — so `x = 4; disp(x);` emits `disp(4.0);` and the C-level
+          // variable becomes dead-load fodder. Safe because `exact`
+          // participates in `canonicalizeType`: every call site whose
+          // arg exact differs gets its own specialization.
+          const litFromExact = exactToLiteral(ty, e.span);
+          if (litFromExact !== null) return litFromExact;
           return {
             kind: "Var",
             name: e.name,

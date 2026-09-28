@@ -28,27 +28,74 @@ import type {
 } from "../parser/index.js";
 import type { IRExpr } from "./ir.js";
 import {
+  isNumeric,
+  isScalar,
+  isString,
   scalarComplex,
   scalarDouble,
   signFromValue,
   stringType,
+  type MType,
 } from "./types.js";
 
-/** Read a scalar real value out of an IR literal: NumLit directly,
- *  scalar CharLit via its byte (numbl's char→double promotion).
+/** Read a scalar real value out of an IR expression. Three sources,
+ *  in order of cheapness:
+ *
+ *   1. `NumLit` IR node — value is on the node directly.
+ *   2. Scalar `CharLit` IR node — read the byte (numbl's char→double
+ *      promotion makes this safe for the arithmetic / comparison fold
+ *      paths that consume the return value as a `number`).
+ *   3. Any IR kind whose `.ty` is a scalar double / scalar char with
+ *      `exact` set. Stage D wires this in so `Var(opt)` with type
+ *      `scalarDouble(positive, exact=1)` folds the same as a literal
+ *      `1` would. Sound because `exact` now participates in
+ *      `canonicalizeType` — two callers with different exacts hash
+ *      apart and get distinct specializations.
+ *
  *  Returns null for any other shape. */
 function asScalarReal(e: IRExpr): number | null {
   if (e.kind === "NumLit") return e.value;
   if (e.kind === "CharLit" && e.value.length === 1) {
     return e.value.charCodeAt(0);
   }
+  const t = e.ty;
+  if (isNumeric(t) && isScalar(t) && !t.isComplex && t.elem === "double") {
+    if (typeof t.exact === "number") return t.exact;
+  }
+  if (isNumeric(t) && isScalar(t) && t.elem === "char") {
+    if (typeof t.exact === "string" && t.exact.length === 1) {
+      return t.exact.charCodeAt(0);
+    }
+  }
   return null;
 }
 
-/** Read the imaginary coefficient of a pure-imag literal (ImagLit
- *  carries `0 + value*i`). Returns null for anything else. */
+/** Read the imaginary coefficient of a pure-imag IR expression.
+ *  Mirrors `asScalarReal`'s three-source structure but only matches
+ *  when the value is purely imaginary (re == 0). General `a + bi`
+ *  complex values aren't foldable today — there's no `ComplexLit` IR
+ *  node to hold the result. */
 function asPureImag(e: IRExpr): number | null {
-  return e.kind === "ImagLit" ? e.value : null;
+  if (e.kind === "ImagLit") return e.value;
+  const t = e.ty;
+  if (isNumeric(t) && isScalar(t) && t.isComplex && t.elem === "double") {
+    const ex = t.exact;
+    if (typeof ex === "object" && ex !== null && "re" in ex && ex.re === 0) {
+      return ex.im;
+    }
+  }
+  return null;
+}
+
+/** Read an exact string value off any IR expression — `StringLit`
+ *  directly, or any kind whose `.ty` is a `StringType` with `exact`
+ *  set. Stage D unlocks Var-driven string concat folding when the
+ *  variable's specialization carries its value. */
+function asExactString(e: IRExpr): string | null {
+  if (e.kind === "StringLit") return e.value;
+  const t = e.ty;
+  if (isString(t) && typeof t.exact === "string") return t.exact;
+  return null;
 }
 
 function numLit(value: number, span: Span): IRExpr {
@@ -183,10 +230,12 @@ function foldImagBinary(
   return null;
 }
 
-/** String concat fold. Today only `StringLit + StringLit` qualifies —
- *  mixed string/char-array concat involves the runtime text view and
- *  isn't representable as a single literal until char-array literal
- *  IR can hold an exact text payload. */
+/** String concat fold. Fires when both sides have a statically-known
+ *  string value — `StringLit` directly or any IR kind whose
+ *  `StringType` carries `exact`. Mixed string/char-array concat
+ *  isn't covered (the char-array side has no exact carrier today;
+ *  char-array literals are tensor-shaped and the scalar-only `exact`
+ *  invariant excludes them). */
 function foldStringBinary(
   op: BinOp,
   left: IRExpr,
@@ -194,8 +243,10 @@ function foldStringBinary(
   span: Span
 ): IRExpr | null {
   if (op !== "Add") return null;
-  if (left.kind !== "StringLit" || right.kind !== "StringLit") return null;
-  const value = left.value + right.value;
+  const l = asExactString(left);
+  const r = asExactString(right);
+  if (l === null || r === null) return null;
+  const value = l + r;
   return { kind: "StringLit", value, ty: stringType(value), span };
 }
 
@@ -252,5 +303,47 @@ export function tryFoldUnaryLit(
         return null;
     }
   }
+  return null;
+}
+
+/** Materialize a literal IR node from a type whose `exact` is set.
+ *  Used at variable-read sites: `x = 4; disp(x);` should emit
+ *  `disp(4.0);` because `x.ty.exact === 4`. Returns null when the
+ *  type doesn't carry an exact value the IR can represent today —
+ *  general `a + bi` complex stays as a `Var` (no `ComplexLit`). */
+export function exactToLiteral(t: MType, span: Span): IRExpr | null {
+  if (isString(t) && typeof t.exact === "string") {
+    return { kind: "StringLit", value: t.exact, ty: t, span };
+  }
+  if (isNumeric(t) && isScalar(t)) {
+    if (!t.isComplex && t.elem === "double" && typeof t.exact === "number") {
+      return { kind: "NumLit", value: t.exact, ty: t, span };
+    }
+    if (t.elem === "char" && typeof t.exact === "string" && t.exact.length === 1) {
+      return { kind: "CharLit", value: t.exact, ty: t, span };
+    }
+    if (t.isComplex && t.elem === "double") {
+      const ex = t.exact;
+      if (typeof ex === "object" && ex !== null && "re" in ex && ex.re === 0) {
+        return { kind: "ImagLit", value: ex.im, ty: t, span };
+      }
+    }
+  }
+  return null;
+}
+
+/** Decide whether a lowered IR condition is statically true / false /
+ *  unknown. Mirrors numbl's toBool: nonzero (non-NaN) is true; zero
+ *  or NaN is false. Returns null if the IR doesn't carry a known
+ *  scalar value at lowering time. Used by `lowerIf` (and any future
+ *  branch-folding site) to elide dead arms when the condition folds. */
+export function tryFoldCondToBool(cond: IRExpr): boolean | null {
+  // Real scalar (incl. char scalar via byte promotion).
+  const r = asScalarReal(cond);
+  if (r !== null) return !Number.isNaN(r) && r !== 0;
+  // Pure-imag scalar — true iff the imag part is nonzero. NaN handled
+  // alongside zero to match numbl's toBool on complex.
+  const im = asPureImag(cond);
+  if (im !== null) return !Number.isNaN(im) && im !== 0;
   return null;
 }

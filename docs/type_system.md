@@ -93,23 +93,29 @@ The field is filled in at literal lowering sites (number / string /
 char / `1i` / `complex(re, im)` with literal args) and at every
 literal-producing predictor / fold site, then threaded through `unify`
 (preserve when both sides agree, drop when they differ or when the
-merged shape is no longer scalar). `canonicalizeType` deliberately
-ignores it so spec keys are unaffected.
+merged shape is no longer scalar).
 
-Two consumers read it today:
+`canonicalizeType` appends `exact` for any type that carries a known
+value, so per-exact specializations are sound: two callers with
+different exacts hash apart and get distinct C bodies. Types that
+don't carry exact hash identically to the pre-Stage-A form (the
+`exact` shard is omitted from the JSON when undefined), so spec
+caches don't churn for code that never exposes a literal.
+
+Three consumers read `exact` today:
 
 - The class constructor pre-pass (`predictConstructorPropertyTypes`
   in `lowerClass.ts`) uses literal exacts as the property's initial
   type — `obj.x = 5` predicts `scalarDouble(positive, exact=5)`.
 - The compile-time constant folder (`src/lowering/constFold.ts`)
-  collapses every binary / unary op whose operands are literal IR
-  kinds (`NumLit` / `CharLit` / `ImagLit` / `StringLit`) into a
-  single literal — real arithmetic / comparisons / power, char
-  arithmetic via the char→double promotion, pure-imag arithmetic
-  that lands back on a representable literal, and string concat
-  all fold at lowering time.
-
-Spec-key effects (per-exact specialization) remain deferred.
+  collapses every binary / unary op whose operands have a statically
+  known scalar value — `NumLit` / `CharLit` / `ImagLit` / `StringLit`
+  IR kinds AND any IR kind whose `.ty` carries `exact` (e.g. a
+  specialization-pinned `Var(opt)` with `scalarDouble(.., exact=1)`
+  folds the same as a literal `1`).
+- The if-branch elider in `lowerIf` reads the same fold to drop dead
+  arms statically — `if 1 > 0 ... else ... end` keeps only the
+  then-arm in the emitted C.
 
 ## DimInfo
 

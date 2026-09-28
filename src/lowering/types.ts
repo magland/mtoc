@@ -1145,6 +1145,35 @@ export function absentDefaultFor(present: ReadonlyArray<MType>): MType {
 
 // ── Sign helpers ─────────────────────────────────────────────────────────
 
+/** Return `t` with `exact` cleared (if it had one). Other fields stay.
+ *  Used by loop body lowering — a variable reassigned inside the loop
+ *  must not retain its entry-state exact in the body's env or every
+ *  fold within the body bakes iteration-1's value in. */
+export function withoutExact(t: MType): MType {
+  if (t.kind === "Numeric" && t.exact !== undefined) {
+    const { exact: _exact, ...rest } = t;
+    return rest;
+  }
+  if (t.kind === "String" && t.exact !== undefined) {
+    return { kind: "String" };
+  }
+  return t;
+}
+
+/** Mutate `env` in place: for each name in `names`, replace its
+ *  binding (if any) with the same type minus `exact`. */
+export function stripExactFromEnv(
+  env: Map<string, MType>,
+  names: ReadonlySet<string>
+): void {
+  for (const name of names) {
+    const ty = env.get(name);
+    if (ty === undefined) continue;
+    const stripped = withoutExact(ty);
+    if (stripped !== ty) env.set(name, stripped);
+  }
+}
+
 export function signFromValue(n: number): Sign {
   if (Number.isNaN(n)) return "unknown";
   if (n > 0) return "positive";
@@ -1665,7 +1694,15 @@ export const arithResultScalar = arithResult;
 export function canonicalizeType(t: MType): unknown {
   if (t.kind === "Unknown") return { kind: "Unknown" };
   if (t.kind === "Void") return { kind: "Void" };
-  if (t.kind === "String") return { kind: "String" };
+  if (t.kind === "String") {
+    // Append `exact` only when the type carries a known value, so the
+    // hash for the unspecific `STRING` singleton matches the pre-
+    // Stage-D form. Two strings with different exacts hash apart and
+    // get distinct specializations downstream.
+    return t.exact === undefined
+      ? { kind: "String" }
+      : { kind: "String", exact: t.exact };
+  }
   if (t.kind === "Handle") {
     // Encode both the target's identity and the canonicalized
     // capture tuple. This is what makes a higher-order function
@@ -1726,6 +1763,16 @@ export function canonicalizeType(t: MType): unknown {
   // the hash form remains byte-identical to the pre-N-D representation.
   if (normalized.dims.length > 2) {
     out.dims = normalized.dims;
+  }
+  // Append `exact` last so the hash for non-exact types matches the
+  // pre-Stage-D form. Scalar-only — non-scalar `NumericType` values
+  // can't carry exact by invariant, so this branch never fires for
+  // tensors. Two literal-fed call sites with different exacts hash
+  // apart, which is what makes per-exact specialization sound:
+  // each distinct value gets its own body and the constant folder
+  // is free to specialize on `e.ty.exact` inside that body.
+  if (normalized.exact !== undefined) {
+    out.exact = normalized.exact;
   }
   return out;
 }

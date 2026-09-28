@@ -289,6 +289,15 @@ interface LibmComplexOpts {
    *  Requires `complexCName` — the complex sibling is used to render
    *  the call. See `BuiltinSig.promoteOnDomainMiss` for context. */
   promoteOnDomainMiss?: boolean;
+  /** Stage-E exact propagation: when every real arg carries `exact`,
+   *  the result type also carries `exact` computed by this function.
+   *  Must return null when the call would route to the complex
+   *  sibling on the actual exact value (so the libm fold doesn't
+   *  silently mask the complex lift). Skip this option for builtins
+   *  whose libm semantics don't match Math.* (e.g. `cbrt` vs
+   *  `Math.cbrt` are fine; `round` differs at half-ties so omit it
+   *  unless you supply a faithful implementation). */
+  exactReal?: (vals: readonly number[]) => number | null;
 }
 
 /** True iff the real arg in slot `i` has a static sign that fails
@@ -327,6 +336,7 @@ function libm(
     complexResult = "propagates",
     complexResultSign = "nonnegative",
     promoteOnDomainMiss = false,
+    exactReal,
   } = complexOpts;
   const complexDomain: ComplexDomain = complexCName
     ? "real-or-complex"
@@ -346,6 +356,20 @@ function libm(
           ? scalarComplex()
           : scalarDouble(complexResultSign);
       }
+      // Stage-E: when every arg has a known scalar real value (from
+      // a literal IR node OR from a Var whose specialization-pinned
+      // type carries `exact`), pre-compute the result so downstream
+      // uses see a fully-pinned scalar — `disp(sqrt(9))` then folds
+      // to `disp(3.0)` via the Var-to-literal substitution.
+      if (exactReal !== undefined) {
+        const vals = readAllRealExact(argTys);
+        if (vals !== null) {
+          const r = exactReal(vals);
+          if (r !== null && Number.isFinite(r)) {
+            return scalarDouble(resultSign, r);
+          }
+        }
+      }
       return scalarDouble(resultSign);
     },
     emit: (args, argTys) => {
@@ -353,6 +377,33 @@ function libm(
       return `${target}(${args.join(", ")})`;
     },
   };
+}
+
+/** Read every arg's `exact` real scalar value. Returns null when any
+ *  arg lacks a scalar-real exact — used by the libm exact-propagation
+ *  hook to gate on "every arg statically known". Char-elem scalar
+ *  exacts are returned as their byte (numbl's char→double promotion);
+ *  complex exacts are excluded (`exactReal` only fires when args are
+ *  real). */
+function readAllRealExact(
+  argTys: ReadonlyArray<MType>
+): number[] | null {
+  const out: number[] = [];
+  for (const t of argTys) {
+    if (!isNumeric(t) || !isScalar(t) || t.isComplex) return null;
+    if (t.elem === "double") {
+      if (typeof t.exact !== "number") return null;
+      out.push(t.exact);
+      continue;
+    }
+    if (t.elem === "char") {
+      if (typeof t.exact !== "string" || t.exact.length !== 1) return null;
+      out.push(t.exact.charCodeAt(0));
+      continue;
+    }
+    return null;
+  }
+  return out;
 }
 
 interface RuntimeComplexOpts {
@@ -365,6 +416,11 @@ interface RuntimeComplexOpts {
    *  sibling to a real-libm-backed builtin (e.g. `log2`/`log10`/`expm1`/
    *  `log1p`: real → libm, complex → mtoc_clog2 / etc.). */
   realIsLibm?: boolean;
+  /** Stage-E exact propagation — see `LibmComplexOpts.exactReal`.
+   *  Same contract: returns null when the call would route to the
+   *  complex sibling or when the input misses the runtime helper's
+   *  domain. */
+  exactReal?: (vals: readonly number[]) => number | null;
 }
 
 /** Builtin that maps to a registered mtoc runtime helper. Optionally
@@ -384,6 +440,7 @@ function runtime(
     complexResult = "propagates",
     complexResultSign = "unknown",
     realIsLibm = false,
+    exactReal,
   } = complexOpts;
   const complexDomain: ComplexDomain = complexHelperName
     ? "real-or-complex"
@@ -397,6 +454,17 @@ function runtime(
         return complexResult === "propagates"
           ? scalarComplex()
           : scalarDouble(complexResultSign);
+      }
+      // Stage-E exact propagation, mirrors libm()'s arm. Same gating:
+      // the real-only branch above already rejected any complex arg.
+      if (exactReal !== undefined) {
+        const vals = readAllRealExact(argTys);
+        if (vals !== null) {
+          const r = exactReal(vals);
+          if (r !== null && Number.isFinite(r)) {
+            return scalarDouble(resultSign, r);
+          }
+        }
       }
       return scalarDouble(resultSign);
     },
@@ -860,24 +928,62 @@ const BUILTINS: BuiltinSig[] = [
     // `realFn → NaN → complexFn` fallback. The numeric-domain check
     // doesn't fire for opted-in builtins; see `validateDomain`.
     promoteOnDomainMiss: true,
+    // Negative inputs return null so the complex-lift path still
+    // runs. The libm factory also gates exactReal on `!useComplex`,
+    // so this guard is belt-and-suspenders.
+    exactReal: ([x]) => (x >= 0 ? Math.sqrt(x) : null),
   }),
-  libm("exp", 1, "exp", "positive", [], { complexCName: "cexp" }),
-  libm("log", 1, "log", "unknown", ["nonnegative"], { complexCName: "clog" }),
-  libm("sin", 1, "sin", "unknown", [], { complexCName: "csin" }),
-  libm("cos", 1, "cos", "unknown", [], { complexCName: "ccos" }),
-  libm("tan", 1, "tan", "unknown", [], { complexCName: "ctan" }),
-  libm("asin", 1, "asin", "unknown", [], { complexCName: "casin" }),
-  libm("acos", 1, "acos", "unknown", [], { complexCName: "cacos" }),
-  libm("atan", 1, "atan", "unknown", [], { complexCName: "catan" }),
-  libm("sinh", 1, "sinh", "unknown", [], { complexCName: "csinh" }),
-  libm("cosh", 1, "cosh", "positive", [], { complexCName: "ccosh" }),
-  libm("tanh", 1, "tanh", "unknown", [], { complexCName: "ctanh" }),
+  libm("exp", 1, "exp", "positive", [], {
+    complexCName: "cexp",
+    exactReal: ([x]) => Math.exp(x),
+  }),
+  libm("log", 1, "log", "unknown", ["nonnegative"], {
+    complexCName: "clog",
+    exactReal: ([x]) => (x > 0 ? Math.log(x) : null),
+  }),
+  libm("sin", 1, "sin", "unknown", [], {
+    complexCName: "csin",
+    exactReal: ([x]) => Math.sin(x),
+  }),
+  libm("cos", 1, "cos", "unknown", [], {
+    complexCName: "ccos",
+    exactReal: ([x]) => Math.cos(x),
+  }),
+  libm("tan", 1, "tan", "unknown", [], {
+    complexCName: "ctan",
+    exactReal: ([x]) => Math.tan(x),
+  }),
+  libm("asin", 1, "asin", "unknown", [], {
+    complexCName: "casin",
+    exactReal: ([x]) => (x >= -1 && x <= 1 ? Math.asin(x) : null),
+  }),
+  libm("acos", 1, "acos", "unknown", [], {
+    complexCName: "cacos",
+    exactReal: ([x]) => (x >= -1 && x <= 1 ? Math.acos(x) : null),
+  }),
+  libm("atan", 1, "atan", "unknown", [], {
+    complexCName: "catan",
+    exactReal: ([x]) => Math.atan(x),
+  }),
+  libm("sinh", 1, "sinh", "unknown", [], {
+    complexCName: "csinh",
+    exactReal: ([x]) => Math.sinh(x),
+  }),
+  libm("cosh", 1, "cosh", "positive", [], {
+    complexCName: "ccosh",
+    exactReal: ([x]) => Math.cosh(x),
+  }),
+  libm("tanh", 1, "tanh", "unknown", [], {
+    complexCName: "ctanh",
+    exactReal: ([x]) => Math.tanh(x),
+  }),
 
   // ── 1-arg libm — `cabs` returns a real scalar ────────────────────────
   libm("abs", 1, "fabs", "nonnegative", [], {
     complexCName: "cabs",
     complexResult: "real",
     complexResultSign: "nonnegative",
+    exactReal: ([x]) => Math.abs(x),
   }),
 
   // ── 1-arg runtime — wrappers around libm with extra logic ────────────
@@ -888,20 +994,24 @@ const BUILTINS: BuiltinSig[] = [
   runtime("log2", 1, "log2", "unknown", ["nonnegative"], {
     complexHelperName: "mtoc_clog2",
     realIsLibm: true,
+    exactReal: ([x]) => (x > 0 ? Math.log2(x) : null),
   }),
   runtime("log10", 1, "log10", "unknown", ["nonnegative"], {
     complexHelperName: "mtoc_clog10",
     realIsLibm: true,
+    exactReal: ([x]) => (x > 0 ? Math.log10(x) : null),
   }),
   runtime("expm1", 1, "expm1", "unknown", [], {
     complexHelperName: "mtoc_cexpm1",
     realIsLibm: true,
+    exactReal: ([x]) => Math.expm1(x),
   }),
   // log1p's true domain is x >= -1, but the sign lattice can't represent
   // bounded intervals — `nonnegative` is the closest expressible bound.
   runtime("log1p", 1, "log1p", "unknown", ["nonnegative"], {
     complexHelperName: "mtoc_clog1p",
     realIsLibm: true,
+    exactReal: ([x]) => (x > -1 ? Math.log1p(x) : null),
   }),
 
   // ── Complex-only / dispatched: real / imag / conj / angle ────────────

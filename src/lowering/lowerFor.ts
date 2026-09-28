@@ -13,8 +13,10 @@ import {
   scalarDouble,
   signIsNonneg,
   signIsPositive,
+  stripExactFromEnv,
   SCALAR_DOUBLE,
 } from "./types.js";
+import { collectAssignedNames } from "./loopExactStrip.js";
 import type { Lowerer } from "./lower.js";
 
 export function lowerFor(
@@ -89,6 +91,11 @@ export function lowerFor(
       scalarDouble(loopVarSign),
       s.span
     );
+    // Strip `exact` from any variable reassigned inside the body —
+    // same reasoning as `lowerWhile`. The loop var itself is included
+    // in the collected set so an outer loop that surrounds this one
+    // sees its loop-var widened too (handled there, harmless here).
+    stripExactFromEnv(this.env, collectAssignedNames(s.body));
     const body = this.lowerStmts(s.body);
     this.env = this.mergeBranchEnvs(
       [envBefore, new Map(this.env)],
